@@ -642,16 +642,18 @@ def steam_roots() -> list[Path]:
 
 
 def steam_running() -> bool:
+    """Whether the Steam client runs: ArmadaOS's native ARM64 client
+    (steamrtarm64/steam) or the x86 one (ubuntu12_32/steam), whose path is
+    the second argument under FEX. Only the program and its interpreter count:
+    this script runs as `python3 mm3_setup.py steam`."""
     for proc in Path("/proc").iterdir():
-        if not proc.name.isdigit():
+        if not proc.name.isdigit() or int(proc.name) == os.getpid():
             continue
         try:
             cmdline = (proc / "cmdline").read_bytes().split(b"\0")
         except OSError:
             continue
-        # Steam runs under FEX on ARM64: its own path is an argument then.
-        if any(part.endswith(b"/steam") or part == b"steam" for part in cmdline[:3] if part) and \
-                any(b"ubuntu12_32" in part or part.endswith(b"steam") for part in cmdline[:3]):
+        if any(part.endswith((b"/steamrtarm64/steam", b"/ubuntu12_32/steam")) for part in cmdline[:2]):
             return True
     return False
 
