@@ -76,6 +76,17 @@
       "pillow.libs/"
     ]
   },
+  "sysroot": {
+    "label": "the ARM64 sysroot",
+    "version": "2026.10.14.1",
+    "url": "https://github.com/Ken5998/mm3-recomp-arm64/releases/download/sysroot-2026.10.14.1/mm3-arm64-sysroot-2026.10.14.1.tar.xz",
+    "sha256": "8302bc0d854d287fe560d221cde99e2662df42f91bb99a325df9ce78297d2cdb",
+    "size": 57509060,
+    "strip": 1,
+    "check": [
+      "usr/lib/ld-linux-aarch64.so.1"
+    ]
+  },
   "runtime_libraries": [
     "libdxvk_d3d11.so.0",
     "libdxvk_dxgi.so.0",
