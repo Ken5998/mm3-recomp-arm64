@@ -1,0 +1,120 @@
+From 94f11408355ec5bd93fe58db15caee10c7116cce Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 07:52:02 +0000
+Subject: [PATCH 10/10] fix(posix): land trapped fp loads in the signal frame's
+ sve registers
+
+Once a thread has used SVE, its signal frame carries the Z registers and
+sigreturn restores Vn from them rather than from the FPSIMD record, so a
+trapped LDR into an FP/SIMD register was lost. glibc's string functions
+use SVE on cores that have it, as the Snapdragon 8 Gen 2's do, and QEMU
+always fills the record. The load now also goes to Zn, clearing the rest
+of it as the instruction does, and records moved to an extra_context
+(long vector lengths) are found too.
+
+The test's plain volatile read-modify-write gains a compiler barrier:
+Clang otherwise compares against the register value read before it.
+---
+ src/platform/mmio_decode_a64.h      | 46 ++++++++++++++++++++++++++++-
+ tests/mmio_decode_posix/test_main.c |  3 ++
+ 2 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/src/platform/mmio_decode_a64.h b/src/platform/mmio_decode_a64.h
+index a65808d..86ce2fd 100644
+--- a/src/platform/mmio_decode_a64.h
++++ b/src/platform/mmio_decode_a64.h
+@@ -11,7 +11,8 @@
+  * offset, pre- and post-index), the sign-extending loads, LDP/STP/LDPSW,
+  * LDAR/STLR/LDAPR, PRFM (skipped), and the FP/SIMD forms of the same
+  * addressing modes, whose B/H/S/D/Q registers come from the signal frame's
+- * FPSIMD record. Anything else -- exclusives, atomics, structure loads --
++ * FPSIMD record (and go to its SVE record too, when it carries the Z
++ * registers sigreturn then restores them from). Anything else -- exclusives, atomics, structure loads --
+  * returns 0, as the x86 decoder does: stepping over an instruction nobody
+  * decoded corrupts the guest silently.
+  *
+@@ -38,6 +39,8 @@ extern __thread uintptr_t g_posix_fault_address;
+  * this header needs no kernel headers. */
+ #define MMIO_A64_FPSIMD_MAGIC 0x46508001u
+ #define MMIO_A64_ESR_MAGIC    0x45535201u
++#define MMIO_A64_SVE_MAGIC    0x53564501u
++#define MMIO_A64_EXTRA_MAGIC  0x45585401u
+ 
+ struct mmio_a64_ctx_head { uint32_t magic, size; };
+ 
+@@ -51,6 +54,17 @@ static inline void *mmio_a64_record(PCONTEXT ctx, uint32_t magic)
+             return NULL;
+         if (h->magic == magic)
+             return h;
++        if (h->magic == MMIO_A64_EXTRA_MAGIC && h->size >= 20) {
++            /* The records that did not fit, further up the signal stack:
++             * head, then a 64-bit pointer to them and their size. */
++            uint64_t datap;
++            uint32_t size;
++            memcpy(&datap, p + 8, sizeof datap);
++            memcpy(&size, p + 16, sizeof size);
++            p = (uint8_t *)(uintptr_t)datap;
++            end = p + size;
++            continue;
++        }
+         p += h->size;
+     }
+     return NULL;
+@@ -65,6 +79,27 @@ static inline uint8_t *mmio_a64_vreg(PCONTEXT ctx, int n)
+     return rec ? rec + 16 + 16 * (size_t)n : NULL;
+ }
+ 
++/* Zn in the frame's SVE record, *vl bytes long, or NULL when the record
++ * carries no registers. It carries them once the thread has used SVE (glibc's
++ * string functions do on cores that have it, and QEMU always does), and
++ * sigreturn then restores Vn from Zn's low bytes rather than from the FPSIMD
++ * record. */
++static inline uint8_t *mmio_a64_zreg(PCONTEXT ctx, int n, int *vl)
++{
++    uint8_t *rec = (uint8_t *)mmio_a64_record(ctx, MMIO_A64_SVE_MAGIC);
++    uint32_t size;
++    uint16_t len;
++    if (!rec)
++        return NULL;
++    /* head (8), vl (2), flags (2), reserved (4), then Z0..Z31 of vl bytes */
++    memcpy(&size, rec + 4, sizeof size);
++    memcpy(&len, rec + 8, sizeof len);
++    if (len < 16 || size < 16 + 32u * len)
++        return NULL;
++    *vl = len;
++    return rec + 16 + (size_t)n * len;
++}
++
+ /* 1 for a store, 0 for a load, -1 when the frame does not say. */
+ static inline int mmio_a64_esr_is_write(PCONTEXT ctx)
+ {
+@@ -151,6 +186,15 @@ static inline int mmio_a64_xfer(PCONTEXT ctx, int load, int gpr, int rt,
+                 wr(dev, off + (uint32_t)done, v, n);
+             }
+         }
++        if (load) {
++            /* Writing Vn clears the rest of Zn. */
++            int vl;
++            uint8_t *z = mmio_a64_zreg(ctx, rt, &vl);
++            if (z) {
++                memset(z, 0, (size_t)vl);
++                memcpy(z, vr, 16);
++            }
++        }
+         return 1;
+     }
+ }
+diff --git a/tests/mmio_decode_posix/test_main.c b/tests/mmio_decode_posix/test_main.c
+index a8c625d..9c509fb 100644
+--- a/tests/mmio_decode_posix/test_main.c
++++ b/tests/mmio_decode_posix/test_main.c
+@@ -203,6 +203,9 @@ static void test_a64(void)
+         volatile uint32_t *r = (volatile uint32_t *)(page + 0x120);
+         uint32_t before = (uint32_t)reg_at(0x120, 4);
+         *r |= 0x10;
++        /* The device's registers change behind the compiler's back: Clang
++         * would otherwise compare against the value read before. */
++        __asm__ volatile("" ::: "memory");
+         CHECK_U64("volatile |= ", reg_at(0x120, 4), before | 0x10);
+         CHECK_U64("volatile |= reads", last.reads, 1);
+         CHECK_U64("volatile |= writes", last.writes, 1);
