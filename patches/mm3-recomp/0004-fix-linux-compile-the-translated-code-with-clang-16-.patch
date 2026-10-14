@@ -1,7 +1,7 @@
 From b07fbed1b29791cead239d079d89fae23c3831d0 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 03:36:53 +0000
-Subject: [PATCH 4/4] fix(linux): compile the translated code with clang 16 and
+Subject: [PATCH 4/7] fix(linux): compile the translated code with clang 16 and
  gcc 14
 
 The translated runtime entries jump to a few functions the translator

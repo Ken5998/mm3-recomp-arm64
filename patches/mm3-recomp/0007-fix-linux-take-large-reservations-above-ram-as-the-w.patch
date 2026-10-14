@@ -1,0 +1,66 @@
+From 50405eafa736d7faed06411dfb7d6f163e3998d9 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 19:21:32 +0000
+Subject: [PATCH 7/7] fix(linux): take large reservations above ram as the
+ windows build does
+
+The ELF build linked xbox_ReserveAlloc to the heap. MM3's CRT heap grows
+by reserving up to 16 MB at a time, and taken from the heap those
+reservations used the physical page numbers the contiguous window
+shares: after the frontend loaded the window was exhausted, textures and
+vertex buffers failed to allocate, and the menus came up black and the
+races grey. The MSVC build never had the wrap and takes them from above
+RAM, as xboxrecomp intends.
+---
+ CMakeLists.txt          | 10 +++++-----
+ src/mm3_memory_compat.c | 11 -----------
+ 2 files changed, 5 insertions(+), 16 deletions(-)
+ delete mode 100644 src/mm3_memory_compat.c
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b741889..e72c77f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -223,7 +223,6 @@ add_executable(${PROJECT_NAME}
+     src/mods/skip_intro.c
+     src/mods/framerate.c
+     src/mm3_unresolved_stubs.c
+- src/mm3_memory_compat.c
+  src/mm3_memory_tails.c
+  src/mm3_runtime_entries.c
+  src/mm3_asset_trace.c
+@@ -263,12 +262,13 @@ else()
+ endif()
+ target_include_directories(${PROJECT_NAME} PRIVATE ${rmlui_SOURCE_DIR}/Backends)
+ 
+-# MM3's CRT uses NtAllocateVirtualMemory reserve requests as heap-backed
+-# buffers.  Keep the vendor runtime untouched: redirect its public reserve
+-# seam to the existing Xbox heap on the ELF build used by this checkout.
++# MM3's large NtAllocateVirtualMemory reservations (its CRT heap grows by
++# reserving up to 16 MB at a time) come from above RAM, as in the Windows
++# build. Taken from the heap instead, they used the physical page numbers the
++# contiguous window shares, the window ran out, and the menus and races drew
++# nothing: their textures and vertex buffers were never allocated.
+ if(NOT MSVC)
+  target_link_options(${PROJECT_NAME} PRIVATE
+-  "-Wl,--wrap=xbox_ReserveAlloc"
+   "-Wl,--wrap=recomp_trace_esp")
+ endif()
+ 
+diff --git a/src/mm3_memory_compat.c b/src/mm3_memory_compat.c
+deleted file mode 100644
+index 3378439..0000000
+--- a/src/mm3_memory_compat.c
++++ /dev/null
+@@ -1,11 +0,0 @@
+-#include "xbox_memory_layout.h"
+-
+-/*
+- * The stock reserve arena lives above RAM.  MM3 later treats the returned
+- * address as a CRT heap block, so it must come from the same allocator as
+- * ordinary heap allocations.
+- */
+-uint32_t __wrap_xbox_ReserveAlloc(uint32_t size, uint32_t align)
+-{
+-    return xbox_HeapAlloc(size, align);
+-}

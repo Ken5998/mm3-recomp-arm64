@@ -1,7 +1,7 @@
 From d62e26184333efcbf75af2a97d560f7bfc5070e1 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 18:00:52 +0000
-Subject: [PATCH 6/6] fix(main): let go of the guest cpu once the entry has
+Subject: [PATCH 6/7] fix(main): let go of the guest cpu once the entry has
  started the game
 
 The entry thread joins the guest CPU when the kernel bridge starts and kept

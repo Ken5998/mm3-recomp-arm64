@@ -1,0 +1,158 @@
+From cc9d48cc54f98d3468a799f22283a1f754f6f057 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 19:21:27 +0000
+Subject: [PATCH 15/15] feat(apu): keep the frame thread on fast cores and say
+ when audio lags
+
+On a CPU that mixes fast and slow cores, such as a handheld's SoC, the
+APU frame thread now stays on the cores whose highest clock is within
+80% of the fastest: the DSP interpreter has to finish every 667 us
+frame in time. Windows raises the same thread's priority instead.
+
+When the pipeline produces less than 95% of real time over 10 s while
+busy, the log says so, with what a frame cost in the voice processor
+and in the DSPs: the player hears that as crackle, one silence cushion
+per underrun.
+---
+ src/apu/apu_core.c | 98 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 98 insertions(+)
+
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index 11959cd..aa7f952 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -19,6 +19,9 @@
+  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#if defined(__linux__) && !defined(_GNU_SOURCE)
++#define _GNU_SOURCE   /* sched_setaffinity, before the first #include */
++#endif
+ #include "apu_state.h"
+ #include "apu.h"
+ #include "apu_xaudio2.h"
+@@ -515,6 +518,46 @@ static void throttle(MCPXAPUState *d)
+     d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - now_us);
+ }
+ 
++/* Says so when the pipeline falls behind real time, which the player hears
++ * as crackle: every underrun puts a cushion of silence in front of the
++ * output. Reported every 10 s while the frame thread is busy for most of
++ * that time and still produced less than 95% of it, with what one frame of
++ * 32 samples (667 us of sound) cost in the voice processor and the DSPs. */
++static void report_speed(int64_t vp_us, int64_t dsp_us, int64_t frame_us)
++{
++    static int64_t window_start, vp_sum, dsp_sum, busy_sum;
++    static unsigned frames, reports;
++    int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++
++    if (!window_start || now - window_start > 60000000) {
++        window_start = now;
++        frames = 0;
++        vp_sum = dsp_sum = busy_sum = 0;
++        return;
++    }
++    frames++;
++    vp_sum += vp_us;
++    dsp_sum += dsp_us;
++    busy_sum += frame_us;
++    if (now - window_start < 10000000)
++        return;
++    {
++        double window = (double)(now - window_start);
++        double sound = frames * NUM_SAMPLES_PER_FRAME * 1000000.0 / 48000.0;
++        if (sound < 0.95 * window && busy_sum > 0.8 * window && reports < 60) {
++            reports++;
++            fprintf(stderr, "[APU] behind real time: %.0f s of sound in %.0f s; a frame took "
++                            "%lld us in voices, %lld us in the DSPs (667 us of sound)\n",
++                    sound / 1e6, window / 1e6, (long long)(vp_sum / frames),
++                    (long long)(dsp_sum / frames));
++            fflush(stderr);
++        }
++    }
++    window_start = now;
++    frames = 0;
++    vp_sum = dsp_sum = busy_sum = 0;
++}
++
+ /* ============================================================
+  * se_frame - Process one audio frame (VP -> GP -> EP pipeline)
+  * ============================================================ */
+@@ -541,8 +584,12 @@ static void se_frame(MCPXAPUState *d)
+     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+     memset(mixbins, 0, sizeof(mixbins));
+ 
++    int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+     mcpx_apu_vp_frame(d, mixbins);
++    int64_t t1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+     mcpx_apu_dsp_frame(d, mixbins);
++    int64_t t2 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++    report_speed(t1 - t0, t2 - t1, t2 - t0);
+     mcpx_apu_monitor_frame(d);
+ 
+     d->ep_frame_div++;
+@@ -554,6 +601,55 @@ static void se_frame(MCPXAPUState *d)
+  * APU frame thread (background processing)
+  * ============================================================ */
+ 
++#if defined(__linux__)
++#include <sched.h>
++
++/* Keeps the calling thread on the fastest cores of a CPU that mixes fast and
++ * slow ones, such as a phone or handheld SoC: those whose highest clock is
++ * within 80% of the fastest. The DSP interpreter has to finish each 667 us
++ * frame in time, and the scheduler does not always move a thread that has
++ * just woken off a slow core soon enough. A CPU whose cores are all alike,
++ * or one that does not report clocks, keeps its affinity. */
++static void apu_thread_to_fast_cores(void)
++{
++    cpu_set_t allowed, fast;
++    long khz[CPU_SETSIZE] = { 0 }, best = 0;
++    int cpu, kept = 0, total = 0;
++
++    if (sched_getaffinity(0, sizeof allowed, &allowed) != 0)
++        return;
++    for (cpu = 0; cpu < CPU_SETSIZE; cpu++) {
++        char path[96];
++        FILE *f;
++        if (!CPU_ISSET(cpu, &allowed))
++            continue;
++        snprintf(path, sizeof path,
++                 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
++        f = fopen(path, "r");
++        if (!f || fscanf(f, "%ld", &khz[cpu]) != 1)
++            khz[cpu] = 0;
++        if (f)
++            fclose(f);
++        if (!khz[cpu])
++            return;                     /* no clock to go by */
++        if (khz[cpu] > best)
++            best = khz[cpu];
++        total++;
++    }
++    CPU_ZERO(&fast);
++    for (cpu = 0; cpu < CPU_SETSIZE; cpu++)
++        if (khz[cpu] && khz[cpu] * 10 >= best * 8) {
++            CPU_SET(cpu, &fast);
++            kept++;
++        }
++    if (kept == total || !kept)
++        return;
++    if (sched_setaffinity(0, sizeof fast, &fast) == 0)
++        fprintf(stderr, "[APU] frame thread kept on the %d fastest of %d cores (up to %ld MHz)\n",
++                kept, total, best / 1000);
++}
++#endif
++
+ static void *mcpx_apu_frame_thread(void *arg)
+ {
+     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+@@ -562,6 +658,8 @@ static void *mcpx_apu_frame_thread(void *arg)
+      * the title raised (KeSetBasePriorityThread) otherwise delays it past
+      * what the output queue holds, and the device plays a gap. */
+     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
++#elif defined(__linux__)
++    apu_thread_to_fast_cores();
+ #endif
+     qemu_mutex_lock(&d->lock);
+ 
