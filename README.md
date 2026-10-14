@@ -63,6 +63,11 @@ The launcher shows which step failed. Its **Logs** link opens the build log,
 and the game writes `~/.local/share/MidtownMadness3/logs/game.log`; attach
 them to an [issue](https://github.com/Ken5998/mm3-recomp-arm64/issues).
 
+If the game stops somewhere without closing, start it from a terminal with
+`RECOMP_THREAD_DUMP_SECS=20 ~/.local/share/MidtownMadness3/midtown-madness-3.sh`,
+leave it stopped for a minute and close it: `game.log` then says where each of
+the game's threads is.
+
 ## Developers
 
 How the port works, how its patches are kept and how releases are made:

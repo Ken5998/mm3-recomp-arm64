@@ -11,8 +11,8 @@ not be published ([LEGAL.md](../LEGAL.md)).
 
 | Path | What it does |
 | --- | --- |
-| `patches/xboxrecomp/` | The runtime on Linux, arm64 and x86-64: device register (MMIO) traps through SIGSEGV with A64 and x86-64 decoders, the D3D11 renderer on DXVK-native with vkd3d's D3DCompile and an SDL2 window, XInput over SDL2 game controllers, audio over SDL2, case-insensitive game paths, the 4 GB guest address space, hard disk partitions as image files, Win32 handles it never made failing as on Windows instead of being dereferenced, and file reads and writes at an offset in one call. Some of the runtime's sources have CRLF line ends, so they are applied with `git am --keep-cr`. |
-| `patches/mm3-recomp/` | The game on Linux (CMake, the crash handler, the POSIX hooks), the launcher on SDL2 and OpenGL with a first-run setup (`src/mm3_setup.cpp`) that drives `launcher/mm3_setup.py`, full screen by default on arm64, the C flags Clang needs for the translated code, and MSVC's integer and `char` semantics for the whole build. |
+| `patches/xboxrecomp/` | The runtime on Linux, arm64 and x86-64: device register (MMIO) traps through SIGSEGV with A64 and x86-64 decoders, the D3D11 renderer on DXVK-native with vkd3d's D3DCompile and an SDL2 window, XInput over SDL2 game controllers, audio over SDL2, case-insensitive game paths, the 4 GB guest address space, hard disk partitions as image files, Win32 handles it never made failing as on Windows instead of being dereferenced, file reads and writes at an offset in one call, and a dump of every guest thread on request (see below). Some of the runtime's sources have CRLF line ends, so they are applied with `git am --keep-cr`. |
+| `patches/mm3-recomp/` | The game on Linux (CMake, the crash handler, the POSIX hooks), the launcher on SDL2 and OpenGL with a first-run setup (`src/mm3_setup.cpp`) that drives `launcher/mm3_setup.py`, full screen by default on arm64, the C flags Clang needs for the translated code, MSVC's integer and `char` semantics for the whole build, and the entry thread leaving the guest CPU once the game's own thread runs. |
 | `upstream.json` | The mm3-recomp and xboxrecomp commits the patches apply to, and the xboxrecomp commit the translator is taken from. |
 | `launcher/mm3_setup.py` | The launcher's setup, run with the handheld's own Python: finds disc images, checks and copies the game files (`scripts/extract_disc.py`), downloads and unpacks the pinned build tools, translates (`scripts/generate_mm3.py`) and compiles the game, installs it with the libraries it loads, adds it to Steam and draws the Steam artwork from the disc's title image. |
 | `toolchain.json` | The build tools it downloads: LLVM 20.1.8 (only clang, lld and llvm-ar are unpacked), CMake, Ninja, Python 3.13 with the Capstone and Pillow wheels, and the ARM64 sysroot; and the sysroot libraries the game ships with. |
@@ -65,6 +65,23 @@ Clang, SDL2, epoxy, OpenSSL, DXVK-native and vkd3d, after
 `python3 scripts/generate_mm3.py` (Python with `capstone` 5) in the patched
 source. With `qemu-aarch64` and an arm64 build, the same runs on emulated
 ARM64.
+
+## When the game hangs
+
+A hang leaves a log that just ends. Two switches of the runtime help, set in
+the environment of `midtown-madness-3.sh` (from a terminal, or as Steam launch
+options before `%command%`):
+
+- `RECOMP_THREAD_DUMP_SECS=20` lists every thread that runs game code every
+  20 seconds in `game.log`: its guest registers, the kernel call it is in and
+  the guest code that made it, the return sites on its guest stack, and the
+  host pc as an offset into `mm3_recomp`. Read the offsets with `llvm-nm -n`
+  on a build of the same source with the same build tools.
+- `RECOMP_GUEST_LOCK=1` lets one game thread run at a time, as on the Xbox's
+  single CPU. The game's threads assume that order between their plain loads
+  and stores, which x86 nearly gives and arm64 does not; if a hang goes away
+  with it, it is a race between them. A thread that spins on another one
+  without a kernel call deadlocks under it.
 
 ## How a release is made
 

@@ -1,0 +1,38 @@
+From d62e26184333efcbf75af2a97d560f7bfc5070e1 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:00:52 +0000
+Subject: [PATCH 6/6] fix(main): let go of the guest cpu once the entry has
+ started the game
+
+The entry thread joins the guest CPU when the kernel bridge starts and kept
+it after the entry returned, so with RECOMP_GUEST_LOCK=1 the game's worker
+waited for it forever. The entry thread runs no more guest code by then: it
+now parts, which also takes it out of the thread dump.
+---
+ src/main.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/main.c b/src/main.c
+index 7ad057c..5cd11f8 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -29,6 +29,7 @@ static HANDLE g_mm3_main_worker_ready;
+ static int g_mm3_inline_threads;
+ extern void sub_00083A6C_original(void);
+ int mm3_launcher(void);
++void guest_cpu_part(void);
+ 
+ /* Register the first XAPI worker before it can create background workers.
+  * The runtime's debug handle changes on every spawn and cannot determine
+@@ -281,6 +282,11 @@ int main(void)
+     }
+     puts("starting XBE entry point 0x00083C55");
+     xbe_entry_point();
++    /* The entry hands the game to its worker and returns, so this thread runs
++     * no more guest code: it lets go of the guest CPU (RECOMP_GUEST_LOCK),
++     * which the worker would otherwise wait for forever, and leaves the
++     * thread dump (RECOMP_THREAD_DUMP_SECS) before it parks below. */
++    guest_cpu_part();
+     if (!g_mm3_inline_threads) {
+         WaitForSingleObject(g_mm3_main_worker_ready, INFINITE);
+         WaitForSingleObject(g_mm3_main_worker, INFINITE);

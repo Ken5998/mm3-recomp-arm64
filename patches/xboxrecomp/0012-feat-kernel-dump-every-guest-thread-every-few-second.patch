@@ -1,0 +1,627 @@
+From 783a293e7aba6e3d345f49dafcff1dca9f6277b4 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:00:40 +0000
+Subject: [PATCH 12/13] feat(kernel): dump every guest thread every few seconds
+ on request
+
+A title that stops on a loading screen leaves a log that just ends, and the
+watchdog samples only the thread that started it, which in a title whose
+entry hands the game to a worker is parked in a host wait by then. With
+RECOMP_THREAD_DUMP_SECS=n, every thread that runs guest code is listed every
+n seconds: its guest registers, the kernel call it is in and the guest site
+that made it, the return sites on its guest stack and, on POSIX, its host pc,
+which names the lifted function a thread spins in when it makes no calls.
+---
+ src/kernel/kernel_bridge.c             | 262 +++++++++++++++++++++++++
+ tests/thread_dump_posix/CMakeLists.txt |  14 ++
+ tests/thread_dump_posix/test_main.c    | 245 +++++++++++++++++++++++
+ 3 files changed, 521 insertions(+)
+ create mode 100644 tests/thread_dump_posix/CMakeLists.txt
+ create mode 100644 tests/thread_dump_posix/test_main.c
+
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index a200174..e9dc43d 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -43,6 +43,12 @@
+ #include <string.h>
+ #include <ctype.h>
+ #include <wctype.h>
++#if !defined(_WIN32)
++/* The thread dump samples each guest thread's host pc with a signal. */
++#include <pthread.h>
++#include <signal.h>
++#include <ucontext.h>
++#endif
+ 
+ /* Access to recompiled code registers. Per-thread: RECOMP_TLS comes from
+  * xbox_memory_layout.h and must match the definitions there -- a plain extern
+@@ -1984,6 +1990,7 @@ static void bridge_PsTerminateSystemThread(void)
+          * to do it. */
+         xbox_FreeThreadStack(g_thread_stack_top);
+         g_thread_stack_top = 0;
++        guest_cpu_part();
+         ExitThread(exit_status);
+     }
+ }
+@@ -9423,6 +9430,230 @@ static RECOMP_TLS int g_kernel_dispatch_slot = -1;
+ 
+ static void kernel_thunk_dispatch_body(void);
+ 
++/* Every thread that runs guest code, for RECOMP_THREAD_DUMP_SECS=<n>.
++ *
++ * A title that stops on a loading screen leaves a log that simply ends. The
++ * watchdog samples one thread, the one that started the title, and a title
++ * whose entry hands the game to a worker (MM3) has that one parked in a host
++ * wait by then. So each guest thread registers here from guest_cpu_join to
++ * guest_cpu_part and keeps the kernel call it is in up to date, and every n
++ * seconds a dump walks all of them: guest registers, the kernel call and its
++ * guest caller, the return sites on the guest stack and, on POSIX, the host
++ * pc, which names the lifted function a thread spins in when it makes no
++ * kernel calls at all. Off unless set, as it costs a store per kernel call. */
++#define GUEST_THREAD_SLOTS 64
++
++typedef struct {
++    int           used;
++    unsigned long tid;
++    uint32_t     *esp, *regs[6];
++    uint32_t      stack_top;
++    volatile int      ordinal;       /* kernel call in progress, or -1 */
++    volatile uint32_t caller, arg0, arg1;
++#if !defined(_WIN32)
++    pthread_t          self;
++    volatile uintptr_t pc, lr;
++    volatile int       sampled;
++#endif
++} GuestThreadSlot;
++
++static GuestThreadSlot g_guest_threads[GUEST_THREAD_SLOTS];
++static CRITICAL_SECTION g_guest_threads_lock;
++static unsigned g_thread_dump_secs;
++static RECOMP_TLS GuestThreadSlot *t_guest_slot;
++static volatile DWORD g_guest_cpu_owner;  /* who holds the guest CPU lock */
++
++#if !defined(_WIN32)
++extern char __executable_start[], etext[];
++
++/* Where this thread is on the host, asked by the dump with SIGUSR2. */
++static void guest_thread_sample(int sig, siginfo_t *si, void *uctx)
++{
++    GuestThreadSlot *s = t_guest_slot;
++    const ucontext_t *uc = (const ucontext_t *)uctx;
++
++    (void)sig; (void)si;
++    if (!s)
++        return;
++#if defined(__aarch64__)
++    s->pc = (uintptr_t)uc->uc_mcontext.pc;
++    s->lr = (uintptr_t)uc->uc_mcontext.regs[30];
++#elif defined(__x86_64__) && defined(REG_RIP)
++    s->pc = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
++#else
++    (void)uc;
++#endif
++    s->sampled = 1;
++}
++
++/* A host code address, as an offset into the executable when it is one. */
++static void guest_thread_print_pc(const char *name, uintptr_t pc)
++{
++    if (pc >= (uintptr_t)__executable_start && pc < (uintptr_t)etext)
++        fprintf(stderr, " %s=+0x%lx", name,
++                (unsigned long)(pc - (uintptr_t)__executable_start));
++    else if (pc)
++        fprintf(stderr, " %s=%p", name, (void *)pc);
++}
++#endif
++
++static void guest_threads_dump(unsigned seq)
++{
++    const uint8_t *mem = (const uint8_t *)g_xbox_mem_offset;
++    extern volatile uint64_t g_icall_count;
++    int i;
++
++    EnterCriticalSection(&g_guest_threads_lock);
++#if !defined(_WIN32)
++    for (i = 0; i < GUEST_THREAD_SLOTS; i++) {
++        GuestThreadSlot *s = &g_guest_threads[i];
++        if (s->used) {
++            s->sampled = 0;
++            s->pc = s->lr = 0;
++            pthread_kill(s->self, SIGUSR2);
++        }
++    }
++    {   /* a thread answers on its next instruction; 100 ms covers a busy host */
++        int waited, pending = 1;
++        for (waited = 0; waited < 100 && pending; waited++) {
++            Sleep(1);
++            pending = 0;
++            for (i = 0; i < GUEST_THREAD_SLOTS; i++)
++                if (g_guest_threads[i].used && !g_guest_threads[i].sampled)
++                    pending = 1;
++        }
++    }
++#endif
++    fprintf(stderr, "[THREADS] dump %u after %us: %lld kernel calls, %llu indirect calls",
++            seq, seq * g_thread_dump_secs, g_kernel_call_count,
++            (unsigned long long)g_icall_count);
++    if (g_guest_cpu_owner)
++        fprintf(stderr, ", guest CPU held by t%lu", (unsigned long)g_guest_cpu_owner);
++    fprintf(stderr, "\n");
++    for (i = 0; i < GUEST_THREAD_SLOTS; i++) {
++        GuestThreadSlot *s = &g_guest_threads[i];
++        uint32_t sp, top, a;
++        int shown = 0;
++
++        if (!s->used)
++            continue;
++        sp = *s->esp;
++        fprintf(stderr, "[THREADS] t%lu esp=%08X eax=%08X ecx=%08X edx=%08X"
++                        " ebx=%08X esi=%08X edi=%08X",
++                s->tid, sp, *s->regs[0], *s->regs[1], *s->regs[2],
++                *s->regs[3], *s->regs[4], *s->regs[5]);
++        if (s->ordinal >= 0)
++            fprintf(stderr, " in kernel ordinal %d from %08X (args %08X %08X)",
++                    s->ordinal, s->caller, s->arg0, s->arg1);
++        else
++            fprintf(stderr, " in guest code");
++#if !defined(_WIN32)
++        if (s->sampled) {
++            fprintf(stderr, ", host");
++            guest_thread_print_pc("pc", s->pc);
++            guest_thread_print_pc("lr", s->lr);
++        }
++#endif
++        fprintf(stderr, "\n[THREADS]   guest stack:");
++        /* Lifted calls push their guest return address, so the words in the
++         * code range are the call chain, give or take a stale one. */
++        top = s->stack_top ? s->stack_top : sp + 0x4000;
++        for (a = sp; sp && a < top && a < XBOX_TOTAL_RAM && shown < 24; a += 4) {
++            uint32_t word = *(const uint32_t *)(mem + a);
++            if (word >= g_xbox_code_lo && word < g_xbox_code_hi) {
++                fprintf(stderr, " %08X", word);
++                shown++;
++            }
++        }
++        fprintf(stderr, "\n");
++    }
++    fflush(stderr);
++    LeaveCriticalSection(&g_guest_threads_lock);
++}
++
++static DWORD WINAPI guest_threads_dump_thread(LPVOID unused)
++{
++    unsigned seq;
++
++    (void)unused;
++    for (seq = 1; ; seq++) {
++        Sleep(g_thread_dump_secs * 1000u);
++        guest_threads_dump(seq);
++    }
++    return 0;
++}
++
++static int guest_thread_dump_enabled(void)
++{
++    static int on = -1;
++
++    if (on < 0) {
++        const char *e = getenv("RECOMP_THREAD_DUMP_SECS");
++        g_thread_dump_secs = e ? (unsigned)atoi(e) : 0u;
++        on = g_thread_dump_secs > 0;
++        if (on) {
++            HANDLE h;
++#if !defined(_WIN32)
++            struct sigaction sa;
++            memset(&sa, 0, sizeof sa);
++            sa.sa_sigaction = guest_thread_sample;
++            sa.sa_flags = SA_SIGINFO | SA_RESTART;
++            sigemptyset(&sa.sa_mask);
++            sigaction(SIGUSR2, &sa, NULL);
++#endif
++            InitializeCriticalSection(&g_guest_threads_lock);
++            h = CreateThread(NULL, 0, guest_threads_dump_thread, NULL, 0, NULL);
++            if (h)
++                CloseHandle(h);
++            fprintf(stderr, "  [KERNEL] guest threads dumped every %us\n",
++                    g_thread_dump_secs);
++        }
++    }
++    return on;
++}
++
++/* First called from xbox_kernel_bridge_init, before any other guest thread
++ * exists, so the lazy setup above runs on one thread. */
++static void guest_thread_register(void)
++{
++    int i;
++
++    if (t_guest_slot || !guest_thread_dump_enabled())
++        return;
++    EnterCriticalSection(&g_guest_threads_lock);
++    for (i = 0; i < GUEST_THREAD_SLOTS; i++) {
++        GuestThreadSlot *s = &g_guest_threads[i];
++        if (s->used)
++            continue;
++        memset(s, 0, sizeof *s);
++        s->tid = GetCurrentThreadId();
++        s->esp = &g_esp;
++        s->regs[0] = &g_eax; s->regs[1] = &g_ecx; s->regs[2] = &g_edx;
++        s->regs[3] = &g_ebx; s->regs[4] = &g_esi; s->regs[5] = &g_edi;
++        s->stack_top = g_thread_stack_top;
++        s->ordinal = -1;
++#if !defined(_WIN32)
++        s->self = pthread_self();
++#endif
++        s->used = 1;
++        t_guest_slot = s;
++        break;
++    }
++    LeaveCriticalSection(&g_guest_threads_lock);
++}
++
++static void guest_thread_unregister(void)
++{
++    GuestThreadSlot *s = t_guest_slot;
++
++    if (!s)
++        return;
++    EnterCriticalSection(&g_guest_threads_lock);
++    s->used = 0;
++    t_guest_slot = NULL;
++    LeaveCriticalSection(&g_guest_threads_lock);
++}
++
+ /* The guest CPU lock (RECOMP_GUEST_LOCK=1).
+  *
+  * The Xbox has one CPU: two guest threads never run guest code at the same
+@@ -9464,19 +9695,25 @@ static int guest_cpu_enabled(void)
+ void guest_cpu_join(void)
+ {
+     t_guest_thread = 1;
++    guest_thread_register();
+     if (guest_cpu_enabled() && !t_guest_held) {
+         EnterCriticalSection(&g_guest_cpu);
+         t_guest_held = 1;
++        g_guest_cpu_owner = GetCurrentThreadId();
+     }
+ }
+ 
++/* Called when a host thread stops running guest code: its guest thread
++ * ended, or (the title's entry thread) it handed the game to a worker. */
+ void guest_cpu_part(void)
+ {
+     if (t_guest_held) {
+         t_guest_held = 0;
++        g_guest_cpu_owner = 0;
+         LeaveCriticalSection(&g_guest_cpu);
+     }
+     t_guest_thread = 0;
++    guest_thread_unregister();
+ }
+ 
+ /* A guest thread lets go of the guest CPU for the length of every kernel
+@@ -9486,6 +9723,7 @@ static void kernel_thunk_dispatch(void)
+     int held = t_guest_held;
+     if (held) {                        /* let other guest threads run meanwhile */
+         t_guest_held = 0;
++        g_guest_cpu_owner = 0;
+         LeaveCriticalSection(&g_guest_cpu);
+     }
+     t_dispatch_depth++;
+@@ -9497,6 +9735,7 @@ static void kernel_thunk_dispatch(void)
+     if (t_guest_thread && t_dispatch_depth == 0 && guest_cpu_enabled()) {
+         EnterCriticalSection(&g_guest_cpu);
+         t_guest_held = 1;
++        g_guest_cpu_owner = GetCurrentThreadId();
+     }
+     (void)held;
+ }
+@@ -9580,6 +9819,22 @@ static void kernel_thunk_dispatch_body(void)
+     g_xbox_kernel_caller = g_esp ? BRIDGE_MEM32(g_esp) : 0;
+     g_esp += 4;
+ 
++    /* What this thread is in, for the thread dump. Kept as a stack: an APC a
++     * wait runs makes kernel calls of its own. */
++    GuestThreadSlot *self = t_guest_slot;
++    int saved_ordinal = -1;
++    uint32_t saved_caller = 0, saved_arg0 = 0, saved_arg1 = 0;
++    if (self) {
++        saved_ordinal = self->ordinal;
++        saved_caller = self->caller;
++        saved_arg0 = self->arg0;
++        saved_arg1 = self->arg1;
++        self->caller = g_xbox_kernel_caller;
++        self->arg0 = STACK_ARG(0);
++        self->arg1 = STACK_ARG(1);
++        self->ordinal = (int)ordinal;
++    }
++
+     /* Name the bridge that corrupts a watched dword.
+      *
+      * A bridge hands Xbox pointers to real Win32 calls, so a bad one has
+@@ -9646,6 +9901,13 @@ static void kernel_thunk_dispatch_body(void)
+      * above; now pop the args. */
+     g_esp += g_slot_arg_bytes[slot];
+ 
++    if (self) {
++        self->caller = saved_caller;
++        self->arg0 = saved_arg0;
++        self->arg1 = saved_arg1;
++        self->ordinal = saved_ordinal;
++    }
++
+     if (g_kernel_watch_va) {
+         uint32_t _after = BRIDGE_MEM32(g_kernel_watch_va);
+         if (_after != _watch_before) {
+diff --git a/tests/thread_dump_posix/CMakeLists.txt b/tests/thread_dump_posix/CMakeLists.txt
+new file mode 100644
+index 0000000..ef7455b
+--- /dev/null
++++ b/tests/thread_dump_posix/CMakeLists.txt
+@@ -0,0 +1,14 @@
++cmake_minimum_required(VERSION 3.20)
++project(thread_dump_posix_test C)
++# RECOMP_THREAD_DUMP_SECS on a POSIX host, where it samples each guest
++# thread's host pc with a signal.
++if(WIN32)
++    message(FATAL_ERROR "This regression covers the POSIX thread dump")
++endif()
++set(CMAKE_C_STANDARD 11)
++add_subdirectory(../.. runtime)
++add_executable(thread_dump_posix_test test_main.c)
++target_include_directories(thread_dump_posix_test PRIVATE ../../src/kernel)
++target_link_libraries(thread_dump_posix_test PRIVATE xboxrecomp)
++enable_testing()
++add_test(NAME thread_dump_posix_test COMMAND thread_dump_posix_test)
+diff --git a/tests/thread_dump_posix/test_main.c b/tests/thread_dump_posix/test_main.c
+new file mode 100644
+index 0000000..f09c595
+--- /dev/null
++++ b/tests/thread_dump_posix/test_main.c
+@@ -0,0 +1,245 @@
++/*
++ * RECOMP_THREAD_DUMP_SECS: every guest thread, every n seconds.
++ *
++ * Three guest threads, each standing where a hung title's threads stand: the
++ * entry thread in a host wait, a worker inside a kernel call (a 2.5 s
++ * KeDelayExecutionThread), and a worker spinning in code that makes no calls.
++ * The first dump has to name each one -- registers, the kernel call and its
++ * guest caller, the return sites on its guest stack, and for the spinning
++ * one the host pc inside this executable, which is the only clue such a
++ * thread leaves. Once the sleeping worker has left, a later dump must no
++ * longer list it: its registers live in thread-local storage that is gone.
++ */
++#include "kernel.h"
++#include "xbox_memory_layout.h"   /* RECOMP_TLS */
++
++#include <errno.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++typedef void (*recomp_func_t)(void);
++recomp_func_t recomp_lookup(uint32_t xbox_va);
++recomp_func_t recomp_lookup(uint32_t xbox_va) { (void)xbox_va; return NULL; }
++recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
++recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NULL; }
++
++extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
++extern RECOMP_TLS uint32_t g_eax, g_ebx, g_esp;
++extern ptrdiff_t g_xbox_mem_offset;
++extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
++void guest_cpu_join(void);
++void guest_cpu_part(void);
++
++enum {
++    THUNK_VA    = 0x00010000,
++    MAIN_SP     = 0x00020000,
++    SLEEPER_SP  = 0x00030000,
++    SPINNER_SP  = 0x00040000,
++    INTERVAL_VA = 0x00200000,
++};
++
++static uint8_t *mem;
++static volatile int stop_spinning;
++static int failures;
++
++static void check(int ok, const char *what)
++{
++    printf("  %-58s %s\n", what, ok ? "PASS" : "FAIL");
++    if (!ok) failures++;
++}
++
++static uint32_t *guest(uint32_t va) { return (uint32_t *)(mem + va); }
++
++/* The dump's signal ends a plain sleep early; finish it. */
++static void sleep_ms(long ms)
++{
++    struct timespec left = { ms / 1000, (ms % 1000) * 1000000L };
++    while (nanosleep(&left, &left) != 0 && errno == EINTR)
++        ;
++}
++
++static void *sleeper(void *unused)
++{
++    (void)unused;
++    guest_cpu_join();
++    /* KeDelayExecutionThread(KernelMode, FALSE, &interval), called from a
++     * guest site at 0x00034000 by a function that 0x00056780 called. */
++    guest(SLEEPER_SP)[0] = 0x00034000u;      /* return address of the call */
++    guest(SLEEPER_SP)[1] = 0;
++    guest(SLEEPER_SP)[2] = 0;
++    guest(SLEEPER_SP)[3] = INTERVAL_VA;
++    guest(SLEEPER_SP)[4] = 0x00056780u;      /* the caller's own return site */
++    *(int64_t *)(mem + INTERVAL_VA) = -25000000;  /* 2.5 s, relative */
++    g_esp = SLEEPER_SP;
++    g_eax = 0x11111111u;
++    g_ebx = 0x22222222u;
++    recomp_lookup_kernel(*guest(THUNK_VA))();
++    guest_cpu_part();
++    return NULL;
++}
++
++static void *spinner(void *unused)
++{
++    volatile unsigned long n = 0;
++
++    (void)unused;
++    guest_cpu_join();
++    guest(SPINNER_SP)[0] = 0x00078900u;
++    g_esp = SPINNER_SP;
++    g_eax = 0x33333333u;
++    while (!stop_spinning)
++        n++;
++    guest_cpu_part();
++    return NULL;
++}
++
++/* The lines of the last dump in the log, or of dump `which`. */
++static char *dump_block(const char *log, int which)
++{
++    char header[32];
++    const char *start = NULL, *p;
++    char *block;
++    size_t len;
++
++    if (which > 0) {
++        snprintf(header, sizeof header, "[THREADS] dump %d ", which);
++        start = strstr(log, header);
++    } else {
++        for (p = log; (p = strstr(p, "[THREADS] dump ")) != NULL; p++)
++            start = p;
++    }
++    if (!start)
++        return NULL;
++    p = strstr(start + 1, "[THREADS] dump ");
++    len = p ? (size_t)(p - start) : strlen(start);
++    block = malloc(len + 1);
++    memcpy(block, start, len);
++    block[len] = 0;
++    return block;
++}
++
++static char *read_log(const char *path)
++{
++    FILE *f = fopen(path, "rb");
++    char *text = calloc(1, 1 << 20);
++    if (f) {
++        fread(text, 1, (1 << 20) - 1, f);
++        fclose(f);
++    }
++    return text;
++}
++
++static int count(const char *text, const char *needle)
++{
++    int n = 0;
++    for (; (text = strstr(text, needle)) != NULL; text++)
++        n++;
++    return n;
++}
++
++/* The thread line that mentions `marker` (a register value). */
++static int line_has(const char *block, const char *marker, const char *what)
++{
++    const char *line = strstr(block, marker);
++    const char *end;
++    if (!line)
++        return 0;
++    while (line > block && line[-1] != '\n')
++        line--;
++    end = strchr(line, '\n');
++    end = end ? strchr(end + 1, '\n') : NULL;   /* and its stack line */
++    {
++        size_t len = end ? (size_t)(end - line) : strlen(line);
++        char *copy = malloc(len + 1);
++        int found;
++        memcpy(copy, line, len);
++        copy[len] = 0;
++        found = strstr(copy, what) != NULL;
++        free(copy);
++        return found;
++    }
++}
++
++int main(void)
++{
++    char path[] = "/tmp/thread_dump_XXXXXX";
++    pthread_t sleeping, spinning;
++    char *log, *first, *last;
++    int fd = mkstemp(path);
++
++    setvbuf(stdout, NULL, _IONBF, 0);
++    if (fd < 0 || !freopen(path, "w", stderr)) {
++        printf("cannot capture stderr\n");
++        return 1;
++    }
++    close(fd);
++
++    mem = VirtualAlloc(NULL, 16 * 1024 * 1024, MEM_RESERVE | MEM_COMMIT,
++                       PAGE_READWRITE);
++    if (!mem) {
++        printf("no guest memory stand-in\n");
++        return 1;
++    }
++    g_xbox_mem_offset = (ptrdiff_t)mem;
++    g_xbox_code_lo = 0x00012000u;
++    g_xbox_code_hi = 0x00100000u;
++
++    setenv("RECOMP_THREAD_DUMP_SECS", "1", 1);
++    *guest(THUNK_VA) = 0x80000000u | 99u;   /* KeDelayExecutionThread */
++    xbox_kernel_set_thunk_address(THUNK_VA, 1);
++    xbox_kernel_bridge_init();              /* this thread joins here */
++
++    guest(MAIN_SP)[0] = 0x00001234u;        /* data, not a return site */
++    guest(MAIN_SP)[1] = 0x00045678u;
++    g_esp = MAIN_SP;
++    g_eax = 0x44444444u;
++
++    pthread_create(&sleeping, NULL, sleeper, NULL);
++    pthread_create(&spinning, NULL, spinner, NULL);
++    sleep_ms(1600);                         /* dump 1 lands at about 1 s */
++
++    log = read_log(path);
++    first = dump_block(log, 1);
++    check(first != NULL, "a dump is written after RECOMP_THREAD_DUMP_SECS");
++    if (first) {
++        check(count(first, "[THREADS] t") == 3, "it lists the three guest threads");
++        check(line_has(first, "eax=11111111", "ebx=22222222"),
++              "the sleeper's own registers, not the dumper's");
++        check(line_has(first, "eax=11111111", "in kernel ordinal 99 from 00034000"),
++              "the sleeper is in KeDelayExecutionThread, called from 00034000");
++        check(line_has(first, "eax=11111111", "guest stack: 00056780"),
++              "the sleeper's stack names its caller's return site");
++        check(line_has(first, "eax=33333333", "in guest code"),
++              "the spinner is in guest code");
++        check(line_has(first, "eax=33333333", "pc=+0x"),
++              "the spinner's host pc is inside the executable");
++        check(line_has(first, "eax=44444444", "guest stack: 00045678") &&
++              !line_has(first, "eax=44444444", "00001234"),
++              "the entry thread's stack skips what is not code");
++        free(first);
++    }
++    free(log);
++
++    pthread_join(sleeping, NULL);
++    sleep_ms(1200);                         /* at least one dump after it left */
++    stop_spinning = 1;
++    pthread_join(spinning, NULL);
++
++    log = read_log(path);
++    last = dump_block(log, 0);
++    check(last != NULL && count(last, "[THREADS] t") == 2 &&
++          !strstr(last, "eax=11111111"),
++          "a thread that left is no longer dumped");
++    if (failures)
++        printf("\nThe captured log:\n%s", log);
++    free(last);
++    free(log);
++    unlink(path);
++
++    printf("\n%d failure(s)\n", failures);
++    return failures ? 1 : 0;
++}
