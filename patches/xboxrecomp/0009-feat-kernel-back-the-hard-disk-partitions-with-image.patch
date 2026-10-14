@@ -1,0 +1,186 @@
+From cf60d20bb206b7a379587598a1d937b4c5332126 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 03:08:52 +0000
+Subject: [PATCH 9/9] feat(kernel): back the hard disk partitions with image
+ files on linux
+
+The POSIX path layer had no rule for \\Device\\Harddisk0\\PartitionN,
+so the open of the raw disk XAPI makes at boot to find the cache
+partitions failed and Midtown Madness 3 quit to the dashboard. Port the
+Win32 backend's behaviour: create the save-side directories, write the
+retail partition table into Partition0.img, size Partition1-5.img (sparse
+on Linux), map the bare partition devices to them, and let a directory
+open of a device image use the directory that holds it.
+---
+ src/kernel/kernel_file.c |  12 +++++
+ src/kernel/kernel_path.c | 113 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 125 insertions(+)
+
+diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
+index a899f07..18eaabc 100644
+--- a/src/kernel/kernel_file.c
++++ b/src/kernel/kernel_file.c
+@@ -841,6 +841,18 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+         return STATUS_OBJECT_PATH_NOT_FOUND;
+     }
+ 
++    /* A partition device opened as a directory, for a free-space query:
++     * hand out the directory that holds its image (see the Win32 backend). */
++    {
++        struct stat st;
++        if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
++            stat(host_path, &st) == 0 && S_ISREG(st.st_mode)) {
++            char *slash = strrchr(host_path, '/');
++            if (slash && slash != host_path)
++                *slash = 0;
++        }
++    }
++
+     int fd;
+     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
+         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
+diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
+index 601e0ce..3a2218f 100644
+--- a/src/kernel/kernel_path.c
++++ b/src/kernel/kernel_path.c
+@@ -484,6 +484,9 @@ translate:
+ #include <sys/types.h>
+ #include <errno.h>
+ #include <dirent.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stdint.h>
+ #include <strings.h>
+ 
+ static char s_game_dir[MAX_PATH];
+@@ -572,6 +575,79 @@ static void resolve_case(char* path, size_t keep)
+     }
+ }
+ 
++/* The raw disk device and its partitions, as in the Win32 backend above:
++ * Partition0.img carries the retail partition table at sector 4, the others
++ * start empty. */
++#define XBOX_DISK_IMAGE_NAME   "Partition0.img"
++#define XBOX_PART_TABLE_OFFSET 0x800
++#define XBOX_PART_IN_USE       0x80000000u
++
++static const unsigned long long xbox_part_sectors[6] = {
++    0,             /* 0: whole disk, holds only the table */
++    0x00465400ull, /* 1: E: game and saves                */
++    0x000FA000ull, /* 2: C: system                        */
++    0x00177000ull, /* 3: X: cache                         */
++    0x00177000ull, /* 4: Y: cache                         */
++    0x00177000ull, /* 5: Z: cache                         */
++};
++
++static void xbox_write_partition_table(const char *path)
++{
++    /* name[16], flags, lba_start, lba_size, reserved -- 32 bytes each */
++    static const struct { const char *name; uint32_t start, size; } parts[] = {
++        { "XBOX_PART_X",  0x00000400, 0x00177000 },  /* X: cache      */
++        { "XBOX_PART_Y",  0x00177400, 0x00177000 },  /* Y: cache      */
++        { "XBOX_PART_Z",  0x002EE400, 0x00177000 },  /* Z: cache      */
++        { "XBOX_PART_C",  0x00465400, 0x000FA000 },  /* C: system     */
++        { "XBOX_PART_E",  0x0055F400, 0x00465400 },  /* E: game/save  */
++    };
++    unsigned char sector[512];
++    size_t i;
++    int fd;
++
++    fd = open(path, O_WRONLY | O_CREAT, 0644);
++    if (fd < 0)
++        return;
++
++    memset(sector, 0, sizeof(sector));
++    memcpy(sector, "****PARTINFO****", 16);
++    for (i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
++        unsigned char *e = sector + 48 + i * 32;   /* 16 magic + 32 reserved */
++        size_t n = strlen(parts[i].name);
++        uint32_t v[4] = { XBOX_PART_IN_USE, parts[i].start, parts[i].size, 0 };
++        memset(e, ' ', 16);
++        memcpy(e, parts[i].name, n < 16 ? n : 16);
++        memcpy(e + 16, v, sizeof(v));   /* little-endian, as on the console */
++    }
++    if (pwrite(fd, sector, sizeof(sector), XBOX_PART_TABLE_OFFSET) != (ssize_t)sizeof(sector))
++        xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "writing %s: %s", path, strerror(errno));
++    close(fd);
++}
++
++/* "\Device\Harddisk0\PartitionN" with nothing below it -> its image file. */
++static BOOL xbox_partition_device_path(const char *xbox_path, char *out, size_t n)
++{
++    static const char *prefix = "\\Device\\Harddisk0\\Partition";
++    int len = match_prefix(xbox_path, prefix);
++    int digit;
++    const char *rest;
++
++    if (!len)
++        return FALSE;
++    digit = xbox_path[len];
++    if (digit < '0' || digit > '9')
++        return FALSE;
++
++    rest = xbox_path + len + 1;
++    if (*rest == '\\' || *rest == '/')
++        rest++;
++    if (*rest != '\0')
++        return FALSE;
++
++    snprintf(out, n, "%s/Partition%c.img", s_save_dir, digit);
++    return TRUE;
++}
++
+ void xbox_path_init(const char* game_dir, const char* save_dir)
+ {
+     if (game_dir) {
+@@ -601,6 +677,38 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
+     strip_trailing_slash(s_game_dir);
+     strip_trailing_slash(s_save_dir);
+ 
++    /* The save-side directories and the disk images, as the Win32 backend
++     * makes them (see there for why each is needed). The save dir becomes
++     * absolute once it exists, so a relative "saves" from the host keeps
++     * meaning the same place. */
++    {
++        static const char *subs[] = { "TitleData", "UserData", "Cache", "SystemData" };
++        char path[MAX_PATH];
++        char full[PATH_MAX];
++
++        mkdir_p(s_save_dir);
++        if (realpath(s_save_dir, full) && strlen(full) < sizeof(s_save_dir))
++            snprintf(s_save_dir, sizeof(s_save_dir), "%s", full);
++        for (int i = 0; i < (int)(sizeof(subs) / sizeof(subs[0])); i++) {
++            snprintf(path, sizeof(path), "%s/%s", s_save_dir, subs[i]);
++            mkdir_p(path);
++        }
++        snprintf(path, sizeof(path), "%s/%s", s_save_dir, XBOX_DISK_IMAGE_NAME);
++        xbox_write_partition_table(path);
++        /* The other partitions, sized to the table's geometry. Files on
++         * Linux are sparse until written, so the 750 MB caches cost nothing. */
++        for (int p = 1; p <= 5; p++) {
++            int fd;
++            snprintf(path, sizeof(path), "%s/Partition%d.img", s_save_dir, p);
++            fd = open(path, O_WRONLY | O_CREAT, 0644);
++            if (fd < 0)
++                continue;
++            if (ftruncate(fd, (off_t)(xbox_part_sectors[p] * 512ull)) != 0)
++                xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "sizing %s: %s", path, strerror(errno));
++            close(fd);
++        }
++    }
++
+     s_initialized = TRUE;
+     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s",
+              s_game_dir, s_save_dir);
+@@ -625,6 +733,11 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
+             return xbox_translate_path(linked, host_path_buf, buf_size);
+     }
+ 
++    if (xbox_partition_device_path(xbox_path, host_path_buf, buf_size)) {
++        XBOX_TRACE(XBOX_LOG_PATH, "%s -> partition image %s", xbox_path, host_path_buf);
++        return TRUE;
++    }
++
+     for (int i = 0; i < PATH_RULE_COUNT; i++) {
+         skip = match_prefix(xbox_path, s_rules[i].prefix);
+         if (skip) {

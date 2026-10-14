@@ -1,0 +1,1021 @@
+From 9472786c05bfeee2b98be82ab488227ffe1229c2 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 03:31:15 +0000
+Subject: [PATCH 1/4] feat(linux): build and run the game on linux
+
+The game builds with GCC or Clang against the xboxrecomp runtime's
+Linux port: SDL2 for the window, input and audio, and the D3D11
+renderer on DXVK-native. The launcher runs on RmlUi's SDL2 and OpenGL 3
+backends, with the desktop's sans-serif font and controllers through SDL.
+
+- CMake: a Linux branch for the launcher backend and libraries; the
+  translated code keeps MSVC's semantics (no strict aliasing, wrapping
+  signed arithmetic, no fused multiply-adds)
+- src/mm3_win32.h: windows.h on Windows, the runtime's win32_compat.h
+  elsewhere, for the sources that only need the basic Win32 calls
+- main.c: the crash report reads the signal's ucontext on x86-64 and
+  arm64 Linux
+- the teleport debugger stays Windows only; its player update hook does
+  not
+- recomp_manual.c: a full fence where x86 has _mm_sfence
+---
+ CMakeLists.txt            |  37 ++++++-
+ src/main.c                |  52 ++++++++--
+ src/mm3_launcher.cpp      | 105 ++++++++++++++++++-
+ src/mm3_launcher_posix.h  | 201 +++++++++++++++++++++++++++++++++++
+ src/mm3_launcher_sdl.cpp  | 213 ++++++++++++++++++++++++++++++++++++++
+ src/mm3_win32.h           |  16 +++
+ src/mods/dev_tools.c      |   2 +-
+ src/mods/framerate.c      |   2 +-
+ src/mods/menu_mouse.c     |   2 +-
+ src/mods/mods.c           |   2 +-
+ src/mods/skip_intro.c     |   2 +-
+ src/mods/teleport.c       |  23 ++++
+ src/mods/widescreen_hud.c |   2 +-
+ src/recomp_manual.c       |   6 ++
+ 14 files changed, 642 insertions(+), 23 deletions(-)
+ create mode 100644 src/mm3_launcher_posix.h
+ create mode 100644 src/mm3_launcher_sdl.cpp
+ create mode 100644 src/mm3_win32.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c94cd5f..9bb744e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -163,13 +163,26 @@ foreach(distance_input IN LISTS distance_owners)
+     list(APPEND RECOMP_GEN_SOURCES "${distance_output}")
+ endforeach()
+ 
++if(WIN32)
++    set(MM3_LAUNCHER_BACKEND
++        src/mm3.rc
++        ${rmlui_SOURCE_DIR}/Backends/RmlUi_Platform_Win32.cpp
++        ${rmlui_SOURCE_DIR}/Backends/RmlUi_Renderer_DX11.cpp
++        ${rmlui_SOURCE_DIR}/Backends/RmlUi_Backend_Win32_DX11.cpp)
++else()
++    # Linux: the launcher on SDL2 and OpenGL 3.3, the game window on SDL2 and
++    # DXVK (tools/xboxrecomp/src/video).
++    find_package(SDL2 REQUIRED)
++    set(MM3_LAUNCHER_BACKEND
++        src/mm3_launcher_sdl.cpp
++        ${rmlui_SOURCE_DIR}/Backends/RmlUi_Platform_SDL.cpp
++        ${rmlui_SOURCE_DIR}/Backends/RmlUi_Renderer_GL3.cpp)
++endif()
++
+ add_executable(${PROJECT_NAME}
+     src/main.c
+     src/mm3_launcher.cpp
+-    src/mm3.rc
+-    ${rmlui_SOURCE_DIR}/Backends/RmlUi_Platform_Win32.cpp
+-    ${rmlui_SOURCE_DIR}/Backends/RmlUi_Renderer_DX11.cpp
+-    ${rmlui_SOURCE_DIR}/Backends/RmlUi_Backend_Win32_DX11.cpp
++    ${MM3_LAUNCHER_BACKEND}
+     src/mods/mods.c
+     src/mods/dev_tools.c
+     src/mods/menu_mouse.c
+@@ -210,7 +223,12 @@ target_include_directories(${PROJECT_NAME} PRIVATE
+     ${XBOXRECOMP_DIR}/include
+     ${XBOXRECOMP_DIR}/src/video)
+ 
+-target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp RmlUi::RmlUi d3d11 dxgi d3dcompiler dwmapi xinput)
++if(WIN32)
++    target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp RmlUi::RmlUi d3d11 dxgi d3dcompiler dwmapi xinput)
++else()
++    target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp RmlUi::RmlUi SDL2::SDL2 ${CMAKE_DL_LIBS})
++    target_compile_definitions(${PROJECT_NAME} PRIVATE RMLUI_SDL_VERSION_MAJOR=2)
++endif()
+ target_include_directories(${PROJECT_NAME} PRIVATE ${rmlui_SOURCE_DIR}/Backends)
+ 
+ # MM3's CRT uses NtAllocateVirtualMemory reserve requests as heap-backed
+@@ -229,4 +247,13 @@ endif()
+ 
+ if(MSVC)
+     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
++else()
++    # The translated code keeps what MSVC gives it: memory read through any
++    # type, wrapping signed arithmetic, and no fused multiply-adds (arm64
++    # compilers fuse by default, which moves the physics off the x86 results).
++    target_compile_options(${PROJECT_NAME} PRIVATE -fno-strict-aliasing -fwrapv -ffp-contract=off)
++    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
++        # The translator writes every condition as if ((a == b)).
++        target_compile_options(${PROJECT_NAME} PRIVATE -Wno-parentheses-equality)
++    endif()
+ endif()
+diff --git a/src/main.c b/src/main.c
+index 1b0df11..7ad057c 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -1,8 +1,15 @@
++#if !defined(_WIN32) && !defined(_GNU_SOURCE)
++#define _GNU_SOURCE /* REG_RIP and friends in ucontext.h */
++#endif
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+-#include <windows.h>
++#include "mm3_win32.h"
++#if !defined(_WIN32)
++#include <execinfo.h>
++#include <ucontext.h>
++#endif
+ 
+ #include <xbox/xboxrecomp.h>
+ 
+@@ -35,7 +42,7 @@ void sub_00083A6C(void)
+         if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                              GetCurrentProcess(), &current,
+                              SYNCHRONIZE, FALSE, 0)) {
+-            fprintf(stderr, "cannot register MM3 main worker: %lu\n", GetLastError());
++            fprintf(stderr, "cannot register MM3 main worker: %lu\n", (unsigned long)GetLastError());
+             ExitProcess(1);
+         }
+         if (InterlockedCompareExchangePointer((PVOID volatile *)&g_mm3_main_worker,
+@@ -43,7 +50,7 @@ void sub_00083A6C(void)
+             CloseHandle(current);
+         } else {
+             fprintf(stderr, "[MM3_MAIN_THREAD] tid=%lu entry=00083A6C\n",
+-                    GetCurrentThreadId());
++                    (unsigned long)GetCurrentThreadId());
+             SetEvent(g_mm3_main_worker_ready);
+         }
+     }
+@@ -53,24 +60,55 @@ void sub_00083A6C(void)
+ static LONG WINAPI mm3_crash_report(EXCEPTION_POINTERS *info)
+ {
+     const EXCEPTION_RECORD *record = info ? info->ExceptionRecord : NULL;
+-    const CONTEXT *context = info ? info->ContextRecord : NULL;
++    PCONTEXT context = info ? info->ContextRecord : NULL;
+     ULONG_PTR fault = record && record->NumberParameters > 1
+         ? record->ExceptionInformation[1] : 0;
++#if defined(_WIN32)
+     uintptr_t module_base = (uintptr_t)GetModuleHandleW(NULL);
++    uintptr_t pc = context ? (uintptr_t)context->Rip : 0;
++#else
++    /* On Linux the context is the signal's ucontext_t. */
++    extern char __executable_start[];
++    uintptr_t module_base = (uintptr_t)__executable_start;
++    const ucontext_t *uc = (const ucontext_t *)context;
++#if defined(__aarch64__)
++    uintptr_t pc = uc ? (uintptr_t)uc->uc_mcontext.pc : 0;
++#else
++    uintptr_t pc = uc ? (uintptr_t)uc->uc_mcontext.gregs[REG_RIP] : 0;
++#endif
++#endif
+     fprintf(stderr, "[CRASH] code=0x%08lX address=%p guest_esp=0x%08X eax=0x%08X\n",
+-            record ? record->ExceptionCode : 0,
++            record ? (unsigned long)record->ExceptionCode : 0,
+             record ? record->ExceptionAddress : NULL,
+             g_esp, g_eax);
++#if defined(_WIN32)
+     fprintf(stderr, "[CRASH] fault=%p rip=%p rsp=%p rax=%llX rdx=%llX\n",
+             (void *)fault,
+             context ? (void *)context->Rip : NULL,
+             context ? (void *)context->Rsp : NULL,
+             context ? context->Rax : 0,
+             context ? context->Rdx : 0);
++#elif defined(__aarch64__)
++    fprintf(stderr, "[CRASH] fault=%p pc=%p sp=%p x0=%llX x1=%llX lr=%llX\n",
++            (void *)fault, (void *)pc, uc ? (void *)uc->uc_mcontext.sp : NULL,
++            uc ? (unsigned long long)uc->uc_mcontext.regs[0] : 0,
++            uc ? (unsigned long long)uc->uc_mcontext.regs[1] : 0,
++            uc ? (unsigned long long)uc->uc_mcontext.regs[30] : 0);
++#else
++    fprintf(stderr, "[CRASH] fault=%p rip=%p rsp=%p rax=%llX rdx=%llX\n",
++            (void *)fault, (void *)pc,
++            uc ? (void *)uc->uc_mcontext.gregs[REG_RSP] : NULL,
++            uc ? (unsigned long long)uc->uc_mcontext.gregs[REG_RAX] : 0,
++            uc ? (unsigned long long)uc->uc_mcontext.gregs[REG_RDX] : 0);
++#endif
+     {
+         void *frames[16];
++#if defined(_WIN32)
+         USHORT count = CaptureStackBackTrace(0, 16, frames, NULL);
+         USHORT i;
++#else
++        int count = backtrace(frames, 16), i;
++#endif
+         for (i = 0; i < count; ++i)
+             fprintf(stderr, "[CRASH_NATIVE] frame=%u rva=0x%llX\n",
+                     (unsigned)i,
+@@ -81,7 +119,7 @@ static LONG WINAPI mm3_crash_report(EXCEPTION_POINTERS *info)
+     }
+    fprintf(stderr, "[CRASH] module=%p rip_rva=0x%llX\n",
+             (void *)module_base,
+-            context ? (unsigned long long)((uintptr_t)context->Rip - module_base) : 0);
++            pc ? (unsigned long long)(pc - module_base) : 0);
+     fprintf(stderr, "[CRASH] xbox_mem_offset=%lld memory_base=%p\n",
+             (long long)g_xbox_mem_offset, xbox_GetMemoryBase());
+     fprintf(stderr, "[CRASH] guest fs=0x%08X ebp=0x%08X seh_ebp=0x%08X ecx=0x%08X ebx=0x%08X esi=0x%08X edi=0x%08X\n",
+@@ -234,7 +272,7 @@ int main(void)
+     if (getenv("MM3_TRACE_BOOT_STATE")) {
+         fprintf(stderr,
+                 "[BOOT_STATE] host_tid=%lu eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X ebp=%08X esp=%08X fs=%08X stack=%08X,%08X,%08X fsdata=%08X,%08X,%08X,%08X kernel=%08X,%08X,%08X kdata=%08X\n",
+-                GetCurrentThreadId(), g_eax, g_ebx, g_ecx, g_edx, g_esi,
++                (unsigned long)GetCurrentThreadId(), g_eax, g_ebx, g_ecx, g_edx, g_esi,
+                 g_edi, g_ebp, g_esp, g_fs_base, MEM32(g_esp),
+                 MEM32(g_esp + 4), MEM32(g_esp + 8), MEM32(g_fs_base),
+                 MEM32(g_fs_base + 4), MEM32(g_fs_base + 8),
+diff --git a/src/mm3_launcher.cpp b/src/mm3_launcher.cpp
+index 0da2c7d..41e543c 100644
+--- a/src/mm3_launcher.cpp
++++ b/src/mm3_launcher.cpp
+@@ -4,10 +4,18 @@
+  * as KEY=VALUE next to game_files\ and Play exports them to the runtime. */
+ #include <RmlUi/Core.h>
+ #include <RmlUi_Backend.h>
++#if defined(_WIN32)
+ #include <RmlUi_Renderer_DX11.h>
+ #include <windows.h>
+ #include <dwmapi.h>
+ #include <Xinput.h>
++typedef RenderInterface_DX11 RenderInterface_Launcher;
++#else
++#include <RmlUi_Renderer_GL3.h>
++#include <unistd.h>
++#include "mm3_launcher_posix.h"
++typedef RenderInterface_GL3 RenderInterface_Launcher;
++#endif
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -142,6 +150,12 @@ bool g_pad;    /* the last input was a controller: show its button hints */
+ bool g_scroll; /* bring the focused row into view after the next update */
+ int g_type = -1; /* a text option whose field takes the keyboard next update */
+ 
++#if defined(_WIN32)
++#define MM3_MISSING_TEXT "game_files\\default.xbe not found. Run scripts\\setup.ps1."
++#else
++#define MM3_MISSING_TEXT "game_files/default.xbe not found. Build the game from your disc first."
++#endif
++
+ const char kDocument[] = R"RML(
+ <rml><head><title>Midtown Madness 3</title><style>
+ body { width: 100%; height: 100%; font-family: Segoe UI; font-size: 14dp; color: #e6e7ea;
+@@ -264,7 +278,7 @@ scrollbarvertical sliderbar { background-color: #2f333c; border-radius: 2dp; }
+     <div class="ghost" data-if="!pad" data-event-click="quit()">Quit</div>
+     <div id="hints" data-if="pad"><span class="glyph">LB</span><span class="glyph pair">RB</span>Tabs<span
+       class="glyph">A</span>Change<span class="glyph">Y</span>Defaults<span class="glyph">Back</span>Quit</div>
+-    <div id="status"><span data-if="missing">game_files\default.xbe not found. Run scripts\setup.ps1.</span></div>
++    <div id="status"><span data-if="missing">)RML" MM3_MISSING_TEXT R"RML(</span></div>
+     <div id="play" data-class-off="missing" data-event-click="play()"><span class="glyph start" data-if="pad">Start</span>Play</div>
+   </div>
+ </body></rml>
+@@ -280,10 +294,11 @@ Rml::String key_name(int vk)
+     case VK_XBUTTON1: return "Mouse 4";
+     case VK_XBUTTON2: return "Mouse 5";
+     }
++    char name[64];
++#if defined(_WIN32)
+     LONG param = (LONG)MapVirtualKeyA(vk, MAPVK_VK_TO_VSC) << 16;
+     if (vk >= VK_PRIOR && vk <= VK_DELETE) /* the extended navigation block, not the numpad */
+         param |= 1 << 24;
+-    char name[64];
+     if ((param >> 16) && GetKeyNameTextA(param, name, sizeof name)) {
+         /* Windows names some keys in capitals (ENTER, BACKSPACE). */
+         for (char *c = name + 1; *c; c++)
+@@ -291,6 +306,22 @@ Rml::String key_name(int vk)
+                 *c = (char)tolower((unsigned char)*c);
+         return name;
+     }
++#else
++    /* Either shift, ctrl or alt: Windows names the generic keys this way. */
++    switch (vk) {
++    case VK_SHIFT: return "Shift";
++    case VK_CONTROL: return "Ctrl";
++    case VK_MENU: return "Alt";
++    }
++    /* By the keyboard layout once SDL's video is up, else by the US one. */
++    if (const int sc = mm3_vk_scancode(vk)) {
++        const char *s = SDL_GetKeyName(SDL_GetKeyFromScancode((SDL_Scancode)sc));
++        if (!*s)
++            s = SDL_GetScancodeName((SDL_Scancode)sc);
++        if (*s)
++            return s;
++    }
++#endif
+     snprintf(name, sizeof name, "Key %02X", vk);
+     return name;
+ }
+@@ -480,6 +511,7 @@ void save_and_export()
+ }
+ 
+ /* Started from build\<config>\: run from the folder above that holds game_files\. */
++#if defined(_WIN32)
+ bool find_game_dir()
+ {
+     char dir[MAX_PATH];
+@@ -496,6 +528,26 @@ bool find_game_dir()
+     }
+     return false;
+ }
++#else
++bool find_game_dir()
++{
++    char dir[MAX_PATH];
++    if (access("game_files/default.xbe", R_OK) == 0)
++        return true;
++    const ssize_t n = readlink("/proc/self/exe", dir, sizeof dir - 1);
++    if (n <= 0)
++        return false;
++    dir[n] = 0;
++    for (char *slash; (slash = strrchr(dir, '/')) != NULL && slash != dir;) {
++        *slash = 0;
++        char probe[MAX_PATH + 32];
++        snprintf(probe, sizeof probe, "%s/game_files/default.xbe", dir);
++        if (access(probe, R_OK) == 0)
++            return chdir(dir) == 0;
++    }
++    return false;
++}
++#endif
+ 
+ void play()
+ {
+@@ -738,6 +790,7 @@ void poll_mouse()
+ }
+ 
+ /* A dark title bar in the launcher's colour instead of the light default. */
++#if defined(_WIN32)
+ void dark_title_bar()
+ {
+     HWND hwnd = NULL;
+@@ -759,6 +812,9 @@ void dark_title_bar()
+         SendMessageA(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icon);
+     }
+ }
++#else
++void dark_title_bar() {} /* the desktop's decorations */
++#endif
+ 
+ bool list_ready(Rml::Context *ctx)
+ {
+@@ -807,6 +863,7 @@ bool on_key(Rml::Context *ctx, Rml::Input::KeyIdentifier key, int mods, float, b
+     return false;
+ }
+ 
++#if defined(_WIN32)
+ void load_fonts()
+ {
+     char fonts[MAX_PATH];
+@@ -817,6 +874,28 @@ void load_fonts()
+         Rml::LoadFontFace(path);
+     }
+ }
++#else
++/* No Segoe UI here: the desktop's sans-serif from fontconfig, registered
++ * under the family the document asks for. */
++void load_fonts()
++{
++    static const struct {
++        const char *style;
++        Rml::Style::FontWeight weight;
++    } kFaces[] = {{"Regular", Rml::Style::FontWeight::Normal}, {"Bold", Rml::Style::FontWeight::Bold}};
++    for (const auto &face : kFaces) {
++        char cmd[96], path[MAX_PATH] = "";
++        snprintf(cmd, sizeof cmd, "fc-match -f '%%{file}' 'sans-serif:style=%s' 2>/dev/null", face.style);
++        if (FILE *p = popen(cmd, "r")) {
++            if (!fgets(path, sizeof path, p))
++                path[0] = 0;
++            pclose(p);
++        }
++        if (!path[0] || !Rml::LoadFontFace(path, "Segoe UI", Rml::Style::FontStyle::Normal, face.weight))
++            fprintf(stderr, "[launcher] no %s sans-serif font (fc-match)\n", face.style);
++    }
++}
++#endif
+ 
+ /* The backend's system interface, with RmlUi's log on stderr like the rest
+  * of the runtime's diagnostics instead of OutputDebugString. */
+@@ -910,10 +989,12 @@ bool bind_model(Rml::Context *ctx)
+ /* 1 = play with the chosen settings exported, 0 = the user quit. */
+ extern "C" int mm3_launcher(void)
+ {
++#if defined(_WIN32)
+     /* Double-clicked: the console only carries diagnostics, drop it. */
+     DWORD pids[2];
+     if (GetConsoleProcessList(pids, 2) == 1)
+         FreeConsole();
++#endif
+ 
+     g_missing = !find_game_dir();
+     load_settings();
+@@ -922,16 +1003,30 @@ extern "C" int mm3_launcher(void)
+     if (const char *tab = getenv("MM3_LAUNCHER_TAB"))
+         g_tab = atoi(tab) >= 0 && atoi(tab) <= 2 ? atoi(tab) : 0;
+ 
++#if defined(_WIN32)
+     /* Not DPI-aware yet, so the work area is in the backend's 96-dpi units. */
+     RECT work = {0, 0, 760, 720};
+     SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0);
+-    const int width = Rml::Math::Min(760, (int)(work.right - work.left) * 9 / 10);
+-    const int height = Rml::Math::Min(720, (int)(work.bottom - work.top) * 9 / 10);
++    const int work_w = (int)(work.right - work.left), work_h = (int)(work.bottom - work.top);
++#else
++    SDL_Rect work = {0, 0, 760, 720};
++    if (SDL_InitSubSystem(SDL_INIT_VIDEO) == 0) {
++        SDL_GetDisplayUsableBounds(0, &work);
++        SDL_QuitSubSystem(SDL_INIT_VIDEO);
++    }
++    const int work_w = work.w, work_h = work.h;
++#endif
++    const int width = Rml::Math::Min(760, work_w * 9 / 10);
++    const int height = Rml::Math::Min(720, work_h * 9 / 10);
+     if (!Backend::Initialize("Midtown Madness 3", width, height, false)) {
+         save_and_export(); /* no launcher: play with the saved settings */
+         return 1;
+     }
+     dark_title_bar();
++#if !defined(_WIN32)
++    for (Bind &b : g_binds) /* named by the keyboard layout, now SDL knows it */
++        set_key(b, b.vk);
++#endif
+     g_system.base = Backend::GetSystemInterface();
+     Rml::SetSystemInterface(&g_system);
+     Rml::SetRenderInterface(Backend::GetRenderInterface());
+@@ -989,7 +1084,7 @@ extern "C" int mm3_launcher(void)
+              * A hidden startup need not send another one: seed its viewport
+              * from the context's actual pixel size before drawing. */
+             const Rml::Vector2i dimensions = ctx->GetDimensions();
+-            static_cast<RenderInterface_DX11 *>(Backend::GetRenderInterface())->SetViewport(
++            static_cast<RenderInterface_Launcher *>(Backend::GetRenderInterface())->SetViewport(
+                 dimensions.x, dimensions.y);
+             Backend::BeginFrame();
+             ctx->Render();
+diff --git a/src/mm3_launcher_posix.h b/src/mm3_launcher_posix.h
+new file mode 100644
+index 0000000..43ac892
+--- /dev/null
++++ b/src/mm3_launcher_posix.h
+@@ -0,0 +1,201 @@
++/* The Win32 calls the launcher polls input with, on SDL2 (Linux). Only
++ * src/mm3_launcher.cpp includes this; the launcher's window comes from
++ * src/mm3_launcher_sdl.cpp. Keys are reported as the Windows virtual keys
++ * the game window records (RECOMP_KEYMAP is written in them). */
++#ifndef MM3_LAUNCHER_POSIX_H
++#define MM3_LAUNCHER_POSIX_H
++
++#include <SDL.h>
++#include <limits.h>
++#include <stdint.h>
++#include <stdlib.h>
++
++typedef uint16_t WORD;
++typedef uint32_t DWORD;
++typedef int32_t LONG;
++typedef void *HWND;
++struct POINT {
++    LONG x, y;
++};
++
++#define MAX_PATH PATH_MAX
++#define ERROR_SUCCESS 0u
++#define ERROR_DEVICE_NOT_CONNECTED 1167u
++#define XUSER_MAX_COUNT 4
++
++#define VK_LBUTTON 0x01
++#define VK_RBUTTON 0x02
++#define VK_MBUTTON 0x04
++#define VK_XBUTTON1 0x05
++#define VK_XBUTTON2 0x06
++#define VK_BACK 0x08
++#define VK_RETURN 0x0D
++#define VK_SHIFT 0x10
++#define VK_CONTROL 0x11
++#define VK_MENU 0x12
++#define VK_ESCAPE 0x1B
++#define VK_PRIOR 0x21
++#define VK_LEFT 0x25
++#define VK_UP 0x26
++#define VK_RIGHT 0x27
++#define VK_DOWN 0x28
++#define VK_DELETE 0x2E
++#define VK_NUMPAD2 0x62
++#define VK_NUMPAD4 0x64
++#define VK_NUMPAD6 0x66
++#define VK_NUMPAD8 0x68
++#define VK_F1 0x70
++#define VK_F2 0x71
++#define VK_F3 0x72
++#define VK_LSHIFT 0xA0
++#define VK_RSHIFT 0xA1
++#define VK_LCONTROL 0xA2
++#define VK_RCONTROL 0xA3
++#define VK_LMENU 0xA4
++#define VK_RMENU 0xA5
++
++#define XINPUT_GAMEPAD_DPAD_UP 0x0001
++#define XINPUT_GAMEPAD_DPAD_DOWN 0x0002
++#define XINPUT_GAMEPAD_DPAD_LEFT 0x0004
++#define XINPUT_GAMEPAD_DPAD_RIGHT 0x0008
++#define XINPUT_GAMEPAD_START 0x0010
++#define XINPUT_GAMEPAD_BACK 0x0020
++#define XINPUT_GAMEPAD_LEFT_THUMB 0x0040
++#define XINPUT_GAMEPAD_RIGHT_THUMB 0x0080
++#define XINPUT_GAMEPAD_LEFT_SHOULDER 0x0100
++#define XINPUT_GAMEPAD_RIGHT_SHOULDER 0x0200
++#define XINPUT_GAMEPAD_A 0x1000
++#define XINPUT_GAMEPAD_B 0x2000
++#define XINPUT_GAMEPAD_X 0x4000
++#define XINPUT_GAMEPAD_Y 0x8000
++
++struct XINPUT_GAMEPAD {
++    WORD wButtons;
++    uint8_t bLeftTrigger, bRightTrigger;
++    int16_t sThumbLX, sThumbLY, sThumbRX, sThumbRY;
++};
++struct XINPUT_STATE {
++    DWORD dwPacketNumber;
++    XINPUT_GAMEPAD Gamepad;
++};
++
++#include "sdl_keys.h" /* the game window's key table */
++
++SDL_Window *mm3_launcher_window(void);
++
++/* The launcher's window while it has the keyboard, as Windows' active
++ * window: input is only read then. */
++static inline HWND GetActiveWindow(void)
++{
++    SDL_Window *w = mm3_launcher_window();
++    return w && (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS) ? (HWND)w : NULL;
++}
++
++static inline int mm3_vk_down(int vk)
++{
++    const Uint32 mouse = SDL_GetMouseState(NULL, NULL);
++    switch (vk) {
++    case VK_LBUTTON: return (mouse & SDL_BUTTON_LMASK) != 0;
++    case VK_RBUTTON: return (mouse & SDL_BUTTON_RMASK) != 0;
++    case VK_MBUTTON: return (mouse & SDL_BUTTON_MMASK) != 0;
++    case VK_XBUTTON1: return (mouse & SDL_BUTTON_X1MASK) != 0;
++    case VK_XBUTTON2: return (mouse & SDL_BUTTON_X2MASK) != 0;
++    case VK_SHIFT: return mm3_vk_down(VK_LSHIFT) || mm3_vk_down(VK_RSHIFT);
++    case VK_CONTROL: return mm3_vk_down(VK_LCONTROL) || mm3_vk_down(VK_RCONTROL);
++    case VK_MENU: return mm3_vk_down(VK_LMENU) || mm3_vk_down(VK_RMENU);
++    }
++    int count = 0;
++    const Uint8 *keys = SDL_GetKeyboardState(&count);
++    for (int sc = 0; sc < count; sc++)
++        if (keys[sc] && xbox_SdlScancodeToVk(sc) == vk)
++            return 1;
++    return 0;
++}
++
++static inline short GetAsyncKeyState(int vk)
++{
++    return mm3_vk_down(vk) ? (short)0x8000 : 0;
++}
++
++/* The first scancode the game window maps to vk, 0 if none. */
++static inline int mm3_vk_scancode(int vk)
++{
++    for (int sc = 1; sc < SDL_NUM_SCANCODES; sc++)
++        if (xbox_SdlScancodeToVk(sc) == vk)
++            return sc;
++    return 0;
++}
++
++static inline int GetCursorPos(POINT *p)
++{
++    int x = 0, y = 0;
++    SDL_GetGlobalMouseState(&x, &y);
++    p->x = x;
++    p->y = y;
++    return 1;
++}
++
++/* Controllers by SDL's game controller mapping, numbered in the order SDL
++ * lists them, in XInput's layout (as tools/xboxrecomp/src/input/xinput_sdl.c
++ * gives the game). */
++static inline DWORD XInputGetState(DWORD slot, XINPUT_STATE *s)
++{
++    static SDL_GameController *pads[XUSER_MAX_COUNT];
++    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER) && SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0)
++        return ERROR_DEVICE_NOT_CONNECTED;
++    if (slot >= XUSER_MAX_COUNT)
++        return ERROR_DEVICE_NOT_CONNECTED;
++    SDL_GameControllerUpdate();
++    SDL_GameController *&pad = pads[slot];
++    if (pad && !SDL_GameControllerGetAttached(pad)) {
++        SDL_GameControllerClose(pad);
++        pad = NULL;
++    }
++    if (!pad) {
++        int index = -1;
++        for (int i = 0, seen = 0; i < SDL_NumJoysticks(); i++)
++            if (SDL_IsGameController(i) && seen++ == (int)slot)
++                index = i;
++        if (index < 0 || !(pad = SDL_GameControllerOpen(index)))
++            return ERROR_DEVICE_NOT_CONNECTED;
++    }
++    static const struct {
++        SDL_GameControllerButton button;
++        WORD bit;
++    } kButtons[] = {
++        {SDL_CONTROLLER_BUTTON_A, XINPUT_GAMEPAD_A},
++        {SDL_CONTROLLER_BUTTON_B, XINPUT_GAMEPAD_B},
++        {SDL_CONTROLLER_BUTTON_X, XINPUT_GAMEPAD_X},
++        {SDL_CONTROLLER_BUTTON_Y, XINPUT_GAMEPAD_Y},
++        {SDL_CONTROLLER_BUTTON_LEFTSHOULDER, XINPUT_GAMEPAD_LEFT_SHOULDER},
++        {SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER},
++        {SDL_CONTROLLER_BUTTON_START, XINPUT_GAMEPAD_START},
++        {SDL_CONTROLLER_BUTTON_BACK, XINPUT_GAMEPAD_BACK},
++        {SDL_CONTROLLER_BUTTON_LEFTSTICK, XINPUT_GAMEPAD_LEFT_THUMB},
++        {SDL_CONTROLLER_BUTTON_RIGHTSTICK, XINPUT_GAMEPAD_RIGHT_THUMB},
++        {SDL_CONTROLLER_BUTTON_DPAD_UP, XINPUT_GAMEPAD_DPAD_UP},
++        {SDL_CONTROLLER_BUTTON_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_DOWN},
++        {SDL_CONTROLLER_BUTTON_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_LEFT},
++        {SDL_CONTROLLER_BUTTON_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_RIGHT},
++    };
++    *s = XINPUT_STATE();
++    for (const auto &b : kButtons)
++        if (SDL_GameControllerGetButton(pad, b.button))
++            s->Gamepad.wButtons |= b.bit;
++    /* SDL's triggers run 0..32767, its Y axes point down. */
++    s->Gamepad.bLeftTrigger = (uint8_t)(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) >> 7);
++    s->Gamepad.bRightTrigger = (uint8_t)(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) >> 7);
++    s->Gamepad.sThumbLX = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX);
++    s->Gamepad.sThumbLY = (int16_t)~SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);
++    s->Gamepad.sThumbRX = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX);
++    s->Gamepad.sThumbRY = (int16_t)~SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY);
++    return ERROR_SUCCESS;
++}
++
++/* "" removes the variable, as on Windows. */
++static inline int _putenv_s(const char *name, const char *value)
++{
++    return *value ? setenv(name, value, 1) : unsetenv(name);
++}
++
++#endif
+diff --git a/src/mm3_launcher_sdl.cpp b/src/mm3_launcher_sdl.cpp
+new file mode 100644
+index 0000000..343b45a
+--- /dev/null
++++ b/src/mm3_launcher_sdl.cpp
+@@ -0,0 +1,213 @@
++/* The launcher's RmlUi backend on Linux: SDL2 window and input, OpenGL 3.3
++ * renderer. RmlUi's own SDL_GL3 backend with two changes: no SDL_image (the
++ * launcher draws no images), and GL entry points come from SDL's loader, so
++ * a Wayland EGL context works as well as an X11 GLX one. */
++#include "RmlUi_Backend.h"
++#include "RmlUi_Platform_SDL.h"
++#include "RmlUi_Renderer_GL3.h"
++#include "RmlUi_Include_GL3.h"
++#include <RmlUi/Core/Context.h>
++#include <RmlUi/Core/Core.h>
++#include <RmlUi/Core/Log.h>
++
++namespace {
++
++struct BackendData {
++    explicit BackendData(SDL_Window *window) : system_interface(window) {}
++
++    SystemInterface_SDL system_interface;
++    RenderInterface_GL3 render_interface;
++    TextInputMethodEditor_SDL text_input_method_editor;
++
++    SDL_Window *window = nullptr;
++    SDL_GLContext glcontext = nullptr;
++
++    bool running = true;
++};
++
++Rml::UniquePtr<BackendData> data;
++
++void fail(SDL_Window *window, SDL_GLContext context, const char *what)
++{
++    Rml::Log::Message(Rml::Log::LT_ERROR, "%s: %s", what, SDL_GetError());
++    if (context)
++        SDL_GL_DeleteContext(context);
++    if (window)
++        SDL_DestroyWindow(window);
++    SDL_Quit();
++}
++
++} // namespace
++
++bool Backend::Initialize(const char *window_name, int width, int height, bool allow_resize)
++{
++    RMLUI_ASSERT(!data);
++
++    SDL_SetHint(SDL_HINT_IME_SHOW_UI, "1");
++    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_TIMER) != 0)
++        return false;
++
++    /* Submit click events when focusing the window. */
++    SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
++    /* RmlUi handles touch itself: no synthetic mouse events for it. */
++    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
++
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
++    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
++
++    const Uint32 window_flags = SDL_WINDOW_OPENGL | (allow_resize ? SDL_WINDOW_RESIZABLE : 0);
++    SDL_Window *window = SDL_CreateWindow(window_name, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, width,
++                                          height, window_flags);
++    if (!window) {
++        fail(nullptr, nullptr, "SDL error on create window");
++        return false;
++    }
++    /* SDL2 starts text input with the window; a focused field turns it on. */
++    SDL_StopTextInput();
++
++    SDL_GLContext glcontext = SDL_GL_CreateContext(window);
++    if (!glcontext) {
++        fail(window, nullptr, "No OpenGL 3.3 context");
++        return false;
++    }
++    SDL_GL_MakeCurrent(window, glcontext);
++    SDL_GL_SetSwapInterval(1);
++
++    if (!gladLoadGL((GLADloadfunc)SDL_GL_GetProcAddress)) {
++        fail(window, glcontext, "Failed to load the OpenGL functions");
++        return false;
++    }
++
++    data = Rml::MakeUnique<BackendData>(window);
++    if (!data->render_interface) {
++        data.reset();
++        fail(window, glcontext, "Failed to initialize the OpenGL 3 render interface");
++        return false;
++    }
++
++    data->window = window;
++    data->glcontext = glcontext;
++
++    int pixels_w = width, pixels_h = height;
++    SDL_GL_GetDrawableSize(window, &pixels_w, &pixels_h);
++    data->render_interface.SetViewport(pixels_w, pixels_h);
++
++    Rml::SetTextInputHandler(&data->text_input_method_editor);
++    return true;
++}
++
++void Backend::Shutdown()
++{
++    RMLUI_ASSERT(data);
++
++    SDL_Window *window = data->window;
++    SDL_GLContext glcontext = data->glcontext;
++
++    data.reset();
++
++    SDL_GL_DeleteContext(glcontext);
++    SDL_DestroyWindow(window);
++    SDL_Quit();
++}
++
++Rml::SystemInterface *Backend::GetSystemInterface()
++{
++    RMLUI_ASSERT(data);
++    return &data->system_interface;
++}
++
++Rml::RenderInterface *Backend::GetRenderInterface()
++{
++    RMLUI_ASSERT(data);
++    return &data->render_interface;
++}
++
++bool Backend::ProcessEvents(Rml::Context *context, KeyDownCallback key_down_callback, bool power_save)
++{
++    RMLUI_ASSERT(data && context);
++
++    bool result = data->running;
++    data->running = true;
++
++    SDL_Event ev;
++    int has_event;
++    if (power_save)
++        has_event = SDL_WaitEventTimeout(&ev, static_cast<int>(Rml::Math::Min(context->GetNextUpdateDelay(), 10.0) * 1000));
++    else
++        has_event = SDL_PollEvent(&ev);
++
++    while (has_event) {
++        bool propagate_event = true;
++        switch (ev.type) {
++        case SDL_QUIT:
++            propagate_event = false;
++            result = false;
++            break;
++        case SDL_KEYDOWN: {
++            propagate_event = false;
++            const Rml::Input::KeyIdentifier key = RmlSDL::ConvertKey(ev.key.keysym.sym);
++            const int key_modifier = RmlSDL::GetKeyModifierState();
++            const float native_dp_ratio = 1.f;
++
++            /* Global shortcuts first, then the context, then the
++             * shortcuts that only apply when the context had no use for it. */
++            if (key_down_callback && !key_down_callback(context, key, key_modifier, native_dp_ratio, true))
++                break;
++            if (!RmlSDL::InputEventHandler(context, data->window, ev))
++                break;
++            if (key_down_callback && !key_down_callback(context, key, key_modifier, native_dp_ratio, false))
++                break;
++            break;
++        }
++        case SDL_TEXTEDITING:
++            propagate_event = false;
++            data->text_input_method_editor.HandleEdit(ev.edit);
++            break;
++        case SDL_WINDOWEVENT:
++            if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
++                int pixels_w = ev.window.data1, pixels_h = ev.window.data2;
++                SDL_GL_GetDrawableSize(data->window, &pixels_w, &pixels_h);
++                data->render_interface.SetViewport(pixels_w, pixels_h);
++            }
++            break;
++        default:
++            break;
++        }
++
++        if (propagate_event)
++            RmlSDL::InputEventHandler(context, data->window, ev);
++
++        has_event = SDL_PollEvent(&ev);
++    }
++
++    return result;
++}
++
++void Backend::RequestExit()
++{
++    RMLUI_ASSERT(data);
++    data->running = false;
++}
++
++void Backend::BeginFrame()
++{
++    RMLUI_ASSERT(data);
++    data->render_interface.Clear();
++    data->render_interface.BeginFrame();
++}
++
++void Backend::PresentFrame()
++{
++    RMLUI_ASSERT(data);
++    data->render_interface.EndFrame();
++    SDL_GL_SwapWindow(data->window);
++}
++
++/* The window the launcher draws in, for the launcher's own polling. */
++SDL_Window *mm3_launcher_window(void)
++{
++    return data ? data->window : nullptr;
++}
+diff --git a/src/mm3_win32.h b/src/mm3_win32.h
+new file mode 100644
+index 0000000..ae68d7b
+--- /dev/null
++++ b/src/mm3_win32.h
+@@ -0,0 +1,16 @@
++/* The Win32 calls MM3's own sources make (tick counts, interlocked
++ * operations, environment, VirtualAlloc): Windows' headers on Windows, the
++ * xboxrecomp runtime's POSIX implementation of them elsewhere. */
++#ifndef MM3_WIN32_H
++#define MM3_WIN32_H
++
++#if defined(_WIN32)
++#include <windows.h>
++#else
++#include "win32_compat.h"
++#ifndef SYNCHRONIZE
++#define SYNCHRONIZE 0x00100000u /* the runtime's handles ignore access rights */
++#endif
++#endif
++
++#endif
+diff --git a/src/mods/dev_tools.c b/src/mods/dev_tools.c
+index 9ce0895..6d3cc65 100644
+--- a/src/mods/dev_tools.c
++++ b/src/mods/dev_tools.c
+@@ -1,4 +1,4 @@
+-#include <windows.h>
++#include "mm3_win32.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+diff --git a/src/mods/framerate.c b/src/mods/framerate.c
+index 2474ed2..03a93bb 100644
+--- a/src/mods/framerate.c
++++ b/src/mods/framerate.c
+@@ -1,6 +1,6 @@
+ #include <stdlib.h>
+ #include <string.h>
+-#include <windows.h>
++#include "mm3_win32.h"
+ #include "recomp_types.h"
+ #include "nv2a_d3d11.h"
+ #include "mods.h"
+diff --git a/src/mods/menu_mouse.c b/src/mods/menu_mouse.c
+index b8ee9f3..fb519db 100644
+--- a/src/mods/menu_mouse.c
++++ b/src/mods/menu_mouse.c
+@@ -16,7 +16,7 @@
+  * state or blending). The fade takes a few hundred ms, during which no row
+  * stands out and the answer is "not known yet". */
+ 
+-#include <windows.h>
++#include "mm3_win32.h"
+ #include "nv2a_d3d11.h"
+ 
+ #define RECTS 1024
+diff --git a/src/mods/mods.c b/src/mods/mods.c
+index 099030b..a43174d 100644
+--- a/src/mods/mods.c
++++ b/src/mods/mods.c
+@@ -1,4 +1,4 @@
+-#include <windows.h>
++#include "mm3_win32.h"
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+diff --git a/src/mods/skip_intro.c b/src/mods/skip_intro.c
+index 82db81a..0745aa7 100644
+--- a/src/mods/skip_intro.c
++++ b/src/mods/skip_intro.c
+@@ -1,7 +1,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <windows.h>
++#include "mm3_win32.h"
+ #include "recomp_types.h"
+ #include "mods.h"
+ 
+diff --git a/src/mods/teleport.c b/src/mods/teleport.c
+index 6a69084..ae24a97 100644
+--- a/src/mods/teleport.c
++++ b/src/mods/teleport.c
+@@ -1,3 +1,5 @@
++/* The panel is a Win32 window fed over a named pipe: Windows only. */
++#if defined(_WIN32)
+ #define _CRT_SECURE_NO_WARNINGS
+ #include <windows.h>
+ #include <stdio.h>
+@@ -384,3 +386,24 @@ void mm3_debug_teleport_init(void)
+     thread = CreateThread(NULL, 0, panel_thread, NULL, 0, NULL);
+     if (thread) CloseHandle(thread);
+ }
++
++#else
++#include <stdio.h>
++#include "teleport.h"
++
++extern void sub_002203E5_original(void);
++extern void mm3_mods_player_update(void);
++
++/* The player update hook stays: the mods' per-player work and the menu
++ * detection hang off it. */
++void sub_002203E5(void)
++{
++    sub_002203E5_original();
++    mm3_mods_player_update();
++}
++
++void mm3_debug_teleport_init(void)
++{
++    fprintf(stderr, "[TELEPORT] the teleport debugger is Windows only\n");
++}
++#endif
+diff --git a/src/mods/widescreen_hud.c b/src/mods/widescreen_hud.c
+index 5e0e91d..dd75134 100644
+--- a/src/mods/widescreen_hud.c
++++ b/src/mods/widescreen_hud.c
+@@ -1,4 +1,4 @@
+-#include <windows.h>
++#include "mm3_win32.h"
+ #include <math.h>
+ #include <stdlib.h>
+ #include <string.h>
+diff --git a/src/recomp_manual.c b/src/recomp_manual.c
+index 569e48b..0e4a3ae 100644
+--- a/src/recomp_manual.c
++++ b/src/recomp_manual.c
+@@ -2,7 +2,9 @@
+ #include <stddef.h>
+ #include <stdlib.h>
+ #include <stdio.h>
++#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+ #include <xmmintrin.h>
++#endif
+ 
+ #include "recomp_types.h"
+ #include "mods/mods.h"
+@@ -1136,7 +1138,11 @@ void sub_00344AB0(void)
+     }
+     g_eax = MEM32(MEM32(0x351F48u) + 0x17C8u);
+     g_ecx = MEM32(g_eax + 0x100410u) | 0x10000u;
++#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+     _mm_sfence();
++#else
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);  /* the pushbuffer before the kick */
++#endif
+     {   /* the executor's lag behind the push pointer about to be kicked */
+         uint32_t dev = MEM32(0x351F48u), regs = MEM32(dev + 0x17C0u);
+         uint32_t cur = MEM32(dev) & 0x0FFFFFFFu, get = MEM32(regs + 0x44u);

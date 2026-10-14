@@ -1,0 +1,46 @@
+From ad6f7fe5b6aa0228d1ed1be7cdf3221b3f5958a1 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 03:08:52 +0000
+Subject: [PATCH 8/9] fix(posix): exit the process without tearing libraries
+ down
+
+ExitProcess called exit(), which runs atexit handlers and C++ static
+destructors while the guest, audio and render threads are still using
+DXVK and SDL, so a title quitting through HalReturnToFirmware crashed
+on the way out. Windows ends the other threads first and skips the
+process's atexit handlers; flush stdio and _exit() instead.
+---
+ src/platform/win32_compat.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/platform/win32_compat.c b/src/platform/win32_compat.c
+index 0b39ea5..a4c00d8 100644
+--- a/src/platform/win32_compat.c
++++ b/src/platform/win32_compat.c
+@@ -1275,7 +1275,15 @@ VOID OutputDebugStringA(LPCSTR str)
+     if (str) fputs(str, stderr);
+ }
+ 
+-VOID ExitProcess(UINT exitCode) { exit((int)exitCode); }
++/* Windows ends the other threads before anything is torn down, and the
++ * process's atexit handlers do not run. exit() would run C++ destructors and
++ * library teardown (DXVK, SDL) while the guest and render threads still use
++ * them, and crash on the way out. */
++VOID ExitProcess(UINT exitCode)
++{
++    fflush(NULL);
++    _exit((int)exitCode);
++}
+ 
+ BOOL IsDebuggerPresent(void)
+ {
+@@ -1460,7 +1468,8 @@ DWORD XInputGetState(DWORD idx, XINPUT_STATE *state)
+ BOOL TerminateProcess(HANDLE process, UINT exitCode)
+ {
+     (void)process;
+-    exit((int)exitCode);
++    ExitProcess(exitCode);
++    return FALSE;
+ }
+ 
+ VOID OutputDebugStringW(LPCWSTR str)

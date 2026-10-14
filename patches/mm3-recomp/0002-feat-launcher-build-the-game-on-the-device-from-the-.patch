@@ -1,0 +1,1026 @@
+From e9b388cfacc1b6a1740c7293bc69fd55351425fe Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 03:31:32 +0000
+Subject: [PATCH 2/4] feat(launcher): build the game on the device from the
+ player's disc
+
+A Linux launcher that needs no generated code (MM3_LAUNCHER_ONLY):
+mm3-launcher shows a setup over the settings until the game is built
+for it. The player picks a disc image (found in the home folder and on
+SD cards, or chosen with the desktop's file dialog), confirms they own
+it, and setup/mm3_setup.py beside the launcher checks the disc, copies
+its files, translates the code and compiles the game in
+~/.local/share/MidtownMadness3, reporting its steps on standard output.
+Once built, the footer adds Add to Steam and Rebuild, and Play runs the
+start script the setup writes, which is also what Steam and the desktop
+menu start.
+
+The start script sets MM3_LAUNCHER_SKIP: the game's own launcher then
+exports the saved settings without opening a window.
+---
+ CMakeLists.txt            |  24 +-
+ src/mm3_launcher.cpp      |  48 ++-
+ src/mm3_launcher_main.cpp |  22 ++
+ src/mm3_setup.cpp         | 746 ++++++++++++++++++++++++++++++++++++++
+ src/mm3_setup.h           |  34 ++
+ src/mods/mods.c           |   2 +
+ 6 files changed, 874 insertions(+), 2 deletions(-)
+ create mode 100644 src/mm3_launcher_main.cpp
+ create mode 100644 src/mm3_setup.cpp
+ create mode 100644 src/mm3_setup.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9bb744e..fd7e87f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -13,6 +13,9 @@ option(MM3_MOVIE_INPUT_TRACE "Observe movie completion and skip input" OFF)
+ option(MM3_OFFLINE_XNET "Bypass MM3 network readiness for offline startup" ON)
+ option(MM3_FRONTEND_WATCH "Trace writes to the RootLevel child pointer" OFF)
+ option(MM3_TRACY "Profile the host rendering pipeline with Tracy" OFF)
++# Linux: just the launcher, which builds the game from the player's disc on
++# the device and then starts it. Needs no generated code.
++option(MM3_LAUNCHER_ONLY "Build only the Linux launcher (mm3-launcher)" OFF)
+ if(MM3_TRACY)
+     set(MM3_TRACY_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/bin/tracy-0.14.1" CACHE PATH "Tracy 0.14.1 sources")
+     set(TRACY_ENABLE ON CACHE BOOL "Enable Tracy client" FORCE)
+@@ -20,7 +23,9 @@ if(MM3_TRACY)
+     add_subdirectory("${MM3_TRACY_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/tracy" EXCLUDE_FROM_ALL)
+ endif()
+ 
+-add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
++if(NOT MM3_LAUNCHER_ONLY)
++    add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
++endif()
+ 
+ # Settings launcher (src/mm3_launcher.cpp): RmlUi on its Win32/D3D11 backend,
+ # FreeType for its fonts. Static, fetched once at configure time.
+@@ -42,6 +47,23 @@ endforeach()
+ FetchContent_MakeAvailable(freetype)
+ add_library(Freetype::Freetype ALIAS freetype)
+ FetchContent_MakeAvailable(rmlui)
++if(MM3_LAUNCHER_ONLY)
++    find_package(SDL2 REQUIRED)
++    add_executable(mm3-launcher
++        src/mm3_launcher_main.cpp
++        src/mm3_launcher.cpp
++        src/mm3_launcher_sdl.cpp
++        src/mm3_setup.cpp
++        src/mods/mods.c
++        ${XBOXRECOMP_DIR}/src/video/sdl_keys.c
++        ${rmlui_SOURCE_DIR}/Backends/RmlUi_Platform_SDL.cpp
++        ${rmlui_SOURCE_DIR}/Backends/RmlUi_Renderer_GL3.cpp)
++    target_compile_definitions(mm3-launcher PRIVATE MM3_SETUP MM3_MODS_TABLE_ONLY RMLUI_SDL_VERSION_MAJOR=2)
++    target_include_directories(mm3-launcher PRIVATE src ${rmlui_SOURCE_DIR}/Backends
++        ${XBOXRECOMP_DIR}/src ${XBOXRECOMP_DIR}/src/video ${XBOXRECOMP_DIR}/src/platform)
++    target_link_libraries(mm3-launcher PRIVATE RmlUi::RmlUi SDL2::SDL2 ${CMAKE_DL_LIBS})
++    return()
++endif()
+ if(MM3_TRACY)
+     foreach(profile_target xbox_kernel xbox_video)
+         target_link_libraries(${profile_target} PRIVATE Tracy::TracyClient)
+diff --git a/src/mm3_launcher.cpp b/src/mm3_launcher.cpp
+index 41e543c..a3ca026 100644
+--- a/src/mm3_launcher.cpp
++++ b/src/mm3_launcher.cpp
+@@ -21,6 +21,9 @@ typedef RenderInterface_GL3 RenderInterface_Launcher;
+ #include <string.h>
+ #include <ctype.h>
+ #include "mods/mods.h"
++#if defined(MM3_SETUP)
++#include "mm3_setup.h" /* the Linux launcher builds the game first */
++#endif
+ 
+ namespace {
+ 
+@@ -551,6 +554,10 @@ bool find_game_dir()
+ 
+ void play()
+ {
++#if defined(MM3_SETUP)
++    if (mm3_setup::active())
++        return;
++#endif
+     if (!g_missing)
+         g_result = 1;
+ }
+@@ -727,6 +734,14 @@ void poll_pad(double now)
+         }
+         return;
+     }
++#if defined(MM3_SETUP)
++    if (g_capture < 0 && mm3_setup::on_pad(pressed)) {
++        if (pressed & XINPUT_GAMEPAD_BACK)
++            g_result = 0;
++        held = -1;
++        return;
++    }
++#endif
+     if (g_capture >= 0) {
+         held = -1;
+         if (!pad_bind(g_binds[g_capture])) {   /* a key prompt: B cancels */
+@@ -843,6 +858,10 @@ bool on_key(Rml::Context *ctx, Rml::Input::KeyIdentifier key, int mods, float, b
+         g_model.DirtyVariable("splash");
+         return false;
+     }
++#if defined(MM3_SETUP)
++    if (g_capture < 0 && mm3_setup::on_key(key))
++        return false;
++#endif
+     if (g_capture >= 0) { /* the prompt owns the keyboard */
+         if (key == Rml::Input::KI_ESCAPE)
+             end_capture();
+@@ -980,7 +999,13 @@ bool bind_model(Rml::Context *ctx)
+     m.BindEventCallback("reset", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &) { reset(); });
+     m.BindEventCallback("play", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &) { play(); });
+     m.BindEventCallback("quit", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &) { g_result = 0; });
++#if defined(MM3_SETUP)
++    mm3_setup::bind(m);
++#endif
+     g_model = m.GetModelHandle();
++#if defined(MM3_SETUP)
++    mm3_setup::attach(g_model);
++#endif
+     return true;
+ }
+ 
+@@ -999,6 +1024,16 @@ extern "C" int mm3_launcher(void)
+     g_missing = !find_game_dir();
+     load_settings();
+     options_changed();
++#if !defined(_WIN32)
++    /* The start script the Linux launcher writes: play with the saved
++     * settings, no window. */
++    if (getenv("MM3_LAUNCHER_SKIP") && *getenv("MM3_LAUNCHER_SKIP")) {
++        if (g_missing)
++            return 0;
++        save_and_export();
++        return 1;
++    }
++#endif
+     /* MM3_LAUNCHER_TAB=0/1/2 opens on Settings, Controls or Mods (screenshots, tests). */
+     if (const char *tab = getenv("MM3_LAUNCHER_TAB"))
+         g_tab = atoi(tab) >= 0 && atoi(tab) <= 2 ? atoi(tab) : 0;
+@@ -1035,7 +1070,12 @@ extern "C" int mm3_launcher(void)
+ 
+     Rml::Context *ctx = Rml::CreateContext("launcher", Rml::Vector2i(width, height));
+     if (ctx && bind_model(ctx)) {
+-        if (Rml::ElementDocument *doc = ctx->LoadDocumentFromMemory(kDocument))
++#if defined(MM3_SETUP)
++        const Rml::String document = mm3_setup::document(kDocument);
++#else
++        const char *document = kDocument;
++#endif
++        if (Rml::ElementDocument *doc = ctx->LoadDocumentFromMemory(document))
+             doc->Show();
+         g_result = -1;
+         int shown_tab = g_tab;
+@@ -1045,6 +1085,12 @@ extern "C" int mm3_launcher(void)
+         while (g_result < 0 && Backend::ProcessEvents(ctx, on_key, !GetActiveWindow())) {
+             const double now = Rml::GetSystemInterface()->GetElapsedTime();
+             tick_splash(now);
++#if defined(MM3_SETUP)
++            if (mm3_setup::tick(now)) { /* just built: the game is there now */
++                g_missing = !find_game_dir();
++                g_model.DirtyVariable("missing");
++            }
++#endif
+             poll_capture();
+             poll_pad(now);
+             poll_mouse();
+diff --git a/src/mm3_launcher_main.cpp b/src/mm3_launcher_main.cpp
+new file mode 100644
+index 0000000..02427c2
+--- /dev/null
++++ b/src/mm3_launcher_main.cpp
+@@ -0,0 +1,22 @@
++/* The Linux launcher (mm3-launcher): the settings launcher of the game, with
++ * a first-run setup that builds the game on this device from the player's
++ * own disc (src/mm3_setup.cpp). Play starts the built game through the start
++ * script the setup writes, which is also what Steam and the desktop menu run. */
++#include <stdio.h>
++#include <unistd.h>
++#include "mm3_setup.h"
++
++extern "C" int mm3_launcher(void);
++
++int main(void)
++{
++    mm3_setup::init();
++    const int play = mm3_launcher();
++    mm3_setup::shutdown();
++    if (play != 1)
++        return 0;
++    const char *script = mm3_setup::start_script();
++    execl(script, script, (char *)nullptr);
++    perror(script);
++    return 1;
++}
+diff --git a/src/mm3_setup.cpp b/src/mm3_setup.cpp
+new file mode 100644
+index 0000000..2842c48
+--- /dev/null
++++ b/src/mm3_setup.cpp
+@@ -0,0 +1,746 @@
++/* The Linux launcher's first-run setup (src/mm3_setup.h). setup/mm3_setup.py,
++ * beside the launcher, does the work in a child process and reports one
++ * event per line on its standard output; this file shows that over the
++ * launcher and takes the player's choices. */
++#include "mm3_setup.h"
++
++#include <RmlUi/Core.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <signal.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <sys/statvfs.h>
++#include <sys/types.h>
++#include <sys/wait.h>
++#include <unistd.h>
++#include "mm3_launcher_posix.h"
++
++namespace mm3_setup {
++namespace {
++
++struct Disc {
++    Rml::String name, folder, size, path;
++    double bytes;
++};
++
++/* A child process whose standard output is read line by line. */
++struct Child {
++    pid_t pid = -1;
++    int fd = -1;
++    Rml::String pending;
++    int status = 0;
++};
++
++Rml::String g_app;     /* the launcher's folder */
++Rml::String g_script;  /* setup/mm3_setup.py */
++Rml::String g_data;    /* ~/.local/share/MidtownMadness3 */
++Rml::String g_version; /* setup/VERSION */
++Rml::String g_start;   /* the data folder's start script */
++
++Rml::DataModelHandle g_model;
++Rml::Vector<Disc> g_discs;
++int g_disc = -1;
++int g_focus = -1;     /* controller and arrow-key focus in the setup, -1 none */
++bool g_owned;
++bool g_active;
++bool g_have_files;    /* the disc was copied before: a build needs no disc */
++bool g_scanning;
++int g_state;          /* 0 choosing, 1 building, 2 failed */
++Rml::String g_step, g_title, g_detail, g_error, g_hint, g_width = "0%";
++bool g_busy;          /* the bar sweeps: the step cannot tell how far it is */
++Rml::String g_note;   /* below the settings: Add to Steam and build results */
++bool g_steaming;
++Rml::String g_iso;    /* what the current build reads */
++
++Child g_build, g_scan, g_steam, g_chooser;
++Rml::Vector<pid_t> g_openers; /* xdg-open, reaped as they finish */
++
++Rml::String home_short(const Rml::String &path)
++{
++    const char *home = getenv("HOME");
++    if (home && *home && path.compare(0, strlen(home), home) == 0)
++        return "~" + path.substr(strlen(home));
++    return path;
++}
++
++Rml::String gigabytes(double bytes)
++{
++    char text[32];
++    snprintf(text, sizeof text, "%.1f GB", bytes / (1024.0 * 1024 * 1024));
++    return text;
++}
++
++bool exists(const Rml::String &path) { return access(path.c_str(), F_OK) == 0; }
++
++Rml::String read_file(const Rml::String &path)
++{
++    Rml::String out;
++    if (FILE *f = fopen(path.c_str(), "r")) {
++        char buffer[4096];
++        size_t n;
++        while ((n = fread(buffer, 1, sizeof buffer, f)) > 0)
++            out.append(buffer, n);
++        fclose(f);
++    }
++    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
++        out.pop_back();
++    return out;
++}
++
++void mkdirs(const Rml::String &path)
++{
++    for (size_t at = 1; at <= path.size(); at++)
++        if (at == path.size() || path[at] == '/')
++            mkdir(path.substr(0, at).c_str(), 0755);
++}
++
++void dirty(const char *name)
++{
++    if (g_model)
++        g_model.DirtyVariable(name);
++}
++
++void dirty_all()
++{
++    for (const char *name : {"setup", "s_discs", "s_disc", "s_focus", "s_owned", "s_have_files", "s_scanning",
++                             "s_state", "s_step", "s_title", "s_detail", "s_error", "s_hint", "s_width", "s_busy",
++                             "s_note", "s_steaming", "s_can_go", "s_go_label"})
++        dirty(name);
++}
++
++bool spawn(Child &child, const Rml::Vector<Rml::String> &args)
++{
++    int pipe_fds[2];
++    if (pipe(pipe_fds) != 0)
++        return false;
++    const pid_t pid = fork();
++    if (pid < 0) {
++        close(pipe_fds[0]);
++        close(pipe_fds[1]);
++        return false;
++    }
++    if (pid == 0) {
++        /* Its own process group, so Cancel ends the tools it started too. */
++        setpgid(0, 0);
++        const int null = open("/dev/null", O_RDWR);
++        dup2(null, 0);
++        dup2(pipe_fds[1], 1);
++        dup2(null, 2);
++        close(pipe_fds[0]);
++        Rml::Vector<char *> argv;
++        for (const Rml::String &a : args)
++            argv.push_back(const_cast<char *>(a.c_str()));
++        argv.push_back(nullptr);
++        execvp(argv[0], argv.data());
++        _exit(127);
++    }
++    close(pipe_fds[1]);
++    fcntl(pipe_fds[0], F_SETFL, fcntl(pipe_fds[0], F_GETFL) | O_NONBLOCK);
++    fcntl(pipe_fds[0], F_SETFD, FD_CLOEXEC);
++    child.pid = pid;
++    child.fd = pipe_fds[0];
++    child.pending.clear();
++    return true;
++}
++
++/* Hands each complete line to on_line; false once the child has exited
++ * (its exit status in child.status). */
++template <typename F> bool poll(Child &child, F on_line)
++{
++    if (child.pid < 0)
++        return false;
++    char buffer[4096];
++    for (;;) {
++        const ssize_t n = read(child.fd, buffer, sizeof buffer);
++        if (n > 0) {
++            child.pending.append(buffer, (size_t)n);
++            size_t end;
++            while ((end = child.pending.find('\n')) != Rml::String::npos) {
++                on_line(child.pending.substr(0, end));
++                child.pending.erase(0, end + 1);
++            }
++            continue;
++        }
++        if (n < 0 && (errno == EAGAIN || errno == EINTR))
++            return true;
++        break; /* end of output */
++    }
++    if (!child.pending.empty())
++        on_line(child.pending);
++    close(child.fd);
++    waitpid(child.pid, &child.status, 0);
++    child.pid = -1;
++    child.fd = -1;
++    return false;
++}
++
++void stop(Child &child)
++{
++    if (child.pid < 0)
++        return;
++    kill(-child.pid, SIGTERM);
++    close(child.fd);
++    waitpid(child.pid, &child.status, 0);
++    child.pid = -1;
++    child.fd = -1;
++}
++
++Rml::Vector<Rml::String> fields(const Rml::String &line)
++{
++    Rml::Vector<Rml::String> out;
++    size_t start = 0;
++    for (;;) {
++        const size_t tab = line.find('\t', start);
++        out.push_back(line.substr(start, tab == Rml::String::npos ? Rml::String::npos : tab - start));
++        if (tab == Rml::String::npos)
++            return out;
++        start = tab + 1;
++    }
++}
++
++double free_bytes()
++{
++    Rml::String path = g_data;
++    while (!path.empty() && !exists(path))
++        path = path.substr(0, path.rfind('/'));
++    struct statvfs fs;
++    if (path.empty() || statvfs(path.c_str(), &fs) != 0)
++        return -1;
++    return (double)fs.f_bavail * (double)fs.f_frsize;
++}
++
++void update_hint()
++{
++    const double need = (g_disc >= 0 && !g_have_files ? g_discs[g_disc].bytes : 0) + 6.0 * (1 << 30);
++    const double free = free_bytes();
++    char text[512];
++    snprintf(text, sizeof text,
++             "Installs to %s. Needs about %.0f GB free%s%s%s; the build takes 20 to 40 minutes on a "
++             "handheld, so keep it on its charger.",
++             home_short(g_data).c_str(), need / (1 << 30), free >= 0 ? " (" : "",
++             free >= 0 ? gigabytes(free).c_str() : "", free >= 0 ? " free now)" : "");
++    g_hint = text;
++    dirty("s_hint");
++}
++
++bool built()
++{
++    const Rml::String installed = read_file(g_data + "/installed.json");
++    return !g_version.empty() && installed.find("\"version\": \"" + g_version + "\"") != Rml::String::npos &&
++           exists(g_data + "/bin/mm3_recomp");
++}
++
++void scan()
++{
++    if (g_scanning || g_script.empty())
++        return;
++    g_scanning = spawn(g_scan, {"python3", g_script, "scan"});
++    dirty("s_scanning");
++}
++
++void add_disc(const Rml::String &path, double bytes, bool select)
++{
++    for (size_t i = 0; i < g_discs.size(); i++)
++        if (g_discs[i].path == path) {
++            if (select)
++                g_disc = (int)i;
++            return;
++        }
++    Disc d;
++    d.path = path;
++    const size_t slash = path.rfind('/');
++    d.name = slash == Rml::String::npos ? path : path.substr(slash + 1);
++    d.folder = slash == Rml::String::npos ? "" : home_short(path.substr(0, slash));
++    if (d.folder == "~")
++        d.folder = "Home folder";
++    d.bytes = bytes;
++    d.size = gigabytes(bytes);
++    g_discs.push_back(d);
++    if (select || g_disc < 0)
++        g_disc = (int)g_discs.size() - 1;
++    dirty("s_discs");
++    dirty("s_disc");
++    update_hint();
++}
++
++void choose_file()
++{
++    if (g_chooser.pid >= 0)
++        return;
++    const char *home = getenv("HOME");
++    const Rml::String start = Rml::String(home ? home : "") + "/";
++    if (access("/usr/bin/zenity", X_OK) == 0)
++        spawn(g_chooser, {"zenity", "--file-selection", "--title=Choose your Midtown Madness 3 disc image",
++                          "--filename=" + start, "--file-filter=Xbox disc images | *.iso *.ISO *.xiso *.XISO",
++                          "--file-filter=All files | *"});
++    else
++        spawn(g_chooser, {"kdialog", "--getopenfilename", start, "*.iso *.ISO *.xiso *.XISO|Xbox disc images"});
++}
++
++void open_logs()
++{
++    const Rml::String log = g_data + "/logs/build.log";
++    Child opener;
++    if (spawn(opener, {"xdg-open", exists(log) ? log : g_data})) {
++        close(opener.fd);
++        g_openers.push_back(opener.pid);
++    }
++}
++
++bool can_go()
++{
++    if (g_state == 1 || g_script.empty())
++        return false;
++    if (g_state == 2 || g_have_files)
++        return true;
++    return g_disc >= 0 && g_owned;
++}
++
++void start_build()
++{
++    if (!can_go())
++        return;
++    if (g_state == 0)
++        g_iso = g_have_files ? "" : g_discs[g_disc].path;
++    if (!spawn(g_build, {"python3", g_script, "build", g_iso})) {
++        g_state = 2;
++        g_error = "Could not start the build: Python 3 is missing.";
++        dirty_all();
++        return;
++    }
++    g_state = 1;
++    g_step = "Starting";
++    g_title = "";
++    g_detail = "";
++    g_error = "";
++    g_busy = true;
++    g_width = "40%";
++    g_focus = -1;
++    dirty_all();
++}
++
++void cancel_build()
++{
++    if (g_build.pid < 0)
++        return;
++    stop(g_build);
++    g_state = 0;
++    g_have_files = exists(g_data + "/game_files/.complete");
++    update_hint();
++    dirty_all();
++}
++
++void add_to_steam()
++{
++    if (g_steaming || g_active || g_script.empty())
++        return;
++    g_steaming = spawn(g_steam, {"python3", g_script, "steam"});
++    g_note = g_steaming ? "Adding to Steam..." : "Could not start Python 3.";
++    dirty("s_note");
++    dirty("s_steaming");
++}
++
++void rebuild()
++{
++    if (g_active || g_steaming)
++        return;
++    g_active = true;
++    g_state = 0;
++    g_have_files = exists(g_data + "/game_files/.complete");
++    g_note = "";
++    if (!g_have_files)
++        scan();
++    update_hint();
++    dirty_all();
++}
++
++/* The rows the controller and the arrow keys move through. */
++int rows()
++{
++    return g_have_files ? 0 : (int)g_discs.size() + 2;
++}
++
++void activate(int row)
++{
++    const int n = (int)g_discs.size();
++    if (row < 0)
++        return;
++    if (row < n)
++        g_disc = row;
++    else if (row == n)
++        choose_file();
++    else if (row == n + 1)
++        g_owned = !g_owned;
++    update_hint();
++    dirty_all();
++}
++
++void move(int d)
++{
++    const int n = rows();
++    if (!n || g_state != 0)
++        return;
++    g_focus = g_focus < 0 ? 0 : Rml::Math::Clamp(g_focus + d, 0, n - 1);
++    dirty("s_focus");
++}
++
++const char kStyle[] = R"RML(
++#setup { position: absolute; left: 0dp; top: 0dp; width: 100%; height: 100%; z-index: 15;
++         display: flex; flex-direction: column; background-color: #121418; }
++#s-main { flex: 1; min-height: 0; padding: 26dp 30dp 10dp 30dp; overflow-y: auto; }
++.s-kicker { font-size: 11dp; font-weight: bold; letter-spacing: 1dp; color: #e8a33d; }
++.s-h1 { margin-top: 6dp; font-size: 28dp; font-weight: bold; color: #ffffff; }
++.s-sub { margin-top: 4dp; font-size: 13dp; color: #80848f; }
++.s-card { margin-top: 20dp; padding: 16dp 18dp; border-radius: 10dp; background-color: #191c21;
++          border: 1dp #ffffff12; }
++.s-label { font-size: 11dp; font-weight: bold; letter-spacing: 1dp; color: #e8a33d; text-transform: uppercase;
++           margin-bottom: 8dp; }
++.s-disc { display: flex; align-items: center; padding: 8dp 10dp; border-radius: 6dp; cursor: pointer;
++          border-left: 2dp transparent; }
++.s-disc:hover { background-color: #1d2026; }
++.s-disc.focus, .s-row.focus { background-color: #22262d; border-left-color: #e8a33d; }
++.s-radio { flex: 0 0 16dp; width: 16dp; height: 16dp; border-radius: 8dp; margin-right: 12dp;
++           background-color: #2a2e36; }
++.s-disc.on .s-radio { background-color: #e8a33d; }
++.s-dot { margin: 5dp; width: 6dp; height: 6dp; border-radius: 3dp; background-color: #17120a; }
++.s-text { flex: 1 1 0; min-width: 0; }
++.s-empty { padding: 6dp 10dp 10dp 10dp; font-size: 13dp; color: #80848f; }
++.s-row { display: flex; align-items: center; margin-top: 6dp; padding: 8dp 10dp; border-radius: 6dp;
++         cursor: pointer; border-left: 2dp transparent; }
++.s-row:hover { background-color: #1d2026; }
++.s-row .switch { flex: 0 0 38dp; margin-right: 12dp; }
++.s-link { color: #e6e7ea; }
++.s-fine { margin-top: 12dp; font-size: 11dp; color: #6c707a; }
++.s-title { font-size: 16dp; color: #ffffff; margin-bottom: 12dp; }
++.s-bar { position: relative; height: 6dp; border-radius: 3dp; background-color: #2a2d34; overflow: hidden;
++         margin-bottom: 10dp; }
++.s-fill { position: absolute; left: 0dp; top: 0dp; height: 100%; border-radius: 3dp; background-color: #e8a33d;
++          transition: width 0.3s cubic-out; }
++.s-fill.busy { animation: 1.1s cubic-in-out infinite sweep; }
++.s-error { margin-top: 10dp; font-size: 13dp; color: #ff8a7a; }
++#s-foot { display: flex; align-items: center; padding: 14dp 28dp 14dp 16dp; border-top: 1dp #ffffff12;
++          background-color: #0e1013; }
++#s-status { flex: 1; font-size: 12dp; color: #e8a33d; text-align: right; padding-right: 12dp; }
++#s-go { padding: 8dp 24dp; border-radius: 6dp; font-weight: bold; color: #17120a; background-color: #e8a33d;
++        cursor: pointer; }
++#s-go:hover { background-color: #f2b456; }
++#s-go.off { background-color: #2a2d34; color: #5d616b; cursor: arrow; }
++)RML";
++
++const char kBody[] = R"RML(
++  <div id="setup" data-if="setup">
++    <div id="s-main">
++      <div class="s-kicker">MIDTOWN MADNESS 3</div>
++      <div class="s-h1">{{ s_state == 1 ? 'Building your copy' : 'Build your copy' }}</div>
++      <div class="s-sub">Checked, copied and compiled on this handheld from your own disc. Nothing is uploaded.</div>
++      <div class="s-card" data-if="s_state == 0 && !s_have_files">
++        <div class="s-label">Your disc image</div>
++        <div class="s-disc" data-for="d, i : s_discs" data-class-on="s_disc == i" data-class-focus="s_focus == i"
++             data-event-click="s_pick(i)">
++          <div class="s-radio"><div class="s-dot"/></div>
++          <div class="s-text"><div>{{ d.name }}</div><div class="hint">{{ d.folder }} · {{ d.size }}</div></div>
++        </div>
++        <div class="s-empty" data-if="s_discs.size == 0">{{ s_scanning ? 'Looking for disc images...' :
++          'No disc images in your home folder or on the SD card. A redump .iso or an XISO of the USA or European disc works.' }}</div>
++        <div class="s-row" data-class-focus="s_focus == s_discs.size" data-event-click="s_choose()">
++          <div class="s-link">Choose another file...</div>
++        </div>
++        <div class="s-row" data-class-focus="s_focus == s_discs.size + 1" data-event-click="s_own()">
++          <div class="switch" data-class-on="s_owned"><div class="knob"/></div>
++          <div>I own this disc and made this image from it myself.</div>
++        </div>
++        <div class="s-fine">{{ s_hint }}</div>
++      </div>
++      <div class="s-card" data-if="s_state == 0 && s_have_files">
++        <div class="s-label">Game files ready</div>
++        <div>Your disc's files are already copied. Build the game again for this version of the launcher.</div>
++        <div class="s-fine">{{ s_hint }}</div>
++      </div>
++      <div class="s-card" data-if="s_state != 0">
++        <div class="s-label">{{ s_step }}</div>
++        <div class="s-title">{{ s_title }}</div>
++        <div class="s-bar"><div class="s-fill" data-class-busy="s_busy" data-style-width="s_width"/></div>
++        <div class="hint">{{ s_detail }}</div>
++        <div class="s-error" data-if="s_state == 2">{{ s_error }}</div>
++      </div>
++    </div>
++    <div id="s-foot">
++      <div class="ghost" data-if="!pad" data-event-click="quit()">Quit</div>
++      <div class="ghost" data-if="!pad" data-event-click="s_logs()">Logs</div>
++      <div class="ghost" data-if="!pad && s_state == 1" data-event-click="s_cancel()">Cancel</div>
++      <div id="hints" data-if="pad"><span data-if="s_state == 0 && !s_have_files"><span class="glyph">A</span>Select</span><span
++        class="glyph">Y</span>Logs<span class="glyph">Back</span>Quit<span data-if="s_state == 1"><span
++        class="glyph">B</span>Cancel</span></div>
++      <div id="s-status"></div>
++      <div id="s-go" data-class-off="!s_can_go" data-event-click="s_go()"><span class="glyph start"
++        data-if="pad && s_can_go">Start</span>{{ s_go_label }}</div>
++    </div>
++  </div>
++)RML";
++
++/* The launcher's footer once the game is built. */
++const char kFoot[] = R"RML(<div class="ghost" data-if="!pad && !s_steaming" data-event-click="s_steam()">Add to Steam</div>
++    <div class="ghost" data-if="!pad && !s_steaming" data-event-click="s_rebuild()">Rebuild</div>)RML";
++const char kPadHint[] = R"RML(<span class="glyph">X</span>Add to Steam)RML";
++const char kNote[] = R"RML(<span data-if="s_note != '' && !missing">{{ s_note }}</span>)RML";
++
++void insert(Rml::String &doc, const char *marker, const char *text, bool after)
++{
++    const size_t at = doc.find(marker);
++    if (at == Rml::String::npos) {
++        fprintf(stderr, "[setup] the launcher's document has no %s\n", marker);
++        return;
++    }
++    doc.insert(after ? at + strlen(marker) : at, text);
++}
++
++void on_build_line(const Rml::String &line)
++{
++    const Rml::Vector<Rml::String> f = fields(line);
++    if (f[0] == "@step" && f.size() >= 4) {
++        g_step = "Step " + f[1] + " of " + f[2];
++        g_title = f[3];
++        g_detail = "";
++        g_busy = true;
++        g_width = "40%";
++    } else if (f[0] == "@progress" && f.size() >= 3) {
++        const double fraction = atof(f[1].c_str());
++        g_busy = fraction < 0;
++        char width[16];
++        snprintf(width, sizeof width, "%.1f%%", g_busy ? 40.0 : fraction * 100);
++        g_width = width;
++        g_detail = f[2];
++    } else if (f[0] == "@error" && f.size() >= 2) {
++        g_error = f[1];
++    } else if (f[0] == "@done") {
++        g_width = "100%";
++        g_busy = false;
++    } else {
++        return;
++    }
++    for (const char *name : {"s_step", "s_title", "s_detail", "s_busy", "s_width", "s_error"})
++        dirty(name);
++}
++
++} // namespace
++
++void init()
++{
++    char exe[PATH_MAX];
++    const ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
++    if (n > 0) {
++        exe[n] = 0;
++        if (char *slash = strrchr(exe, '/'))
++            *slash = 0;
++        g_app = exe;
++        if (exists(g_app + "/setup/mm3_setup.py"))
++            g_script = g_app + "/setup/mm3_setup.py";
++        g_version = read_file(g_app + "/setup/VERSION");
++    }
++    const char *xdg = getenv("XDG_DATA_HOME");
++    const char *home = getenv("HOME");
++    g_data = (xdg && *xdg ? Rml::String(xdg) : Rml::String(home ? home : ".") + "/.local/share") + "/MidtownMadness3";
++    g_start = g_data + "/midtown-madness-3.sh";
++    mkdirs(g_data);
++    if (chdir(g_data.c_str()) != 0)
++        fprintf(stderr, "[setup] cannot enter %s\n", g_data.c_str());
++    signal(SIGCHLD, SIG_DFL);
++
++    g_active = !built();
++    g_have_files = exists(g_data + "/game_files/.complete");
++    if (g_active && !g_have_files)
++        scan();
++    if (g_script.empty()) {
++        g_state = 2;
++        g_step = "Setup";
++        g_title = "This launcher is incomplete";
++        g_error = "setup/mm3_setup.py is missing next to the launcher. Extract the whole download again.";
++    }
++    update_hint();
++}
++
++void shutdown()
++{
++    stop(g_build);
++    stop(g_scan);
++    stop(g_chooser);
++    /* Adding to Steam restarts Steam: let it finish on its own. */
++}
++
++bool active() { return g_active; }
++
++const char *start_script() { return g_start.c_str(); }
++
++Rml::String document(const char *launcher)
++{
++    Rml::String doc = launcher;
++    insert(doc, "</style>", kStyle, false);
++    insert(doc, "</body>", kBody, false);
++    insert(doc, "data-event-click=\"quit()\">Quit</div>", kFoot, true);
++    insert(doc, "<span class=\"glyph\">Back</span>Quit", kPadHint, true);
++    insert(doc, "<div id=\"status\">", kNote, true);
++    return doc;
++}
++
++void bind(Rml::DataModelConstructor &m)
++{
++    if (auto d = m.RegisterStruct<Disc>()) {
++        d.RegisterMember("name", &Disc::name);
++        d.RegisterMember("folder", &Disc::folder);
++        d.RegisterMember("size", &Disc::size);
++    }
++    m.RegisterArray<Rml::Vector<Disc>>();
++    m.Bind("setup", &g_active);
++    m.Bind("s_discs", &g_discs);
++    m.Bind("s_disc", &g_disc);
++    m.Bind("s_focus", &g_focus);
++    m.Bind("s_owned", &g_owned);
++    m.Bind("s_have_files", &g_have_files);
++    m.Bind("s_scanning", &g_scanning);
++    m.Bind("s_state", &g_state);
++    m.Bind("s_step", &g_step);
++    m.Bind("s_title", &g_title);
++    m.Bind("s_detail", &g_detail);
++    m.Bind("s_error", &g_error);
++    m.Bind("s_hint", &g_hint);
++    m.Bind("s_width", &g_width);
++    m.Bind("s_busy", &g_busy);
++    m.Bind("s_note", &g_note);
++    m.Bind("s_steaming", &g_steaming);
++    m.BindFunc("s_can_go", [](Rml::Variant &v) { v = can_go(); });
++    m.BindFunc("s_go_label", [](Rml::Variant &v) {
++        v = Rml::String(g_state == 1 ? "Building..." : g_state == 2 ? "Try again"
++                        : g_have_files ? "Build again" : "Verify and build");
++    });
++    m.BindEventCallback("s_pick", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &args) {
++        if (!args.empty())
++            activate(args[0].Get<int>());
++    });
++    m.BindEventCallback("s_choose", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &) {
++        choose_file();
++    });
++    m.BindEventCallback("s_own", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &) {
++        g_owned = !g_owned;
++        dirty_all();
++    });
++    m.BindEventCallback("s_go", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &) { start_build(); });
++    m.BindEventCallback("s_cancel", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &) {
++        cancel_build();
++    });
++    m.BindEventCallback("s_logs", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &) { open_logs(); });
++    m.BindEventCallback("s_steam", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &) {
++        add_to_steam();
++    });
++    m.BindEventCallback("s_rebuild", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &) {
++        rebuild();
++    });
++}
++
++void attach(Rml::DataModelHandle model)
++{
++    g_model = model;
++    dirty_all();
++}
++
++bool tick(double)
++{
++    bool finished = false;
++    for (size_t i = 0; i < g_openers.size();)
++        if (waitpid(g_openers[i], nullptr, WNOHANG) != 0)
++            g_openers.erase(g_openers.begin() + (long)i);
++        else
++            i++;
++    if (g_scanning && !poll(g_scan, [](const Rml::String &line) {
++            const Rml::Vector<Rml::String> f = fields(line);
++            if (f[0] == "@disc" && f.size() >= 3)
++                add_disc(f[1], atof(f[2].c_str()), false);
++        })) {
++        g_scanning = false;
++        dirty("s_scanning");
++    }
++    if (g_chooser.pid >= 0) {
++        Rml::String chosen;
++        if (!poll(g_chooser, [&](const Rml::String &line) { chosen = line; }) && !chosen.empty()) {
++            struct stat st;
++            if (stat(chosen.c_str(), &st) == 0)
++                add_disc(chosen, (double)st.st_size, true);
++            g_focus = -1;
++            dirty_all();
++        }
++    }
++    if (g_build.pid >= 0 && !poll(g_build, on_build_line)) {
++        const bool ok = WIFEXITED(g_build.status) && WEXITSTATUS(g_build.status) == 0 && built();
++        if (ok) {
++            g_active = false;
++            g_state = 0;
++            g_note = "Ready. Press Play, or Add to Steam to start it from Gaming Mode.";
++            finished = true;
++        } else {
++            g_state = 2;
++            if (g_error.empty())
++                g_error = "The build stopped. Logs has the details.";
++        }
++        dirty_all();
++    }
++    if (g_steaming && !poll(g_steam, [](const Rml::String &line) {
++            const Rml::Vector<Rml::String> f = fields(line);
++            if ((f[0] == "@done" || f[0] == "@error" || f[0] == "@progress") && f.size() >= 2)
++                g_note = f[0] == "@progress" && f.size() >= 3 ? f[2] : f[1];
++            dirty("s_note");
++        })) {
++        g_steaming = false;
++        dirty("s_steaming");
++    }
++    return finished;
++}
++
++bool on_key(Rml::Input::KeyIdentifier key)
++{
++    if (!g_active)
++        return false;
++    switch (key) {
++    case Rml::Input::KI_UP: move(-1); return true;
++    case Rml::Input::KI_DOWN: move(1); return true;
++    case Rml::Input::KI_SPACE:
++        if (g_focus >= 0)
++            activate(g_focus);
++        return true;
++    case Rml::Input::KI_RETURN:
++        if (g_focus >= 0 && g_focus < rows())
++            activate(g_focus);
++        else
++            start_build();
++        return true;
++    case Rml::Input::KI_ESCAPE: return false; /* the launcher quits */
++    default: return true;
++    }
++}
++
++bool on_pad(unsigned pressed)
++{
++    if (!g_active) {
++        if (pressed & XINPUT_GAMEPAD_X) {
++            add_to_steam();
++            return true;
++        }
++        return false;
++    }
++    if (pressed & XINPUT_GAMEPAD_DPAD_UP) move(-1);
++    if (pressed & XINPUT_GAMEPAD_DPAD_DOWN) move(1);
++    if (pressed & XINPUT_GAMEPAD_A) {
++        if (g_focus >= 0)
++            activate(g_focus);
++        else
++            move(1);
++    }
++    if (pressed & XINPUT_GAMEPAD_START) start_build();
++    if (pressed & XINPUT_GAMEPAD_Y) open_logs();
++    if ((pressed & XINPUT_GAMEPAD_B) && g_state == 1) cancel_build();
++    return true;
++}
++
++} // namespace mm3_setup
+diff --git a/src/mm3_setup.h b/src/mm3_setup.h
+new file mode 100644
+index 0000000..1206321
+--- /dev/null
++++ b/src/mm3_setup.h
+@@ -0,0 +1,34 @@
++/* The Linux launcher's first-run setup: it builds the game on the device
++ * from the player's own disc (setup/mm3_setup.py beside the launcher does
++ * the work) and adds it to Steam. src/mm3_launcher.cpp shows it over the
++ * settings while the game is not built for this launcher. */
++#ifndef MM3_SETUP_H
++#define MM3_SETUP_H
++
++#include <RmlUi/Core.h>
++
++namespace mm3_setup {
++
++/* Finds the setup script and makes the data folder the working directory,
++ * where the game, its settings and its saves live. */
++void init();
++/* Ends a build still running when the launcher closes. */
++void shutdown();
++/* The setup covers the launcher: the game is not built for this version. */
++bool active();
++/* The launcher's document with the setup's markup and style added. */
++Rml::String document(const char *launcher);
++void bind(Rml::DataModelConstructor &m);
++void attach(Rml::DataModelHandle model);
++/* Polls the setup script; true once a build has just finished. */
++bool tick(double now);
++/* Input: true when the setup took the key or the controller's buttons
++ * (XInput bits, the D-pad standing for the left stick too). */
++bool on_key(Rml::Input::KeyIdentifier key);
++bool on_pad(unsigned pressed);
++/* The script Play runs: the game with the launcher's saved settings. */
++const char *start_script();
++
++} // namespace mm3_setup
++
++#endif
+diff --git a/src/mods/mods.c b/src/mods/mods.c
+index a43174d..00fd0ac 100644
+--- a/src/mods/mods.c
++++ b/src/mods/mods.c
+@@ -47,6 +47,7 @@ int mm3_mod_on(int mod)
+     return state[mod] == 2;
+ }
+ 
++#if !defined(MM3_MODS_TABLE_ONLY) /* the Linux launcher lists the mods, nothing more */
+ /* Player updates only run in gameplay, so a gap means a menu: the frontend,
+  * car select or a pause. RECOMP_MENU_KEYS follows it. Not a mod: input. */
+ static volatile DWORD last_update;
+@@ -92,3 +93,4 @@ void mm3_mods_player_update(void)
+     if (mm3_mod_on(MM3_MOD_DEV_TOOLS))
+         mm3_dev_tools_tick();
+ }
++#endif

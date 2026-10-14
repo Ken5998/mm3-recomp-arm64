@@ -1,0 +1,101 @@
+From 7b5fb605dd56b33c1a402e3a9baf29be09397cbe Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 03:04:07 +0000
+Subject: [PATCH 7/9] fix(memory): reserve the whole guest address space on
+ linux
+
+The span covered RAM, its mirrors and the contiguous window only, so
+Linux was free to place it right below libc. The apertures mapped above
+it (tiled, NV2A, MCPX, flash) then landed on shared libraries, and the
+MMIO traps, which only change protection, took their pages away.
+
+Reserve the full 4 GB guest space and release each aperture's slice of
+it before mapping the aperture there. Reservations are MAP_NORESERVE so
+the span does not count against the commit limit.
+---
+ src/kernel/xbox_memory_layout.c | 28 +++++++++++++++++++++++++---
+ src/platform/win32_compat.c     |  4 ++++
+ 2 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 81fb4fc..165599b 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -1996,9 +1996,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+             }
+         }
+ #else
+-        g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+-        if (g_span_size < (size_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+-            g_span_size = (size_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
++        /* The whole 32-bit guest space, so the apertures placed later -- tiled
++         * 0xF0000000, NV2A 0xFD000000, MCPX 0xFE800000, flash 0xFF000000 --
++         * land in this reservation too. Reserving only RAM, its mirrors and
++         * the contiguous window let Linux put the span right below libc: the
++         * apertures above it then fell on the shared libraries, and the MMIO
++         * traps, which only change protection, took those libraries' pages
++         * away (getenv faulting in libc before the first frame). */
++        g_span_size = (size_t)0x100000000ULL;
+         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+         if (g_span_base) {
+             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
+@@ -2546,6 +2551,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+      */
+     {
+         uintptr_t nv2a_native = XBOX_NV2A_BASE + g_memory_offset;
++#ifndef _WIN32
++        if (g_span_base)
++            VirtualFree((void *)nv2a_native, XBOX_NV2A_SIZE, MEM_RELEASE);
++#endif
+         g_nv2a_memory = VirtualAlloc(
+             (LPVOID)nv2a_native,
+             XBOX_NV2A_SIZE,
+@@ -2605,6 +2614,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+      */
+     {
+         uintptr_t mcpx_native = XBOX_MCPX_BASE + g_memory_offset;
++#ifndef _WIN32
++        if (g_span_base)
++            VirtualFree((void *)mcpx_native, XBOX_MCPX_SIZE, MEM_RELEASE);
++#endif
+         g_mcpx_memory = VirtualAlloc(
+             (LPVOID)mcpx_native,
+             XBOX_MCPX_SIZE,
+@@ -2687,6 +2700,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+     /* Flash ROM aperture -- see XBOX_FLASH_BASE for why. */
+     {
+         uintptr_t flash_native = XBOX_FLASH_BASE + g_memory_offset;
++#ifndef _WIN32
++        if (g_span_base)
++            VirtualFree((void *)flash_native, XBOX_FLASH_SIZE, MEM_RELEASE);
++#endif
+ 
+         g_flash_memory = VirtualAlloc(
+             (LPVOID)flash_native,
+@@ -2886,6 +2903,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+     {
+         uintptr_t tiled_native = XBOX_TILED_BASE + g_memory_offset;
+         size_t tiled_size = xbox_TiledApertureSize();
++#ifndef _WIN32
++        if (g_span_base)
++            VirtualFree((void *)tiled_native,
++                        tiled_size > XBOX_CONTIG_SIZE ? XBOX_CONTIG_SIZE : tiled_size, MEM_RELEASE);
++#endif
+         /* A view of the CONTIGUOUS window, not of RAM.
+          *
+          * On hardware all three -- physical P, 0x80000000+P and 0xF0000000+P
+diff --git a/src/platform/win32_compat.c b/src/platform/win32_compat.c
+index 48a1417..0b39ea5 100644
+--- a/src/platform/win32_compat.c
++++ b/src/platform/win32_compat.c
+@@ -1140,6 +1140,10 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
+ #if defined(MAP_FIXED_NOREPLACE)
+     if (address) flags |= MAP_FIXED_NOREPLACE;
+ #endif
++    /* A reservation is address space, not memory: the guest span is 4 GB and
++     * must not count against the commit limit before anything touches it. */
++    if ((allocationType & MEM_RESERVE) && !(allocationType & MEM_COMMIT))
++        flags |= MAP_NORESERVE;
+ 
+     void *p;
+ #if defined(__APPLE__)

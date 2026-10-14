@@ -1,0 +1,29 @@
+From b07fbed1b29791cead239d079d89fae23c3831d0 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 03:36:53 +0000
+Subject: [PATCH 4/4] fix(linux): compile the translated code with clang 16 and
+ gcc 14
+
+The translated runtime entries jump to a few functions the translator
+never declares, on paths that are never taken. MSVC and GCC 13 warn about
+the implicit declarations; Clang 16 and later and GCC 14 make them an
+error, so the C sources now keep them a warning.
+---
+ CMakeLists.txt | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fd7e87f..25b15bf 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -274,6 +274,10 @@ else()
+     # type, wrapping signed arithmetic, and no fused multiply-adds (arm64
+     # compilers fuse by default, which moves the physics off the x86 results).
+     target_compile_options(${PROJECT_NAME} PRIVATE -fno-strict-aliasing -fwrapv -ffp-contract=off)
++    # The translated runtime entries (recomp_runtime_entries.c) hold
++    # unreachable tail jumps to functions nothing declares; MSVC warns about
++    # the implicit declarations, Clang 16 and GCC 14 refuse them.
++    target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wno-error=implicit-function-declaration>)
+     if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+         # The translator writes every condition as if ((a == b)).
+         target_compile_options(${PROJECT_NAME} PRIVATE -Wno-parentheses-equality)

@@ -1,0 +1,202 @@
+From d2a31f7c91f0aa02429a26af21d3f43ab082c7ae Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 02:49:32 +0000
+Subject: [PATCH 6/9] feat(video): share the window's scancode to virtual key
+ table
+
+A settings screen that binds keys before the game window exists can read SDL's keyboard in the same virtual keys RECOMP_KEYMAP uses: the table moves to sdl_keys.c.
+---
+ src/video/CMakeLists.txt |  1 +
+ src/video/fb_present.c   | 58 ++--------------------------------------
+ src/video/sdl_keys.c     | 58 ++++++++++++++++++++++++++++++++++++++++
+ src/video/sdl_keys.h     | 21 +++++++++++++++
+ 4 files changed, 82 insertions(+), 56 deletions(-)
+ create mode 100644 src/video/sdl_keys.c
+ create mode 100644 src/video/sdl_keys.h
+
+diff --git a/src/video/CMakeLists.txt b/src/video/CMakeLists.txt
+index eee2bdc..430f3bc 100644
+--- a/src/video/CMakeLists.txt
++++ b/src/video/CMakeLists.txt
+@@ -32,6 +32,7 @@ else()
+         find_package(SDL2)
+         if(DXVK_FOUND AND VKD3D_UTILS_FOUND AND SDL2_FOUND)
+             target_compile_definitions(xbox_video PUBLIC XBOXRECOMP_DXVK)
++            target_sources(xbox_video PRIVATE sdl_keys.c)
+             target_link_libraries(xbox_video PUBLIC
+                 PkgConfig::DXVK PkgConfig::VKD3D_UTILS SDL2::SDL2 platform)
+             message(STATUS "xbox_video: D3D11 renderer on DXVK-native ${DXVK_dxvk-d3d11_VERSION}")
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index 0d89183..ee2c060 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -26,6 +26,7 @@
+ #include <SDL.h>
+ #include <SDL_vulkan.h>
+ #include <unistd.h>
++#include "sdl_keys.h"
+ #endif
+ #include <stdio.h>
+ #include "platform/recomp_profile.h"
+@@ -629,61 +630,6 @@ static void fb_toggle_fullscreen(SDL_Window *win)
+     SDL_ShowCursor(full ? SDL_ENABLE : SDL_DISABLE);
+ }
+ 
+-/* SDL's physical key to the Windows virtual key the input layer binds
+- * (RECOMP_KEYMAP is written in VK codes). */
+-static int fb_vk(SDL_Scancode sc)
+-{
+-    if (sc >= SDL_SCANCODE_A && sc <= SDL_SCANCODE_Z) return 'A' + (sc - SDL_SCANCODE_A);
+-    if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_9) return '1' + (sc - SDL_SCANCODE_1);
+-    if (sc >= SDL_SCANCODE_F1 && sc <= SDL_SCANCODE_F12) return VK_F1 + (sc - SDL_SCANCODE_F1);
+-    if (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_9) return VK_NUMPAD1 + (sc - SDL_SCANCODE_KP_1);
+-    switch (sc) {
+-    case SDL_SCANCODE_0:            return '0';
+-    case SDL_SCANCODE_KP_0:         return VK_NUMPAD0;
+-    case SDL_SCANCODE_RETURN:
+-    case SDL_SCANCODE_KP_ENTER:     return VK_RETURN;
+-    case SDL_SCANCODE_ESCAPE:       return VK_ESCAPE;
+-    case SDL_SCANCODE_BACKSPACE:    return VK_BACK;
+-    case SDL_SCANCODE_TAB:          return VK_TAB;
+-    case SDL_SCANCODE_SPACE:        return VK_SPACE;
+-    case SDL_SCANCODE_LEFT:         return VK_LEFT;
+-    case SDL_SCANCODE_RIGHT:        return VK_RIGHT;
+-    case SDL_SCANCODE_UP:           return VK_UP;
+-    case SDL_SCANCODE_DOWN:         return VK_DOWN;
+-    case SDL_SCANCODE_INSERT:       return VK_INSERT;
+-    case SDL_SCANCODE_DELETE:       return VK_DELETE;
+-    case SDL_SCANCODE_HOME:         return VK_HOME;
+-    case SDL_SCANCODE_END:          return VK_END;
+-    case SDL_SCANCODE_PAGEUP:       return VK_PRIOR;
+-    case SDL_SCANCODE_PAGEDOWN:     return VK_NEXT;
+-    case SDL_SCANCODE_PAUSE:        return VK_PAUSE;
+-    case SDL_SCANCODE_CAPSLOCK:     return VK_CAPITAL;
+-    case SDL_SCANCODE_LSHIFT:       return VK_LSHIFT;
+-    case SDL_SCANCODE_RSHIFT:       return VK_RSHIFT;
+-    case SDL_SCANCODE_LCTRL:        return VK_LCONTROL;
+-    case SDL_SCANCODE_RCTRL:        return VK_RCONTROL;
+-    case SDL_SCANCODE_LALT:         return VK_LMENU;
+-    case SDL_SCANCODE_RALT:         return VK_RMENU;
+-    case SDL_SCANCODE_KP_MULTIPLY:  return VK_MULTIPLY;
+-    case SDL_SCANCODE_KP_PLUS:      return VK_ADD;
+-    case SDL_SCANCODE_KP_MINUS:     return VK_SUBTRACT;
+-    case SDL_SCANCODE_KP_DIVIDE:    return VK_DIVIDE;
+-    case SDL_SCANCODE_KP_PERIOD:    return VK_DECIMAL;
+-    case SDL_SCANCODE_SEMICOLON:    return VK_OEM_1;
+-    case SDL_SCANCODE_EQUALS:       return VK_OEM_PLUS;
+-    case SDL_SCANCODE_COMMA:        return VK_OEM_COMMA;
+-    case SDL_SCANCODE_MINUS:        return VK_OEM_MINUS;
+-    case SDL_SCANCODE_PERIOD:       return VK_OEM_PERIOD;
+-    case SDL_SCANCODE_SLASH:        return VK_OEM_2;
+-    case SDL_SCANCODE_GRAVE:        return VK_OEM_3;
+-    case SDL_SCANCODE_LEFTBRACKET:  return VK_OEM_4;
+-    case SDL_SCANCODE_BACKSLASH:    return VK_OEM_5;
+-    case SDL_SCANCODE_RIGHTBRACKET: return VK_OEM_6;
+-    case SDL_SCANCODE_APOSTROPHE:   return VK_OEM_7;
+-    default:                        return 0;
+-    }
+-}
+-
+ static void fb_key(const SDL_KeyboardEvent *k, SDL_Window *win)
+ {
+     int down = k->type == SDL_KEYDOWN, vk;
+@@ -694,7 +640,7 @@ static void fb_key(const SDL_KeyboardEvent *k, SDL_Window *win)
+             fb_toggle_fullscreen(win);
+         return;
+     }
+-    if (!(vk = fb_vk(sc)))
++    if (!(vk = xbox_SdlScancodeToVk(sc)))
+         return;
+     s_key_down[vk] = (unsigned char)down;
+     /* Windows reports either shift as VK_SHIFT, and the default keymap binds
+diff --git a/src/video/sdl_keys.c b/src/video/sdl_keys.c
+new file mode 100644
+index 0000000..1983002
+--- /dev/null
++++ b/src/video/sdl_keys.c
+@@ -0,0 +1,58 @@
++/* SDL scancodes to Windows virtual keys: see sdl_keys.h. */
++#include "sdl_keys.h"
++#include "platform/win32_compat.h"
++#include <SDL.h>
++
++int xbox_SdlScancodeToVk(int scancode)
++{
++    const SDL_Scancode sc = (SDL_Scancode)scancode;
++    if (sc >= SDL_SCANCODE_A && sc <= SDL_SCANCODE_Z) return 'A' + (sc - SDL_SCANCODE_A);
++    if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_9) return '1' + (sc - SDL_SCANCODE_1);
++    if (sc >= SDL_SCANCODE_F1 && sc <= SDL_SCANCODE_F12) return VK_F1 + (sc - SDL_SCANCODE_F1);
++    if (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_9) return VK_NUMPAD1 + (sc - SDL_SCANCODE_KP_1);
++    switch (sc) {
++    case SDL_SCANCODE_0:            return '0';
++    case SDL_SCANCODE_KP_0:         return VK_NUMPAD0;
++    case SDL_SCANCODE_RETURN:
++    case SDL_SCANCODE_KP_ENTER:     return VK_RETURN;
++    case SDL_SCANCODE_ESCAPE:       return VK_ESCAPE;
++    case SDL_SCANCODE_BACKSPACE:    return VK_BACK;
++    case SDL_SCANCODE_TAB:          return VK_TAB;
++    case SDL_SCANCODE_SPACE:        return VK_SPACE;
++    case SDL_SCANCODE_LEFT:         return VK_LEFT;
++    case SDL_SCANCODE_RIGHT:        return VK_RIGHT;
++    case SDL_SCANCODE_UP:           return VK_UP;
++    case SDL_SCANCODE_DOWN:         return VK_DOWN;
++    case SDL_SCANCODE_INSERT:       return VK_INSERT;
++    case SDL_SCANCODE_DELETE:       return VK_DELETE;
++    case SDL_SCANCODE_HOME:         return VK_HOME;
++    case SDL_SCANCODE_END:          return VK_END;
++    case SDL_SCANCODE_PAGEUP:       return VK_PRIOR;
++    case SDL_SCANCODE_PAGEDOWN:     return VK_NEXT;
++    case SDL_SCANCODE_PAUSE:        return VK_PAUSE;
++    case SDL_SCANCODE_CAPSLOCK:     return VK_CAPITAL;
++    case SDL_SCANCODE_LSHIFT:       return VK_LSHIFT;
++    case SDL_SCANCODE_RSHIFT:       return VK_RSHIFT;
++    case SDL_SCANCODE_LCTRL:        return VK_LCONTROL;
++    case SDL_SCANCODE_RCTRL:        return VK_RCONTROL;
++    case SDL_SCANCODE_LALT:         return VK_LMENU;
++    case SDL_SCANCODE_RALT:         return VK_RMENU;
++    case SDL_SCANCODE_KP_MULTIPLY:  return VK_MULTIPLY;
++    case SDL_SCANCODE_KP_PLUS:      return VK_ADD;
++    case SDL_SCANCODE_KP_MINUS:     return VK_SUBTRACT;
++    case SDL_SCANCODE_KP_DIVIDE:    return VK_DIVIDE;
++    case SDL_SCANCODE_KP_PERIOD:    return VK_DECIMAL;
++    case SDL_SCANCODE_SEMICOLON:    return VK_OEM_1;
++    case SDL_SCANCODE_EQUALS:       return VK_OEM_PLUS;
++    case SDL_SCANCODE_COMMA:        return VK_OEM_COMMA;
++    case SDL_SCANCODE_MINUS:        return VK_OEM_MINUS;
++    case SDL_SCANCODE_PERIOD:       return VK_OEM_PERIOD;
++    case SDL_SCANCODE_SLASH:        return VK_OEM_2;
++    case SDL_SCANCODE_GRAVE:        return VK_OEM_3;
++    case SDL_SCANCODE_LEFTBRACKET:  return VK_OEM_4;
++    case SDL_SCANCODE_BACKSLASH:    return VK_OEM_5;
++    case SDL_SCANCODE_RIGHTBRACKET: return VK_OEM_6;
++    case SDL_SCANCODE_APOSTROPHE:   return VK_OEM_7;
++    default:                        return 0;
++    }
++}
+diff --git a/src/video/sdl_keys.h b/src/video/sdl_keys.h
+new file mode 100644
+index 0000000..055a9c6
+--- /dev/null
++++ b/src/video/sdl_keys.h
+@@ -0,0 +1,21 @@
++/**
++ * SDL's physical keys as the Windows virtual keys the input layer binds
++ * (RECOMP_KEYMAP is written in VK codes). The game window records keys this
++ * way; a settings screen that binds keys before that window exists can use
++ * the same table. Linux only: Windows has the real virtual keys.
++ */
++#ifndef XBOXRECOMP_SDL_KEYS_H
++#define XBOXRECOMP_SDL_KEYS_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* The virtual key for an SDL_Scancode, 0 for keys the game ignores. */
++int xbox_SdlScancodeToVk(int scancode);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif

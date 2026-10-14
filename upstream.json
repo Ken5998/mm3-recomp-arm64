@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/MattSG/mm3-recomp",
+  "commit": "07a5e6622ecd012b125cc2a5c77b187200601bae",
+  "xboxrecomp": {
+    "repository": "https://github.com/MattSG/xboxrecomp",
+    "commit": "88e4b028b3561b326b4354d21bc94ce72290162e",
+    "generator_commit": "967ec30f362dee229183b4e112e928cd41830484"
+  },
+  "verified_utc": "2026-10-14T00:00:00Z"
+}

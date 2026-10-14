@@ -1,0 +1,1564 @@
+From 3ccf8b8a6a10616f4c4b7f0376d2217f7235050c Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 22:34:42 +0000
+Subject: [PATCH 1/9] feat(posix): trap device registers on arm64 and x86-64
+ linux
+
+AddVectoredExceptionHandler now installs a SIGSEGV/SIGBUS handler that
+builds the EXCEPTION_RECORD Windows would (write flag, fault address) and
+passes the ucontext as the CONTEXT. mmio_decode.h decodes the faulting
+instruction on both hosts: the existing x86-64 decoder reads the ucontext
+registers, and a new A64 decoder covers LDR/STR of every width and
+addressing mode, LDP/STP, LDAR/STLR/LDAPR and the FP/SIMD forms.
+
+The OHCI, NV2A and APU hooks use it on Linux, the AC'97 and watch traps
+emulate the store instead of single-stepping it, and host.c builds on
+POSIX without the D3D8 window. Also adds GetComputerNameA, _putenv_s and
+SetUnhandledExceptionFilter to the shim, and links libm into it.
+---
+ CMakeLists.txt                         |   8 +-
+ src/apu/apu_mmio_hook.c                |  46 +++-
+ src/host/CMakeLists.txt                |   5 +-
+ src/host/host.c                        |  35 ++-
+ src/kernel/xbox_memory_layout.c        |  58 +++++
+ src/nv2a/nv2a_mmio_hook.c              |  42 +++-
+ src/platform/CMakeLists.txt            |   2 +-
+ src/platform/mmio_decode.h             |  80 ++++--
+ src/platform/mmio_decode_a64.h         | 333 +++++++++++++++++++++++++
+ src/platform/win32_compat.c            | 192 +++++++++++++-
+ src/platform/win32_compat.h            |   6 +
+ src/platform/xbox_winnt.h              |  35 +--
+ src/usb/ohci.c                         |   8 +-
+ tests/mmio_decode_posix/CMakeLists.txt |  14 ++
+ tests/mmio_decode_posix/test_main.c    | 246 ++++++++++++++++++
+ 15 files changed, 1044 insertions(+), 66 deletions(-)
+ create mode 100644 src/platform/mmio_decode_a64.h
+ create mode 100644 tests/mmio_decode_posix/CMakeLists.txt
+ create mode 100644 tests/mmio_decode_posix/test_main.c
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 940b087..08fe91e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -60,9 +60,7 @@ add_subdirectory(src/net)
+ add_subdirectory(src/video)
+ 
+ # Host bring-up: MMIO routing to the APU/USB/NV2A models, window and device
+-if(WIN32)
+-    add_subdirectory(src/host)
+-endif()
++add_subdirectory(src/host)
+ 
+ # ── Umbrella target ───────────────────────────────────────────
+ 
+@@ -79,7 +77,5 @@ target_link_libraries(xboxrecomp INTERFACE
+     xbox_nv2a
+     xbox_video
+ )
+-if(WIN32)
+-    target_link_libraries(xboxrecomp INTERFACE xbox_host)
+-endif()
++target_link_libraries(xboxrecomp INTERFACE xbox_host)
+ 
+diff --git a/src/apu/apu_mmio_hook.c b/src/apu/apu_mmio_hook.c
+index 46cc2c5..fa05ca3 100644
+--- a/src/apu/apu_mmio_hook.c
++++ b/src/apu/apu_mmio_hook.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "apu.h"
++#include "../platform/mmio_decode.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <stdbool.h>
+@@ -15,11 +16,10 @@
+  * platform's MMIO hook is active, so define it before the #if guard. */
+ MCPXAPUState *g_apu_state = NULL;
+ 
+-/* The MMIO hook is a Win32-VEH x86-64 instruction decoder. On Linux the
+- * equivalent goes through sigaction + ucontext_t (Stage 2 / main.c). For
+- * now the whole body is Windows-only so apu_emu links on Debian. */
+-#if defined(_WIN32)
+-#include <windows.h>
++/* The MMIO hook decodes the faulting instruction (mmio_decode.h): a Win32
++ * VEH on Windows, the SIGSEGV handler behind AddVectoredExceptionHandler on
++ * Linux. Hosts with no decoder get no hook. */
++#if defined(MMIO_TRAP_SUPPORTED)
+ 
+ /* APU MMIO base in Xbox VA space */
+ #define APU_MMIO_BASE  0xFE800000u
+@@ -32,6 +32,8 @@ static int g_apu_mmio_read_count = 0;
+ static int g_apu_mmio_write_count = 0;
+ static int g_apu_mmio_decode_fail = 0;
+ 
++#if defined(_WIN32)
++
+ /* ============================================================
+  * x86-64 register access helpers (same as NV2A hook)
+  * ============================================================ */
+@@ -254,6 +256,38 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
+  * Public API (called from VEH in main.c)
+  * ============================================================ */
+ 
++#else /* POSIX: the shared decoder in mmio_decode.h */
++
++static uint64_t apu_trap_read(void *dev, uint32_t off, int size)
++{
++    g_apu_mmio_read_count++;
++    return mcpx_apu_mmio_read((MCPXAPUState *)dev, off, (unsigned)size);
++}
++
++static void apu_trap_write(void *dev, uint32_t off, uint64_t val, int size)
++{
++    g_apu_mmio_write_count++;
++    mcpx_apu_mmio_write((MCPXAPUState *)dev, off, val, (unsigned)size);
++}
++
++static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
++{
++    (void)is_write;
++    if (!g_apu_state) return false;
++    if (mmio_emulate(ctx, mmio_offset, g_apu_state, apu_trap_read, apu_trap_write))
++        return true;
++    g_apu_mmio_decode_fail++;
++    if (g_apu_mmio_decode_fail <= 20) {
++        const uint8_t *ip = mmio_ctx_pc(ctx);
++        fprintf(stderr, "[APU] MMIO decode fail at PC=%p: %02X %02X %02X %02X\n",
++                (void *)ip, ip[0], ip[1], ip[2], ip[3]);
++        fflush(stderr);
++    }
++    return false;
++}
++
++#endif /* _WIN32 */
++
+ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+                           uint32_t fault_xbox_va, int is_write)
+ {
+@@ -279,4 +313,4 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+     return ok;
+ }
+ 
+-#endif /* _WIN32 */
++#endif /* MMIO_TRAP_SUPPORTED */
+diff --git a/src/host/CMakeLists.txt b/src/host/CMakeLists.txt
+index c9968fa..4164c61 100644
+--- a/src/host/CMakeLists.txt
++++ b/src/host/CMakeLists.txt
+@@ -4,7 +4,10 @@
+ add_library(xbox_host STATIC host.c)
+ 
+ target_include_directories(xbox_host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+-target_link_libraries(xbox_host PUBLIC platform xbox_kernel xbox_apu xbox_usb xbox_net xbox_nv2a xbox_d3d8)
++target_link_libraries(xbox_host PUBLIC platform xbox_kernel xbox_apu xbox_usb xbox_net xbox_nv2a)
++if(WIN32)
++    target_link_libraries(xbox_host PUBLIC xbox_d3d8)
++endif()
+ 
+ if(MSVC)
+     target_compile_options(xbox_host PRIVATE /W4 /O2)
+diff --git a/src/host/host.c b/src/host/host.c
+index b2a89d1..642366b 100644
+--- a/src/host/host.c
++++ b/src/host/host.c
+@@ -3,9 +3,14 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#if defined(_WIN32)
+ #include <windows.h>
+-
+ #include <d3d/d3d8_xbox.h>
++#else
++#include "win32_compat.h"
++#endif
++
++#include "mmio_decode.h"
+ #include "xbox_memory_layout.h"
+ #include "nv2a_mmio_hook.h"
+ #include "nv2a_state.h"
+@@ -29,8 +34,10 @@ extern bool apu_hook_handle_mmio(PCONTEXT context, uintptr_t fault_address,
+                                  uint32_t guest_address, int is_write);
+ 
+ static PVOID s_mmio_veh;
++#if defined(_WIN32)
+ static IDirect3D8 *s_d3d;
+ static IDirect3DDevice8 *s_device;
++#endif
+ 
+ static LONG CALLBACK mmio_handler(PEXCEPTION_POINTERS info)
+ {
+@@ -108,6 +115,7 @@ void xbox_HostHardwareShutdown(void)
+     }
+ }
+ 
++#if defined(_WIN32)
+ static LRESULT CALLBACK graphics_wndproc(HWND window, UINT message,
+                                          WPARAM wparam, LPARAM lparam)
+ {
+@@ -172,3 +180,28 @@ int xbox_HostGraphicsInit(const char *window_title)
+     }
+     return 1;
+ }
++#else /* POSIX */
++
++/* No D3D8 device here: MM3-style titles draw through the NV2A executor,
++ * whose renderer makes its own device and presents into the framebuffer
++ * window (fb_present.c). What the graphics side still needs from the host is
++ * the NV2A register model and the PVIDEO trap. */
++int xbox_HostGraphicsInit(const char *window_title)
++{
++    DWORD old_protect;
++
++    (void)window_title;
++#if !defined(MMIO_TRAP_SUPPORTED)
++    fprintf(stderr, "[HOST] no MMIO fault decoder for this CPU\n");
++    return 0;
++#else
++    nv2a_hook_init(g_xbox_mem_offset);
++    if (!VirtualProtect((void *)((uintptr_t)g_xbox_mem_offset + PVIDEO_PAGE),
++                        0x1000, PAGE_NOACCESS, &old_protect)) {
++        fprintf(stderr, "[NV2A] could not trap PVIDEO page\n");
++        return 0;
++    }
++    return 1;
++#endif
++}
++#endif
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 1289c36..81fb4fc 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -407,6 +407,42 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
+ #define AC97_TRAP_BYTES   0x1000u
+ #define AC97_RR           0x02u
+ 
++#if !defined(_WIN32)
++#include "mmio_decode.h"
++
++/* POSIX has no trap flag to single-step a write with, so the write traps
++ * below are serviced by doing the store: decode it (mmio_decode.h), apply it
++ * to the page made writable for the moment, and step past it. The caller
++ * does its own work and protects the page again. Returns 0 for an
++ * instruction the decoder does not know, leaving the fault unhandled. */
++static uint64_t step_plain_read(void *page, uint32_t off, int size)
++{
++    uint64_t v = 0;
++    memcpy(&v, (const uint8_t *)page + off, (size_t)size);
++    return v;
++}
++
++static void step_plain_write(void *page, uint32_t off, uint64_t v, int size)
++{
++    memcpy((uint8_t *)page + off, &v, (size_t)size);
++}
++
++static int step_store(PEXCEPTION_POINTERS ep, void *page, size_t len)
++{
++#if defined(MMIO_TRAP_SUPPORTED)
++    uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
++    DWORD old;
++    if (!VirtualProtect(page, len, PAGE_READWRITE, &old))
++        return 0;
++    return mmio_emulate(ep->ContextRecord, (uint32_t)(fault - (uintptr_t)page),
++                        page, step_plain_read, step_plain_write);
++#else
++    (void)ep; (void)page; (void)len;
++    return 0;
++#endif
++}
++#endif
++
+ static void *g_ac97_page = NULL;      /* host address of the trapped page */
+ static void *g_ac97_veh  = NULL;
+ static RECOMP_TLS int s_ac97_stepping = 0;
+@@ -444,6 +480,7 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
+      * because another thread must not mistake its own single-step for this
+      * one -- and re-protecting from the wrong thread would strand this one
+      * mid-step. */
++#if defined(_WIN32)
+     if (code == EXCEPTION_SINGLE_STEP && s_ac97_stepping) {
+         s_ac97_stepping = 0;
+         ac97_clear_reset_bits();
+@@ -451,6 +488,7 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
+         ep->ContextRecord->EFlags &= ~0x100u;   /* clear TF */
+         return EXCEPTION_CONTINUE_EXECUTION;
+     }
++#endif
+ 
+     if (code == EXCEPTION_ACCESS_VIOLATION
+             && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+@@ -458,12 +496,21 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
+ 
+         if (fault >= (uintptr_t)g_ac97_page
+                 && fault < (uintptr_t)g_ac97_page + AC97_TRAP_BYTES) {
++#if defined(_WIN32)
+             if (!VirtualProtect(g_ac97_page, AC97_TRAP_BYTES,
+                                 PAGE_READWRITE, &old))
+                 return EXCEPTION_CONTINUE_SEARCH;
+             s_ac97_stepping = 1;
+             ep->ContextRecord->EFlags |= 0x100u;   /* TF: step the write */
+             return EXCEPTION_CONTINUE_EXECUTION;
++#else
++            (void)s_ac97_stepping;
++            if (!step_store(ep, g_ac97_page, AC97_TRAP_BYTES))
++                return EXCEPTION_CONTINUE_SEARCH;
++            ac97_clear_reset_bits();
++            VirtualProtect(g_ac97_page, AC97_TRAP_BYTES, PAGE_READONLY, &old);
++            return EXCEPTION_CONTINUE_EXECUTION;
++#endif
+         }
+     }
+     return EXCEPTION_CONTINUE_SEARCH;
+@@ -1496,6 +1543,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
+     if (!g_watch_page)
+         return EXCEPTION_CONTINUE_SEARCH;
+ 
++#if defined(_WIN32)
+     if (code == EXCEPTION_SINGLE_STEP && s_watch_stepping) {
+         s_watch_stepping = 0;
+         watch_report();
+@@ -1503,6 +1551,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
+         ep->ContextRecord->EFlags &= ~0x100u;
+         return EXCEPTION_CONTINUE_EXECUTION;
+     }
++#endif
+ 
+     if (code == EXCEPTION_ACCESS_VIOLATION
+             && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+@@ -1510,11 +1559,20 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
+ 
+         if (fault >= (uintptr_t)g_watch_page
+                 && fault < (uintptr_t)g_watch_page + 4096) {
++#if defined(_WIN32)
+             if (!VirtualProtect(g_watch_page, 4096, PAGE_READWRITE, &old))
+                 return EXCEPTION_CONTINUE_SEARCH;
+             s_watch_stepping = 1;
+             ep->ContextRecord->EFlags |= 0x100u;
+             return EXCEPTION_CONTINUE_EXECUTION;
++#else
++            (void)s_watch_stepping;
++            if (!step_store(ep, g_watch_page, 4096))
++                return EXCEPTION_CONTINUE_SEARCH;
++            watch_report();
++            VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old);
++            return EXCEPTION_CONTINUE_EXECUTION;
++#endif
+         }
+     }
+     return EXCEPTION_CONTINUE_SEARCH;
+diff --git a/src/nv2a/nv2a_mmio_hook.c b/src/nv2a/nv2a_mmio_hook.c
+index 86e09cc..f19939f 100644
+--- a/src/nv2a/nv2a_mmio_hook.c
++++ b/src/nv2a/nv2a_mmio_hook.c
+@@ -7,6 +7,7 @@
+ 
+ #include "nv2a_mmio_hook.h"
+ #include "nv2a_state.h"
++#include "../platform/mmio_decode.h"
+ #include <stdio.h>
+ 
+ /* NV2A MMIO base in Xbox VA space */
+@@ -28,7 +29,7 @@ static int g_mmio_decode_fail = 0;
+  * (regardless of whether the MMIO hook is active). Keep its definition
+  * outside the Win32 guard. */
+ 
+-#if defined(_WIN32)
++#if defined(MMIO_TRAP_SUPPORTED)
+ 
+ static SRWLOCK g_pvideo_lock = SRWLOCK_INIT;
+ 
+@@ -56,6 +57,8 @@ void nv2a_hook_pvideo_consume(unsigned bank)
+     ReleaseSRWLockExclusive(&g_pvideo_lock);
+ }
+ 
++#if defined(_WIN32)
++
+ /* ============================================================
+  * x86-64 register access helpers
+  * ============================================================ */
+@@ -388,6 +391,39 @@ static bool decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
+     return false;
+ }
+ 
++#else /* POSIX: the shared decoder in mmio_decode.h */
++
++static uint64_t nv2a_trap_read(void *dev, uint32_t off, int size)
++{
++    g_mmio_read_count++;
++    return nv2a_mmio_read((NV2AState *)dev, off, size);
++}
++
++static void nv2a_trap_write(void *dev, uint32_t off, uint64_t val, int size)
++{
++    g_mmio_write_count++;
++    nv2a_mmio_write((NV2AState *)dev, off, val, size);
++}
++
++static bool decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
++{
++    NV2AState *nv2a = nv2a_get_state();
++    (void)is_write;
++    if (!nv2a) return false;
++    if (mmio_emulate(ctx, mmio_offset, nv2a, nv2a_trap_read, nv2a_trap_write))
++        return true;
++    g_mmio_decode_fail++;
++    if (g_mmio_decode_fail <= 20) {
++        const uint8_t *ip = mmio_ctx_pc(ctx);
++        fprintf(stderr, "[NV2A] MMIO decode fail at PC=%p: %02X %02X %02X %02X\n",
++                (void *)ip, ip[0], ip[1], ip[2], ip[3]);
++        fflush(stderr);
++    }
++    return false;
++}
++
++#endif /* _WIN32 */
++
+ /* ============================================================
+  * Public API
+  * ============================================================ */
+@@ -448,7 +484,7 @@ bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
+     return false;
+ }
+ 
+-#else /* !_WIN32 -- SIGSEGV-based MMIO trapping deferred to main.c port */
++#else /* no fault decoder for this host */
+ 
+ bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4])
+ { (void)regs; return false; }
+@@ -464,4 +500,4 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+ bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
+ { (void)fault_addr; (void)fault_xbox_va; return false; }
+ 
+-#endif /* _WIN32 */
++#endif /* MMIO_TRAP_SUPPORTED */
+diff --git a/src/platform/CMakeLists.txt b/src/platform/CMakeLists.txt
+index 503aad1..8e28f6f 100644
+--- a/src/platform/CMakeLists.txt
++++ b/src/platform/CMakeLists.txt
+@@ -30,6 +30,6 @@ else()
+         ${CMAKE_CURRENT_SOURCE_DIR}
+     )
+     find_package(Threads REQUIRED)
+-    target_link_libraries(platform PUBLIC Threads::Threads)
++    target_link_libraries(platform PUBLIC Threads::Threads m)
+     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
+ endif()
+diff --git a/src/platform/mmio_decode.h b/src/platform/mmio_decode.h
+index c0dd9e0..fb7bedb 100644
+--- a/src/platform/mmio_decode.h
++++ b/src/platform/mmio_decode.h
+@@ -30,10 +30,31 @@
+ 
+ #if defined(_WIN32)
+ #include <windows.h>
++#define MMIO_TRAP_X86_64 1
++#elif defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
++/* POSIX: PCONTEXT is the ucontext_t a SA_SIGINFO handler receives (see
++ * AddVectoredExceptionHandler in win32_compat.c). */
++#include <stddef.h>
++#include <ucontext.h>
++#include "win32_compat.h"
++#if defined(__x86_64__)
++#define MMIO_TRAP_X86_64 1
++#else
++#define MMIO_TRAP_AARCH64 1
++#endif
++#endif
++
++#if defined(MMIO_TRAP_X86_64) || defined(MMIO_TRAP_AARCH64)
++#define MMIO_TRAP_SUPPORTED 1
+ 
+ /* Service one register access. dev is passed straight back to the callbacks. */
+ typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
+ typedef void     (*mmio_write_fn)(void *dev, uint32_t off, uint64_t val, int size);
++#endif
++
++#if defined(_WIN32)
++#define MMIO_CTX_RIP(c)    ((c)->Rip)
++#define MMIO_CTX_EFLAGS(c) ((c)->EFlags)
+ 
+ static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
+ {
+@@ -49,7 +70,23 @@ static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
+     default: return NULL;
+     }
+ }
++#elif defined(MMIO_TRAP_X86_64)
++/* glibc's REG_* indices, spelled out so this header does not depend on
++ * _GNU_SOURCE having been defined before the first #include. */
++#define MMIO_GREGS(c)      (((ucontext_t *)(c))->uc_mcontext.gregs)
++#define MMIO_CTX_RIP(c)    (MMIO_GREGS(c)[16])          /* REG_RIP */
++#define MMIO_CTX_EFLAGS(c) (MMIO_GREGS(c)[17])          /* REG_EFL */
++
++static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
++{
++    /* ModRM order rax rcx rdx rbx rsp rbp rsi rdi r8..r15 -> REG_* */
++    static const unsigned char map[16] = {
++        13, 14, 12, 11, 15, 10, 9, 8, 0, 1, 2, 3, 4, 5, 6, 7 };
++    return (uint64_t *)&MMIO_GREGS(c)[map[reg & 0xF]];
++}
++#endif
+ 
++#if defined(MMIO_TRAP_X86_64)
+ static inline int mmio_modrm_len(const uint8_t *ip, int rex_b)
+ {
+     uint8_t modrm = *ip;
+@@ -71,22 +108,22 @@ static inline int mmio_modrm_len(const uint8_t *ip, int rex_b)
+ static inline void mmio_set_flags(PCONTEXT ctx, uint64_t result, int size,
+                                   int carry)
+ {
+-    ctx->EFlags &= ~(0x0001u | 0x0040u | 0x0080u | 0x0800u);
++    MMIO_CTX_EFLAGS(ctx) &= ~(0x0001u | 0x0040u | 0x0080u | 0x0800u);
+     if (size < 8)
+         result &= (1ULL << (size * 8)) - 1;
+     if (result == 0)
+-        ctx->EFlags |= 0x0040u;                                   /* ZF */
++        MMIO_CTX_EFLAGS(ctx) |= 0x0040u;                                   /* ZF */
+     if (result & (1ULL << (size * 8 - 1)))
+-        ctx->EFlags |= 0x0080u;                                   /* SF */
++        MMIO_CTX_EFLAGS(ctx) |= 0x0080u;                                   /* SF */
+     if (carry)
+-        ctx->EFlags |= 0x0001u;                                   /* CF */
++        MMIO_CTX_EFLAGS(ctx) |= 0x0001u;                                   /* CF */
+ }
+ 
+-/* 1 if the instruction at ctx->Rip was serviced and Rip advanced past it. */
++/* 1 if the instruction at MMIO_CTX_RIP(ctx) was serviced and Rip advanced past it. */
+ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+                                mmio_read_fn rd, mmio_write_fn wr)
+ {
+-    const uint8_t *ip = (const uint8_t *)ctx->Rip;
++    const uint8_t *ip = (const uint8_t *)MMIO_CTX_RIP(ctx);
+     int prefix = 0, has66 = 0, rex = 0, has_rex = 0;
+     const uint8_t *op;
+     int size, rex_w, rex_r, rex_b, mlen, reg;
+@@ -114,19 +151,19 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+         mlen = mmio_modrm_len(op + 1, rex_b);
+         reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
+         wr(dev, off, *mmio_ctx_reg(ctx, reg), size);
+-        ctx->Rip += prefix + 1 + mlen;
++        MMIO_CTX_RIP(ctx) += prefix + 1 + mlen;
+         return 1;
+ 
+     case 0xC7:                                       /* MOV r/m, imm32       */
+         mlen = mmio_modrm_len(op + 1, rex_b);
+         wr(dev, off, *(const uint32_t *)(op + 1 + mlen), size);
+-        ctx->Rip += prefix + 1 + mlen + 4;
++        MMIO_CTX_RIP(ctx) += prefix + 1 + mlen + 4;
+         return 1;
+ 
+     case 0xC6:                                       /* MOV r/m8, imm8       */
+         mlen = mmio_modrm_len(op + 1, rex_b);
+         wr(dev, off, op[1 + mlen], 1);
+-        ctx->Rip += prefix + 1 + mlen + 1;
++        MMIO_CTX_RIP(ctx) += prefix + 1 + mlen + 1;
+         return 1;
+ 
+     case 0x8A: case 0x8B: {                          /* MOV r, r/m   (read)  */
+@@ -140,7 +177,7 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+         else if (size == 2) *dst = (*dst & ~0xFFFFULL) | (v & 0xFFFF);
+         else if (size == 4) *dst = v & 0xFFFFFFFFULL;  /* 32-bit clears high */
+         else                *dst = v;
+-        ctx->Rip += prefix + 1 + mlen;
++        MMIO_CTX_RIP(ctx) += prefix + 1 + mlen;
+         return 1;
+     }
+ 
+@@ -152,7 +189,7 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+         m    = rd(dev, off, size);
+         r    = *mmio_ctx_reg(ctx, reg);
+         mmio_set_flags(ctx, m & r, size, 0);
+-        ctx->Rip += prefix + 1 + mlen;
++        MMIO_CTX_RIP(ctx) += prefix + 1 + mlen;
+         return 1;
+     }
+ 
+@@ -166,7 +203,7 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+         mask = (size < 8) ? ((1ULL << (size * 8)) - 1) : ~0ULL;
+         m &= mask; r &= mask;
+         mmio_set_flags(ctx, m - r, size, m < r);
+-        ctx->Rip += prefix + 1 + mlen;
++        MMIO_CTX_RIP(ctx) += prefix + 1 + mlen;
+         return 1;
+     }
+ 
+@@ -175,7 +212,7 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+         mlen = mmio_modrm_len(op + 1, rex_b);
+         reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
+         wr(dev, off, rd(dev, off, size) | *mmio_ctx_reg(ctx, reg), size);
+-        ctx->Rip += prefix + 1 + mlen;
++        MMIO_CTX_RIP(ctx) += prefix + 1 + mlen;
+         return 1;
+ 
+     case 0x20: case 0x21:                            /* AND r/m, r           */
+@@ -183,7 +220,7 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+         mlen = mmio_modrm_len(op + 1, rex_b);
+         reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
+         wr(dev, off, rd(dev, off, size) & *mmio_ctx_reg(ctx, reg), size);
+-        ctx->Rip += prefix + 1 + mlen;
++        MMIO_CTX_RIP(ctx) += prefix + 1 + mlen;
+         return 1;
+ 
+     case 0x0F:
+@@ -192,7 +229,7 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+             mlen  = mmio_modrm_len(op + 2, rex_b);
+             reg   = ((op[2] >> 3) & 7) | (rex_r ? 8 : 0);
+             *mmio_ctx_reg(ctx, reg) = rd(dev, off, s) & ((1ULL << (s * 8)) - 1);
+-            ctx->Rip += prefix + 2 + mlen;
++            MMIO_CTX_RIP(ctx) += prefix + 2 + mlen;
+             return 1;
+         }
+         return 0;
+@@ -202,5 +239,16 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+     }
+ }
+ 
+-#endif /* _WIN32 */
++/* The faulting instruction, for "undecoded access" reports. */
++static inline const uint8_t *mmio_ctx_pc(PCONTEXT ctx)
++{
++    return (const uint8_t *)(uintptr_t)MMIO_CTX_RIP(ctx);
++}
++
++#endif /* MMIO_TRAP_X86_64 */
++
++#if defined(MMIO_TRAP_AARCH64)
++#include "mmio_decode_a64.h"
++#endif
++
+ #endif /* MMIO_DECODE_H */
+diff --git a/src/platform/mmio_decode_a64.h b/src/platform/mmio_decode_a64.h
+new file mode 100644
+index 0000000..a65808d
+--- /dev/null
++++ b/src/platform/mmio_decode_a64.h
+@@ -0,0 +1,333 @@
++/*
++ * mmio_decode_a64.h -- the AArch64 half of mmio_decode.h.
++ *
++ * On an arm64 host the generated code reaches a trapped register with an
++ * ordinary A64 load or store, so this decodes those instead of x86. A64 is
++ * the easier of the two: every instruction is four bytes, and a read-modify-
++ * write the x86 decoder has to service in one fault (OR [reg], r) arrives
++ * here as a separate load and store, each its own fault.
++ *
++ * Covered: LDR/STR of every width (unsigned offset, unscaled, register
++ * offset, pre- and post-index), the sign-extending loads, LDP/STP/LDPSW,
++ * LDAR/STLR/LDAPR, PRFM (skipped), and the FP/SIMD forms of the same
++ * addressing modes, whose B/H/S/D/Q registers come from the signal frame's
++ * FPSIMD record. Anything else -- exclusives, atomics, structure loads --
++ * returns 0, as the x86 decoder does: stepping over an instruction nobody
++ * decoded corrupts the guest silently.
++ *
++ * The device offset is taken from the decoded effective address, not the
++ * fault address alone: for a pair the fault may name the second register's
++ * half, and the access starts at the first.
++ *
++ * Included by mmio_decode.h; not meant to be included on its own.
++ */
++#ifndef MMIO_DECODE_A64_H
++#define MMIO_DECODE_A64_H
++
++#include <stdint.h>
++#include <string.h>
++#include <ucontext.h>
++
++/* Set by the SIGSEGV/SIGBUS handler in win32_compat.c before it calls the
++ * registered handlers: the address the access faulted on. */
++extern __thread uintptr_t g_posix_fault_address;
++
++#define MMIO_A64_UC(c) ((ucontext_t *)(c))
++
++/* The signal frame's extension records (asm/sigcontext.h), spelled out so
++ * this header needs no kernel headers. */
++#define MMIO_A64_FPSIMD_MAGIC 0x46508001u
++#define MMIO_A64_ESR_MAGIC    0x45535201u
++
++struct mmio_a64_ctx_head { uint32_t magic, size; };
++
++static inline void *mmio_a64_record(PCONTEXT ctx, uint32_t magic)
++{
++    uint8_t *p = (uint8_t *)MMIO_A64_UC(ctx)->uc_mcontext.__reserved;
++    uint8_t *end = p + sizeof MMIO_A64_UC(ctx)->uc_mcontext.__reserved;
++    while (p + sizeof(struct mmio_a64_ctx_head) <= end) {
++        struct mmio_a64_ctx_head *h = (struct mmio_a64_ctx_head *)p;
++        if (h->magic == 0 || h->size < sizeof *h)
++            return NULL;
++        if (h->magic == magic)
++            return h;
++        p += h->size;
++    }
++    return NULL;
++}
++
++/* Vn as 16 bytes, little-endian, or NULL if the frame carries no FPSIMD
++ * record (it always does on Linux; the check is for emulators). */
++static inline uint8_t *mmio_a64_vreg(PCONTEXT ctx, int n)
++{
++    uint8_t *rec = (uint8_t *)mmio_a64_record(ctx, MMIO_A64_FPSIMD_MAGIC);
++    /* head (8) + fpsr (4) + fpcr (4), then __uint128_t vregs[32] */
++    return rec ? rec + 16 + 16 * (size_t)n : NULL;
++}
++
++/* 1 for a store, 0 for a load, -1 when the frame does not say. */
++static inline int mmio_a64_esr_is_write(PCONTEXT ctx)
++{
++    uint8_t *rec = (uint8_t *)mmio_a64_record(ctx, MMIO_A64_ESR_MAGIC);
++    uint64_t esr, ec;
++    if (!rec)
++        return -1;
++    memcpy(&esr, rec + 8, sizeof esr);
++    ec = esr >> 26;
++    if (ec != 0x24 && ec != 0x25)       /* data abort, lower / same EL */
++        return -1;
++    return (int)((esr >> 6) & 1);       /* WnR */
++}
++
++static inline uint64_t mmio_a64_x(PCONTEXT ctx, int r)
++{
++    return r == 31 ? 0 : MMIO_A64_UC(ctx)->uc_mcontext.regs[r];
++}
++
++/* Rn as a base register: 31 is SP there, not XZR. */
++static inline uint64_t mmio_a64_base(PCONTEXT ctx, int r)
++{
++    return r == 31 ? MMIO_A64_UC(ctx)->uc_mcontext.sp
++                   : MMIO_A64_UC(ctx)->uc_mcontext.regs[r];
++}
++
++static inline void mmio_a64_set_base(PCONTEXT ctx, int r, uint64_t v)
++{
++    if (r == 31) MMIO_A64_UC(ctx)->uc_mcontext.sp = v;
++    else         MMIO_A64_UC(ctx)->uc_mcontext.regs[r] = v;
++}
++
++static inline void mmio_a64_set_x(PCONTEXT ctx, int r, uint64_t v)
++{
++    if (r != 31)
++        MMIO_A64_UC(ctx)->uc_mcontext.regs[r] = v;
++}
++
++static inline int64_t mmio_a64_sext(uint64_t v, int bits)
++{
++    return (int64_t)(v << (64 - bits)) >> (64 - bits);
++}
++
++/* One register's worth of an access, `bytes` wide at device offset `off`.
++ * gpr: Rt is a general register; otherwise Vt, whose upper bytes a load
++ * clears. sext: sign-extend a load to 32 (4) or 64 (8) bits, 0 for none. */
++static inline int mmio_a64_xfer(PCONTEXT ctx, int load, int gpr, int rt,
++                                int bytes, int sext, uint32_t off, void *dev,
++                                mmio_read_fn rd, mmio_write_fn wr)
++{
++    if (gpr) {
++        if (load) {
++            uint64_t v = rd(dev, off, bytes);
++            if (bytes < 8)
++                v &= (1ULL << (bytes * 8)) - 1;
++            if (sext) {
++                v = (uint64_t)mmio_a64_sext(v, bytes * 8);
++                if (sext == 4)
++                    v &= 0xFFFFFFFFULL;
++            }
++            mmio_a64_set_x(ctx, rt, v);
++        } else {
++            uint64_t v = mmio_a64_x(ctx, rt);
++            if (bytes < 8)
++                v &= (1ULL << (bytes * 8)) - 1;
++            wr(dev, off, v, bytes);
++        }
++        return 1;
++    } else {
++        uint8_t *vr = mmio_a64_vreg(ctx, rt);
++        int done;
++        if (!vr)
++            return 0;
++        if (load)
++            memset(vr, 0, 16);
++        for (done = 0; done < bytes; done += bytes > 8 ? 8 : bytes) {
++            int n = bytes > 8 ? 8 : bytes;
++            uint64_t v = 0;
++            if (load) {
++                v = rd(dev, off + (uint32_t)done, n);
++                memcpy(vr + done, &v, (size_t)n);
++            } else {
++                memcpy(&v, vr + done, (size_t)n);
++                wr(dev, off + (uint32_t)done, v, n);
++            }
++        }
++        return 1;
++    }
++}
++
++/* 1 if the instruction at the faulting PC was serviced and PC advanced past
++ * it. off is the device offset of g_posix_fault_address. */
++static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
++                               mmio_read_fn rd, mmio_write_fn wr)
++{
++    uint64_t *pc = (uint64_t *)&MMIO_A64_UC(ctx)->uc_mcontext.pc;
++    uint32_t insn;
++    int rt, rn, size, opc, vbit, load, gpr, bytes, sext = 0;
++    uint64_t base, ea;
++    int wb = 0;
++    uint64_t wb_value = 0;
++
++    if (!rd || !wr)
++        return 0;
++    memcpy(&insn, (const void *)(uintptr_t)*pc, sizeof insn);
++    rt   = (int)(insn & 31);
++    rn   = (int)((insn >> 5) & 31);
++    vbit = (int)((insn >> 26) & 1);
++    gpr  = !vbit;
++    base = mmio_a64_base(ctx, rn);
++
++    /* ---- LDP/STP/LDPSW/LDNP/STNP: opc 101 V 0 type L imm7 Rt2 Rn Rt ---- */
++    if ((insn & 0x3A000000u) == 0x28000000u) {
++        int type = (int)((insn >> 23) & 3);       /* 00 nt, 01 post, 10 off, 11 pre */
++        int popc = (int)(insn >> 30);
++        int rt2  = (int)((insn >> 10) & 31);
++        int64_t imm7 = mmio_a64_sext((insn >> 15) & 0x7F, 7);
++        int scale;
++        load = (int)((insn >> 22) & 1);
++        if (gpr) {
++            if (popc == 3) return 0;
++            scale = popc == 2 ? 3 : 2;
++            if (popc == 1) {                       /* LDPSW */
++                if (!load || type == 0) return 0;
++                sext = 8;
++            }
++        } else {
++            if (popc == 3) return 0;
++            scale = 2 + popc;                      /* S, D, Q */
++        }
++        bytes = 1 << scale;
++        ea = type == 1 ? base : base + (uint64_t)(imm7 * bytes);
++        if (type == 1 || type == 3) {
++            wb = 1;
++            wb_value = base + (uint64_t)(imm7 * bytes);
++        }
++        off += (uint32_t)(ea - g_posix_fault_address);
++        if (!mmio_a64_xfer(ctx, load, gpr, rt, bytes, sext, off, dev, rd, wr) ||
++            !mmio_a64_xfer(ctx, load, gpr, rt2, bytes, sext,
++                           off + (uint32_t)bytes, dev, rd, wr))
++            return 0;
++        if (wb)
++            mmio_a64_set_base(ctx, rn, wb_value);
++        *pc += 4;
++        return 1;
++    }
++
++    /* ---- LDAR/STLR: size 001000 1 L 0 11111 1 11111 Rn Rt ---- */
++    if ((insn & 0x3FBFFC00u) == 0x089FFC00u) {
++        bytes = 1 << (insn >> 30);
++        load = (int)((insn >> 22) & 1);
++        off += (uint32_t)(base - g_posix_fault_address);
++        if (!mmio_a64_xfer(ctx, load, 1, rt, bytes, 0, off, dev, rd, wr))
++            return 0;
++        __atomic_thread_fence(__ATOMIC_SEQ_CST);
++        *pc += 4;
++        return 1;
++    }
++
++    /* ---- LDAPR: size 111000 101 11111 110000 Rn Rt ---- */
++    if ((insn & 0x3FFFFC00u) == 0x38BFC000u) {
++        bytes = 1 << (insn >> 30);
++        off += (uint32_t)(base - g_posix_fault_address);
++        if (!mmio_a64_xfer(ctx, 1, 1, rt, bytes, 0, off, dev, rd, wr))
++            return 0;
++        *pc += 4;
++        return 1;
++    }
++
++    /* ---- single register: size 111 V 0x opc ... ---- */
++    if ((insn & 0x3A000000u) != 0x38000000u)
++        return 0;
++    size = (int)(insn >> 30);
++    opc  = (int)((insn >> 22) & 3);
++
++    if (insn & (1u << 24)) {
++        /* unsigned scaled imm12 */
++        uint64_t imm12 = (insn >> 10) & 0xFFF;
++        int scale = gpr ? size : (size | ((opc & 2) << 1));
++        ea = base + (imm12 << scale);
++    } else if ((insn & 0x00200C00u) == 0x00200800u) {
++        /* register offset: Rm, option, S */
++        int rm = (int)((insn >> 16) & 31);
++        int option = (int)((insn >> 13) & 7);
++        int s = (int)((insn >> 12) & 1);
++        int scale = gpr ? size : (size | ((opc & 2) << 1));
++        uint64_t m = mmio_a64_x(ctx, rm);
++        switch (option) {
++        case 2: m = (uint32_t)m; break;                                   /* UXTW */
++        case 3: case 7: break;                                            /* LSL/SXTX */
++        case 6: m = (uint64_t)(int64_t)(int32_t)(uint32_t)m; break;       /* SXTW */
++        default: return 0;
++        }
++        ea = base + (s ? m << scale : m);
++    } else if ((insn & 0x00200000u) == 0) {
++        int64_t imm9 = mmio_a64_sext((insn >> 12) & 0x1FF, 9);
++        switch ((insn >> 10) & 3) {
++        case 0: ea = base + (uint64_t)imm9; break;                        /* unscaled */
++        case 1: ea = base; wb = 1; wb_value = base + (uint64_t)imm9; break;  /* post */
++        case 3: ea = base + (uint64_t)imm9; wb = 1; wb_value = ea; break;    /* pre */
++        default: return 0;                                                /* unprivileged */
++        }
++    } else {
++        return 0;                                  /* atomics, PAC loads */
++    }
++
++    if (gpr) {
++        bytes = 1 << size;
++        switch (opc) {
++        case 0: load = 0; break;
++        case 1: load = 1; break;
++        case 2:
++            if (size == 3) {                       /* PRFM: nothing to do */
++                *pc += 4;
++                return 1;
++            }
++            load = 1; sext = 8;                    /* LDRS* to Xt */
++            break;
++        default:
++            if (size >= 2) return 0;
++            load = 1; sext = 4;                    /* LDRSB/LDRSH to Wt */
++            break;
++        }
++    } else {
++        bytes = 1 << (size | ((opc & 2) << 1));    /* B H S D Q */
++        if (bytes > 16) return 0;
++        load = opc & 1;
++    }
++
++    off += (uint32_t)(ea - g_posix_fault_address);
++    if (!mmio_a64_xfer(ctx, load, gpr, rt, bytes, sext, off, dev, rd, wr))
++        return 0;
++    if (wb)
++        mmio_a64_set_base(ctx, rn, wb_value);
++    *pc += 4;
++    return 1;
++}
++
++/* 1 for a store, 0 for a load: the frame's ESR when it has one, else the
++ * instruction itself. Loads are the safer guess for anything undecodable. */
++static inline int mmio_a64_is_write(PCONTEXT ctx)
++{
++    int w = mmio_a64_esr_is_write(ctx);
++    uint32_t insn;
++    if (w >= 0)
++        return w;
++    memcpy(&insn, (const void *)(uintptr_t)MMIO_A64_UC(ctx)->uc_mcontext.pc,
++           sizeof insn);
++    if ((insn & 0x3A000000u) == 0x28000000u)   /* pair */
++        return !((insn >> 22) & 1);
++    if ((insn & 0x3FBFFC00u) == 0x089FFC00u)   /* LDAR/STLR */
++        return !((insn >> 22) & 1);
++    if ((insn & 0x3A000000u) == 0x38000000u) { /* single register */
++        int opc = (int)((insn >> 22) & 3);
++        return ((insn >> 26) & 1) ? !(opc & 1) : opc == 0;
++    }
++    return 0;
++}
++
++/* The faulting instruction, for "undecoded access" reports. */
++static inline const uint8_t *mmio_ctx_pc(PCONTEXT ctx)
++{
++    return (const uint8_t *)(uintptr_t)MMIO_A64_UC(ctx)->uc_mcontext.pc;
++}
++
++#endif /* MMIO_DECODE_A64_H */
+diff --git a/src/platform/win32_compat.c b/src/platform/win32_compat.c
+index 350c8f6..48a1417 100644
+--- a/src/platform/win32_compat.c
++++ b/src/platform/win32_compat.c
+@@ -1823,6 +1823,29 @@ void _aligned_free(void *ptr) { free(ptr); }
+ int _stricmp(const char *a, const char *b)            { return strcasecmp(a, b); }
+ int _strnicmp(const char *a, const char *b, SIZE_T n) { return strncasecmp(a, b, n); }
+ 
++int _putenv_s(const char *name, const char *value)
++{
++    /* An empty value removes the variable, as on the MSVC CRT. */
++    return (value && *value ? setenv(name, value, 1) : unsetenv(name)) ? errno : 0;
++}
++
++BOOL GetComputerNameA(LPSTR buffer, LPDWORD size)
++{
++    char name[256];
++    size_t n;
++    if (!buffer || !size || gethostname(name, sizeof name) != 0)
++        return FALSE;
++    name[sizeof name - 1] = '\0';
++    n = strlen(name);
++    if (n + 1 > *size) {
++        *size = (DWORD)(n + 1);
++        return FALSE;
++    }
++    memcpy(buffer, name, n + 1);
++    *size = (DWORD)n;
++    return TRUE;
++}
++
+ /* ===================================================================== */
+ /* Wide-string helpers (16-bit Xbox WCHAR)                                */
+ /* ===================================================================== */
+@@ -1912,8 +1935,175 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
+     /* TODO: on Windows this does not return; SEH dispatch unimplemented. */
+ }
+ 
++/* ---- Vectored exception handlers over POSIX signals ------------------
++ *
++ * The runtime traps device registers by leaving their pages inaccessible and
++ * servicing the fault (mmio_decode.h). On Windows that is a VEH; here the
++ * same handlers are called from a SIGSEGV/SIGBUS handler with an
++ * EXCEPTION_RECORD built the way Windows builds one -- ExceptionInformation[0]
++ * is 1 for a write, [1] the faulting address -- and the ucontext_t as the
++ * CONTEXT. A handler that returns EXCEPTION_CONTINUE_EXECUTION resumes at the
++ * (possibly edited) context; when none does, the unhandled-exception filter
++ * runs and the signal goes to whatever was installed before, or the default
++ * action, so a real crash still crashes. */
++#if defined(__linux__) && (defined(__aarch64__) || defined(__x86_64__))
++#include "mmio_decode.h"
++
++__thread uintptr_t g_posix_fault_address;
++
++#define VEH_SLOTS 16
++static PVECTORED_EXCEPTION_HANDLER s_veh[VEH_SLOTS];
++static pthread_mutex_t s_veh_lock = PTHREAD_MUTEX_INITIALIZER;
++static LPTOP_LEVEL_EXCEPTION_FILTER s_unhandled_filter;
++static struct sigaction s_prev_segv, s_prev_bus;
++static int s_veh_installed;
++
++static int posix_fault_is_write(ucontext_t *uc)
++{
++#if defined(__aarch64__)
++    return mmio_a64_is_write((PCONTEXT)uc);
++#else
++    return (uc->uc_mcontext.gregs[19] & 2) ? 1 : 0;      /* REG_ERR: W bit */
++#endif
++}
++
++static void *posix_fault_pc(ucontext_t *uc)
++{
++#if defined(__aarch64__)
++    return (void *)(uintptr_t)uc->uc_mcontext.pc;
++#else
++    return (void *)(uintptr_t)uc->uc_mcontext.gregs[16]; /* REG_RIP */
++#endif
++}
++
++static void veh_signal(int sig, siginfo_t *si, void *uctx)
++{
++    ucontext_t *uc = (ucontext_t *)uctx;
++    EXCEPTION_RECORD rec;
++    EXCEPTION_POINTERS ep;
++    struct sigaction *prev = sig == SIGBUS ? &s_prev_bus : &s_prev_segv;
++    int saved_errno = errno;
++    int i;
++
++    memset(&rec, 0, sizeof rec);
++    rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
++    rec.ExceptionAddress = posix_fault_pc(uc);
++    rec.NumberParameters = 2;
++    rec.ExceptionInformation[0] = (ULONG_PTR)posix_fault_is_write(uc);
++    rec.ExceptionInformation[1] = (ULONG_PTR)si->si_addr;
++    ep.ExceptionRecord = &rec;
++    ep.ContextRecord = (PCONTEXT)uc;
++    g_posix_fault_address = (uintptr_t)si->si_addr;
++
++    for (i = 0; i < VEH_SLOTS; i++) {
++        PVECTORED_EXCEPTION_HANDLER h =
++            __atomic_load_n(&s_veh[i], __ATOMIC_ACQUIRE);
++        if (h && h(&ep) == EXCEPTION_CONTINUE_EXECUTION) {
++            errno = saved_errno;
++            return;
++        }
++    }
++    if (s_unhandled_filter &&
++        s_unhandled_filter(&ep) == EXCEPTION_CONTINUE_EXECUTION) {
++        errno = saved_errno;
++        return;
++    }
++    /* Nobody wanted it: hand it on. Returning re-runs the faulting
++     * instruction under the previous disposition, which for SIG_DFL is the
++     * usual crash and core dump. */
++    if ((prev->sa_flags & SA_SIGINFO) && prev->sa_sigaction) {
++        prev->sa_sigaction(sig, si, uctx);
++        return;
++    }
++    if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN &&
++        prev->sa_handler) {
++        prev->sa_handler(sig);
++        return;
++    }
++    sigaction(sig, prev, NULL);
++    errno = saved_errno;
++}
++
++static int veh_install(void)
++{
++    struct sigaction sa;
++    if (s_veh_installed)
++        return 1;
++    memset(&sa, 0, sizeof sa);
++    sa.sa_sigaction = veh_signal;
++    sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
++    sigemptyset(&sa.sa_mask);
++    if (sigaction(SIGSEGV, &sa, &s_prev_segv) != 0)
++        return 0;
++    if (sigaction(SIGBUS, &sa, &s_prev_bus) != 0) {
++        sigaction(SIGSEGV, &s_prev_segv, NULL);
++        return 0;
++    }
++    s_veh_installed = 1;
++    return 1;
++}
++
++PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
++{
++    PVOID slot = NULL;
++    int i;
++    if (!Handler)
++        return NULL;
++    pthread_mutex_lock(&s_veh_lock);
++    if (veh_install()) {
++        if (First) {
++            /* first: shift the others down to make room at the front */
++            if (!s_veh[VEH_SLOTS - 1]) {
++                for (i = VEH_SLOTS - 1; i > 0; i--)
++                    __atomic_store_n(&s_veh[i], s_veh[i - 1], __ATOMIC_RELEASE);
++                __atomic_store_n(&s_veh[0], Handler, __ATOMIC_RELEASE);
++                slot = (PVOID)Handler;
++            }
++        } else {
++            for (i = 0; i < VEH_SLOTS; i++)
++                if (!s_veh[i]) {
++                    __atomic_store_n(&s_veh[i], Handler, __ATOMIC_RELEASE);
++                    slot = (PVOID)Handler;
++                    break;
++                }
++        }
++    }
++    pthread_mutex_unlock(&s_veh_lock);
++    return slot;
++}
++
++ULONG RemoveVectoredExceptionHandler(PVOID h)
++{
++    ULONG found = 0;
++    int i, j;
++    pthread_mutex_lock(&s_veh_lock);
++    for (i = 0; i < VEH_SLOTS; i++)
++        if ((PVOID)s_veh[i] == h) {
++            for (j = i; j < VEH_SLOTS - 1; j++)
++                __atomic_store_n(&s_veh[j], s_veh[j + 1], __ATOMIC_RELEASE);
++            __atomic_store_n(&s_veh[VEH_SLOTS - 1], NULL, __ATOMIC_RELEASE);
++            found = 1;
++            break;
++        }
++    pthread_mutex_unlock(&s_veh_lock);
++    return found;
++}
++
++LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter)
++{
++    LPTOP_LEVEL_EXCEPTION_FILTER old = s_unhandled_filter;
++    pthread_mutex_lock(&s_veh_lock);
++    s_unhandled_filter = filter;
++    veh_install();
++    pthread_mutex_unlock(&s_veh_lock);
++    return old;
++}
++#else
+ PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
+-{ (void)First; (void)Handler; return NULL; }   /* TODO: wire to sigaction */
++{ (void)First; (void)Handler; return NULL; }   /* no fault decoder for this host */
+ ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 1; }
++LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter)
++{ (void)filter; return NULL; }
++#endif
+ 
+ #endif /* !_WIN32 */
+diff --git a/src/platform/win32_compat.h b/src/platform/win32_compat.h
+index 1703647..d2f1a5f 100644
+--- a/src/platform/win32_compat.h
++++ b/src/platform/win32_compat.h
+@@ -450,6 +450,8 @@ typedef void *PEXCEPTION_POINTERS;
+ typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(PEXCEPTION_POINTERS info);
+ PVOID AddVectoredExceptionHandler(ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER Handler);
+ ULONG RemoveVectoredExceptionHandler(PVOID Handle);
++typedef LONG (*LPTOP_LEVEL_EXCEPTION_FILTER)(PEXCEPTION_POINTERS info);
++LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter);
+ 
+ #define EXCEPTION_CONTINUE_SEARCH       0
+ #define EXCEPTION_EXECUTE_HANDLER       1
+@@ -524,6 +526,10 @@ int _strnicmp(const char *a, const char *b, SIZE_T n);
+ /* strtok_s takes the same (str, delim, context) arguments as POSIX strtok_r
+  * and returns the same thing, so the name is all that differs. */
+ #define strtok_s strtok_r
++int _putenv_s(const char *name, const char *value);
++
++/* ---- Host identity ---------------------------------------------------- */
++BOOL GetComputerNameA(LPSTR buffer, LPDWORD size);
+ 
+ /* ---- Wide-string helpers (operate on the 16-bit Xbox WCHAR) ----------
+  * Named xbox_wcs* (not macros over wcs*) so they never collide with the
+diff --git a/src/platform/xbox_winnt.h b/src/platform/xbox_winnt.h
+index 8a1f9aa..2da0bc2 100644
+--- a/src/platform/xbox_winnt.h
++++ b/src/platform/xbox_winnt.h
+@@ -153,34 +153,15 @@ typedef void             **PHANDLE, **LPHANDLE;
+ typedef void              *HMODULE, *HINSTANCE, *HKEY, *HLOCAL, *HGLOBAL;
+ typedef void              *HWND, *HDC, *HBITMAP, *HICON, *HMENU, *HCURSOR;
+ 
+-/* PCONTEXT: Windows VEH register state. On Linux the equivalent is
+- * ucontext_t*; we leave it opaque here since Linux callers don't use it. */
+- 
+-#ifdef __linux__
+-/* On gcc these data structures are necessary  even if anyone is going to be used*/
+-typedef union Register{
+-	uint32_t X; // all register
+-	uint8_t SR[4]; // Subregister
+-} REG; 
+-
+-typedef uint32_t  IREG;
+-
+-typedef struct ProcessorCONTEXT{
+-	// General
+-	REG EAX;
+-	REG EBX;
+-	REG ECX;
+-	REG EDX;
+-	IREG ESI;
+-	IREG EDI;
+-	IREG ESP;
+-	IREG EBP;
+-	//  Instruction Pointer Flags
+-	IREG EIP;
+-	IREG EFlags;
+-} *PCONTEXT;
+-#else
++/* PCONTEXT: Windows VEH register state. On POSIX it is the ucontext_t a
++ * SA_SIGINFO handler receives (win32_compat.c routes SIGSEGV/SIGBUS to the
++ * registered vectored handlers); mmio_decode.h reads the registers out of
++ * it. Opaque everywhere else. */
++#if defined(_WIN32)
+ typedef void              *PCONTEXT;
++#else
++struct ucontext_t;
++typedef struct ucontext_t *PCONTEXT;
+ #endif
+ /* Xbox/UTF-16 wide char is 16-bit, unlike the 32-bit Linux wchar_t. */
+ typedef uint16_t           WCHAR, *PWCHAR, *LPWSTR, *PWSTR;
+diff --git a/src/usb/ohci.c b/src/usb/ohci.c
+index bb135aa..b629dd8 100644
+--- a/src/usb/ohci.c
++++ b/src/usb/ohci.c
+@@ -1284,7 +1284,7 @@ void xbox_OhciInit(void)
+     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
+     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
+ 
+-#if defined(_WIN32)
++#if defined(MMIO_TRAP_SUPPORTED)
+     /* The registers have to fault to be answered. The MCPX aperture is mapped
+      * as plain committed memory, so both blocks are made inaccessible here and
+      * the title's VEH routes the faults back to xbox_OhciHandleMmio.
+@@ -1320,7 +1320,7 @@ void xbox_OhciInit(void)
+             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
+     fflush(stderr);
+ 
+-#if defined(_WIN32)
++#if defined(MMIO_TRAP_SUPPORTED)
+     {
+         HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
+         if (th)
+@@ -1348,7 +1348,7 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
+ 
+ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
+ {
+-#if defined(_WIN32)
++#if defined(MMIO_TRAP_SUPPORTED)
+     OhciController *hc = hc_for(xbox_va);
+     int ok;
+ 
+@@ -1357,7 +1357,7 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
+     ok = mmio_emulate((PCONTEXT)ctx, xbox_va - hc->base, hc,
+                       ohci_read, ohci_write);
+     if (!ok && hc->decode_fail++ < 20) {
+-        const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
++        const uint8_t *ip = mmio_ctx_pc((PCONTEXT)ctx);
+         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: "
+                         "%02X %02X %02X %02X %02X %02X\n",
+                 hc->index, xbox_va - hc->base,
+diff --git a/tests/mmio_decode_posix/CMakeLists.txt b/tests/mmio_decode_posix/CMakeLists.txt
+new file mode 100644
+index 0000000..c71abf4
+--- /dev/null
++++ b/tests/mmio_decode_posix/CMakeLists.txt
+@@ -0,0 +1,14 @@
++cmake_minimum_required(VERSION 3.20)
++project(mmio_decode_posix_test C)
++# Trapped MMIO on a POSIX host: the SIGSEGV-backed vectored handler in
++# win32_compat.c plus the host's instruction decoder (mmio_decode.h), driven
++# by real faulting loads and stores.
++if(WIN32)
++    message(FATAL_ERROR "This regression covers the POSIX fault path")
++endif()
++set(CMAKE_C_STANDARD 11)
++add_subdirectory(../../src/platform platform)
++add_executable(mmio_decode_posix_test test_main.c)
++target_link_libraries(mmio_decode_posix_test PRIVATE platform)
++enable_testing()
++add_test(NAME mmio_decode_posix_test COMMAND mmio_decode_posix_test)
+diff --git a/tests/mmio_decode_posix/test_main.c b/tests/mmio_decode_posix/test_main.c
+new file mode 100644
+index 0000000..a8c625d
+--- /dev/null
++++ b/tests/mmio_decode_posix/test_main.c
+@@ -0,0 +1,246 @@
++/*
++ * mmio_decode_posix - trapped MMIO on a POSIX host, end to end.
++ *
++ * A page is left PROT_NONE and a vectored handler -- the SIGSEGV path behind
++ * AddVectoredExceptionHandler in win32_compat.c -- services each access with
++ * mmio_emulate() against a recording device. Unlike tests/mmio_decode, which
++ * feeds hand-encoded x86 to the Windows decoder, the instructions here are
++ * the host's own: on arm64 the A64 forms a compiler emits for volatile
++ * accesses, written out in inline assembly so each one is pinned down.
++ *
++ * What is checked is what goes wrong silently: the device offset (from the
++ * effective address, so a pair's second half lands at +size), the width, sign
++ * and zero extension into the destination, base-register writeback, and the
++ * PC landing exactly on the next instruction.
++ */
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/mman.h>
++
++#include "win32_compat.h"
++#include "mmio_decode.h"
++
++static int failures;
++#define CHECK_U64(name, got, want) \
++    do { uint64_t g_ = (uint64_t)(got), w_ = (uint64_t)(want); \
++         if (g_ != w_) { \
++            printf("FAIL: %s (got 0x%llX, want 0x%llX)\n", name, \
++                   (unsigned long long)g_, (unsigned long long)w_); \
++            failures++; } } while (0)
++
++static uint8_t *page;                 /* the trapped page */
++static uint8_t regs[4096];            /* what the device holds */
++static struct { uint32_t off; int size; uint64_t val; int reads, writes; } last;
++static int unhandled;
++
++static uint64_t dev_read(void *d, uint32_t off, int size)
++{
++    uint64_t v = 0;
++    (void)d;
++    memcpy(&v, regs + off, (size_t)size);
++    last.off = off; last.size = size; last.val = v; last.reads++;
++    return v;
++}
++
++static void dev_write(void *d, uint32_t off, uint64_t v, int size)
++{
++    (void)d;
++    memcpy(regs + off, &v, (size_t)size);
++    last.off = off; last.size = size; last.val = v; last.writes++;
++}
++
++static LONG handler(PEXCEPTION_POINTERS ep)
++{
++    uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
++    if (fault < (uintptr_t)page || fault >= (uintptr_t)page + 4096)
++        return EXCEPTION_CONTINUE_SEARCH;
++    if (mmio_emulate(ep->ContextRecord, (uint32_t)(fault - (uintptr_t)page),
++                     NULL, dev_read, dev_write))
++        return EXCEPTION_CONTINUE_EXECUTION;
++    unhandled++;
++    return EXCEPTION_CONTINUE_SEARCH;
++}
++
++static void reset(void)
++{
++    memset(&last, 0, sizeof last);
++    for (int i = 0; i < 4096; i++)
++        regs[i] = (uint8_t)(0x80 + i * 7);
++}
++
++static uint64_t reg_at(uint32_t off, int size)
++{
++    uint64_t v = 0;
++    memcpy(&v, regs + off, (size_t)size);
++    return v;
++}
++
++#if defined(__aarch64__)
++static void test_a64(void)
++{
++    uint64_t x, y, base;
++    uint32_t w;
++
++    reset();
++    __asm__ volatile("ldr %w0, [%1, #0x40]" : "=r"(w) : "r"(page) : "memory");
++    CHECK_U64("ldr w imm off", last.off, 0x40);
++    CHECK_U64("ldr w imm size", last.size, 4);
++    CHECK_U64("ldr w imm value", w, reg_at(0x40, 4));
++
++    reset();
++    x = ~0ULL;
++    __asm__ volatile("ldrb %w0, [%1, #3]" : "+r"(x) : "r"(page) : "memory");
++    CHECK_U64("ldrb zero-extends", x, reg_at(3, 1));
++
++    reset();
++    __asm__ volatile("ldrsh %0, [%1, #0x10]" : "=r"(x) : "r"(page) : "memory");
++    CHECK_U64("ldrsh x sign-extends", x, (uint64_t)(int64_t)(int16_t)reg_at(0x10, 2));
++
++    reset();
++    __asm__ volatile("ldrsb %w0, [%1, #0x11]" : "=r"(x) : "r"(page) : "memory");
++    CHECK_U64("ldrsb w sign-extends to 32", x,
++              (uint64_t)(uint32_t)(int32_t)(int8_t)reg_at(0x11, 1));
++
++    reset();
++    __asm__ volatile("ldrsw %0, [%1, #0x24]" : "=r"(x) : "r"(page) : "memory");
++    CHECK_U64("ldrsw", x, (uint64_t)(int64_t)(int32_t)reg_at(0x24, 4));
++
++    reset();
++    __asm__ volatile("str %w0, [%1, #0x100]" :: "r"(0xCAFEBABEu), "r"(page) : "memory");
++    CHECK_U64("str w off", last.off, 0x100);
++    CHECK_U64("str w value", reg_at(0x100, 4), 0xCAFEBABEu);
++
++    reset();
++    __asm__ volatile("str wzr, [%0, #0x104]" :: "r"(page) : "memory");
++    CHECK_U64("str wzr writes zero", reg_at(0x104, 4), 0);
++    CHECK_U64("str wzr size", last.size, 4);
++
++    reset();
++    __asm__ volatile("strh %w0, [%1, #0x22]" :: "r"(0x12345678u), "r"(page) : "memory");
++    CHECK_U64("strh truncates", reg_at(0x22, 2), 0x5678);
++    CHECK_U64("strh leaves next byte", regs[0x24], (uint8_t)(0x80 + 0x24 * 7));
++
++    reset();
++    __asm__ volatile("stur %0, [%1, #-8]" :: "r"(0x1122334455667788ULL), "r"(page + 0x208) : "memory");
++    CHECK_U64("stur x off", last.off, 0x200);
++    CHECK_U64("stur x value", reg_at(0x200, 8), 0x1122334455667788ULL);
++
++    reset();
++    x = 0x30;
++    __asm__ volatile("ldr %w0, [%1, %2]" : "=r"(w) : "r"(page), "r"(x) : "memory");
++    CHECK_U64("ldr reg offset", last.off, 0x30);
++    CHECK_U64("ldr reg offset value", w, reg_at(0x30, 4));
++
++    reset();
++    x = 0x0C;
++    __asm__ volatile("ldr %w0, [%1, %2, lsl #2]" : "=r"(w) : "r"(page), "r"(x) : "memory");
++    CHECK_U64("ldr reg offset scaled", last.off, 0x30);
++
++    reset();
++    w = 0x08;
++    __asm__ volatile("str %w0, [%1, %w2, uxtw]" :: "r"(0xABCDu), "r"(page), "r"(w) : "memory");
++    CHECK_U64("str uxtw offset", last.off, 0x08);
++
++    reset();
++    base = (uint64_t)(uintptr_t)(page + 0x300);
++    __asm__ volatile("ldr %w0, [%1, #8]!" : "=r"(w), "+r"(base) :: "memory");
++    CHECK_U64("pre-index off", last.off, 0x308);
++    CHECK_U64("pre-index writeback", base, (uint64_t)(uintptr_t)(page + 0x308));
++
++    reset();
++    base = (uint64_t)(uintptr_t)(page + 0x300);
++    __asm__ volatile("str %w1, [%0], #-4" : "+r"(base) : "r"(7u) : "memory");
++    CHECK_U64("post-index off", last.off, 0x300);
++    CHECK_U64("post-index writeback", base, (uint64_t)(uintptr_t)(page + 0x2FC));
++
++    reset();
++    __asm__ volatile("ldp %w0, %w1, [%2, #0x50]" : "=r"(x), "=r"(y) : "r"(page) : "memory");
++    CHECK_U64("ldp w first", x, reg_at(0x50, 4));
++    CHECK_U64("ldp w second", y, reg_at(0x54, 4));
++    CHECK_U64("ldp reads", last.reads, 2);
++
++    reset();
++    __asm__ volatile("stp %0, %1, [%2, #0x60]" :: "r"(1ULL), "r"(2ULL), "r"(page) : "memory");
++    CHECK_U64("stp x first", reg_at(0x60, 8), 1);
++    CHECK_U64("stp x second", reg_at(0x68, 8), 2);
++
++    reset();
++    base = (uint64_t)(uintptr_t)(page + 0x400);
++    __asm__ volatile("stp %w1, %w2, [%0, #-8]!" : "+r"(base) : "r"(3u), "r"(4u) : "memory");
++    CHECK_U64("stp pre-index first", reg_at(0x3F8, 4), 3);
++    CHECK_U64("stp pre-index second", reg_at(0x3FC, 4), 4);
++    CHECK_U64("stp pre-index writeback", base, (uint64_t)(uintptr_t)(page + 0x3F8));
++
++    reset();
++    __asm__ volatile("ldar %w0, [%1]" : "=r"(w) : "r"(page + 0x70) : "memory");
++    CHECK_U64("ldar", w, reg_at(0x70, 4));
++
++    reset();
++    __asm__ volatile("stlr %w0, [%1]" :: "r"(0x55u), "r"(page + 0x74) : "memory");
++    CHECK_U64("stlr", reg_at(0x74, 4), 0x55);
++
++    reset();
++    __asm__ volatile("prfm pldl1keep, [%0, #0x80]" :: "r"(page) : "memory");
++    CHECK_U64("prfm touches nothing", last.reads + last.writes, 0);
++
++    {
++        float f;
++        double d;
++        reset();
++        memcpy(regs + 0x90, &(float){1.5f}, 4);
++        __asm__ volatile("ldr %s0, [%1, #0x90]" : "=w"(f) : "r"(page) : "memory");
++        CHECK_U64("ldr s", f == 1.5f, 1);
++        reset();
++        d = 2.25;
++        __asm__ volatile("str %d0, [%1, #0x98]" :: "w"(d), "r"(page) : "memory");
++        CHECK_U64("str d", reg_at(0x98, 8), 0x4002000000000000ULL);
++    }
++
++    /* What gcc makes of a plain volatile read-modify-write. */
++    reset();
++    {
++        volatile uint32_t *r = (volatile uint32_t *)(page + 0x120);
++        uint32_t before = (uint32_t)reg_at(0x120, 4);
++        *r |= 0x10;
++        CHECK_U64("volatile |= ", reg_at(0x120, 4), before | 0x10);
++        CHECK_U64("volatile |= reads", last.reads, 1);
++        CHECK_U64("volatile |= writes", last.writes, 1);
++    }
++}
++#endif
++
++#if defined(__x86_64__)
++static void test_x64(void)
++{
++    volatile uint32_t *r = (volatile uint32_t *)(page + 0x40);
++    uint32_t w;
++    reset();
++    w = *r;
++    CHECK_U64("mov r32, [m] off", last.off, 0x40);
++    CHECK_U64("mov r32, [m] value", w, reg_at(0x40, 4));
++    reset();
++    *r = 0xCAFEBABEu;
++    CHECK_U64("mov [m], r32", reg_at(0x40, 4), 0xCAFEBABEu);
++}
++#endif
++
++int main(void)
++{
++    page = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    if (page == MAP_FAILED || !AddVectoredExceptionHandler(1, handler)) {
++        printf("FAIL: setup\n");
++        return 1;
++    }
++#if defined(__aarch64__)
++    test_a64();
++#elif defined(__x86_64__)
++    test_x64();
++#endif
++    if (unhandled) {
++        printf("FAIL: %d undecoded access(es)\n", unhandled);
++        failures++;
++    }
++    printf("%d failure(s)\n", failures);
++    return failures != 0;
++}

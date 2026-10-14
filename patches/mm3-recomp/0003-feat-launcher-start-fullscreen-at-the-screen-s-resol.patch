@@ -1,0 +1,44 @@
+From 16e9b6dc8aa50c818af0bea4cf782e38863a7ad9 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 03:31:40 +0000
+Subject: [PATCH 3/4] feat(launcher): start fullscreen at the screen's
+ resolution on arm64 linux
+
+ARM64 Linux is a handheld: the game fills the screen by default and
+renders at its resolution instead of supersampling it twice. Both stay
+in Settings.
+---
+ src/mm3_launcher.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/mm3_launcher.cpp b/src/mm3_launcher.cpp
+index a3ca026..f9aaabe 100644
+--- a/src/mm3_launcher.cpp
++++ b/src/mm3_launcher.cpp
+@@ -452,9 +452,26 @@ void add_mod_options()
+     }
+ }
+ 
++#if defined(__aarch64__) && !defined(_WIN32)
++/* ARM64 Linux means a handheld: fill its screen, and draw at its own
++ * resolution rather than twice it. */
++void handheld_defaults()
++{
++    for (Option &o : g_options) {
++        if (o.env == "RECOMP_FULLSCREEN")
++            o.def = "1";
++        else if (o.env == "RECOMP_SUPERSAMPLE")
++            o.def = "1";
++    }
++}
++#endif
++
+ void load_settings()
+ {
+     add_mod_options();
++#if defined(__aarch64__) && !defined(_WIN32)
++    handheld_defaults();
++#endif
+     reset_all();
+     for (Option &o : g_options)
+     {

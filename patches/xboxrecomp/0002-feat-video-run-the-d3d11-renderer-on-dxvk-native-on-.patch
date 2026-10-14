@@ -1,0 +1,1052 @@
+From fcbe533fe7192c3b9adaa3228973b51992735abc Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 23:00:07 +0000
+Subject: [PATCH 2/9] feat(video): run the d3d11 renderer on dxvk-native on
+ linux
+
+The NV2A renderer (nv2a_d3d11.c) and the framebuffer window were Windows
+only. On Linux the renderer now builds against DXVK-native, which provides
+d3d11/dxgi on Vulkan, with vkd3d-utils for D3DCompile, and the window is an
+SDL2 window that DXVK's SDL2 WSI presents into.
+
+- d3d11_posix.h: the few Win32 calls the renderer makes besides D3D, over
+  pthreads; on x86-64, D3DCompile through vkd3d's ms_abi convention
+- three HLSL tweaks vkd3d needs (isnan, a masked index,
+  GetRenderTargetSampleCount only for pixel shaders)
+- fb_present.c: SDL2 window thread with keys (as VK codes), mouse,
+  focus, borderless fullscreen (F11, Alt+Enter, RECOMP_FULLSCREEN);
+  closing it ends the process
+- the device waits for the window, which brings SDL's video up
+- CMake: XBOXRECOMP_DXVK (on by default, stub if DXVK, vkd3d-utils or
+  SDL2 are missing); declare the kernel/video and nv2a/d3d8 link edges
+  so GNU ld resolves them
+- tests/d3d11_dxvk_posix: device, every shader and the window come up
+---
+ src/nv2a/CMakeLists.txt               |   2 +
+ src/platform/win32_compat.h           |  33 +++
+ src/video/CMakeLists.txt              |  27 +++
+ src/video/d3d11_posix.h               | 290 ++++++++++++++++++++++
+ src/video/fb_present.c                | 331 +++++++++++++++++++++++++-
+ src/video/fb_present.h                |  11 +
+ src/video/nv2a_d3d11.c                |  55 ++++-
+ tests/d3d11_dxvk_posix/CMakeLists.txt |  16 ++
+ tests/d3d11_dxvk_posix/test_main.c    |  51 ++++
+ 9 files changed, 807 insertions(+), 9 deletions(-)
+ create mode 100644 src/video/d3d11_posix.h
+ create mode 100644 tests/d3d11_dxvk_posix/CMakeLists.txt
+ create mode 100644 tests/d3d11_dxvk_posix/test_main.c
+
+diff --git a/src/nv2a/CMakeLists.txt b/src/nv2a/CMakeLists.txt
+index 20075a9..8b22d65 100644
+--- a/src/nv2a/CMakeLists.txt
++++ b/src/nv2a/CMakeLists.txt
+@@ -30,6 +30,8 @@ else()
+ endif()
+ 
+ target_link_libraries(xbox_nv2a PRIVATE platform)
++# nv2a_pgraph_d3d11.c draws through the D3D8 layer's device.
++target_link_libraries(xbox_nv2a PRIVATE xbox_d3d8)
+ if(WIN32)
+     target_link_libraries(xbox_nv2a PRIVATE kernel32)
+ endif()
+diff --git a/src/platform/win32_compat.h b/src/platform/win32_compat.h
+index d2f1a5f..e0982bf 100644
+--- a/src/platform/win32_compat.h
++++ b/src/platform/win32_compat.h
+@@ -66,6 +66,7 @@ extern "C" {
+ #define PAGE_EXECUTE           0x10u
+ #define PAGE_EXECUTE_READ      0x20u
+ #define PAGE_EXECUTE_READWRITE 0x40u
++#define PAGE_GUARD             0x100u
+ 
+ /* Code-page ids accepted by MultiByteToWideChar (only UTF8/ACP are honoured) */
+ #define CP_ACP    0u
+@@ -285,6 +286,8 @@ int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
+ #define VK_RBUTTON   0x02
+ #define VK_CANCEL    0x03
+ #define VK_MBUTTON   0x04
++#define VK_XBUTTON1  0x05
++#define VK_XBUTTON2  0x06
+ #define VK_BACK      0x08
+ #define VK_TAB       0x09
+ #define VK_RETURN    0x0D
+@@ -305,20 +308,50 @@ int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
+ #define VK_DOWN      0x28
+ #define VK_INSERT    0x2D
+ #define VK_DELETE    0x2E
++#define VK_NUMPAD0   0x60
++#define VK_NUMPAD1   0x61
++#define VK_NUMPAD2   0x62
++#define VK_NUMPAD3   0x63
++#define VK_NUMPAD4   0x64
++#define VK_NUMPAD5   0x65
++#define VK_NUMPAD6   0x66
++#define VK_NUMPAD7   0x67
++#define VK_NUMPAD8   0x68
++#define VK_NUMPAD9   0x69
+ #define VK_MULTIPLY  0x6A
+ #define VK_ADD       0x6B
+ #define VK_SUBTRACT  0x6D
++#define VK_DECIMAL   0x6E
+ #define VK_DIVIDE    0x6F
+ #define VK_F1        0x70
+ #define VK_F2        0x71
+ #define VK_F3        0x72
+ #define VK_F4        0x73
+ #define VK_F5        0x74
++#define VK_F6        0x75
++#define VK_F7        0x76
++#define VK_F8        0x77
++#define VK_F9        0x78
++#define VK_F10       0x79
++#define VK_F11       0x7A
+ #define VK_F12       0x7B
++#define VK_LSHIFT    0xA0
++#define VK_RSHIFT    0xA1
++#define VK_LCONTROL  0xA2
++#define VK_RCONTROL  0xA3
++#define VK_LMENU     0xA4
++#define VK_RMENU     0xA5
++#define VK_OEM_1     0xBA
+ #define VK_OEM_PLUS  0xBB
+ #define VK_OEM_COMMA 0xBC
+ #define VK_OEM_MINUS 0xBD
+ #define VK_OEM_PERIOD 0xBE
++#define VK_OEM_2     0xBF
++#define VK_OEM_3     0xC0
++#define VK_OEM_4     0xDB
++#define VK_OEM_5     0xDC
++#define VK_OEM_6     0xDD
++#define VK_OEM_7     0xDE
+ 
+ /* ---- Message-loop shims (PeekMessage etc. -- always "no messages") ---- */
+ typedef struct tagMSG {
+diff --git a/src/video/CMakeLists.txt b/src/video/CMakeLists.txt
+index a6ccb51..eee2bdc 100644
+--- a/src/video/CMakeLists.txt
++++ b/src/video/CMakeLists.txt
+@@ -11,6 +11,33 @@ target_include_directories(xbox_video PUBLIC
+     ${CMAKE_CURRENT_SOURCE_DIR}/..
+ )
+ target_link_libraries(xbox_video PUBLIC xbox_d3d8)
++# The kernel and the video code call into each other: the pushbuffer executor
++# and the kernel bridge drive the renderer, the window and the movie pump, and
++# the renderer reads guest memory through the kernel. Saying so both ways
++# makes CMake repeat the pair on the link line, which a single-pass linker
++# (GNU ld) needs; MSVC's linker never minded.
++target_link_libraries(xbox_video PUBLIC xbox_kernel)
++target_link_libraries(xbox_kernel PUBLIC xbox_video)
+ if(WIN32)
+     target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32 dbghelp winmm)
++else()
++    # The D3D11 renderer on Linux: DXVK-native provides d3d11/dxgi on Vulkan,
++    # vkd3d-utils provides D3DCompile, and the window is SDL2's. Without them
++    # the renderer and the window build as stubs.
++    option(XBOXRECOMP_DXVK "Build the D3D11 renderer against DXVK-native" ON)
++    if(XBOXRECOMP_DXVK)
++        find_package(PkgConfig REQUIRED)
++        pkg_check_modules(DXVK IMPORTED_TARGET dxvk-d3d11 dxvk-dxgi)
++        pkg_check_modules(VKD3D_UTILS IMPORTED_TARGET libvkd3d-utils)
++        find_package(SDL2)
++        if(DXVK_FOUND AND VKD3D_UTILS_FOUND AND SDL2_FOUND)
++            target_compile_definitions(xbox_video PUBLIC XBOXRECOMP_DXVK)
++            target_link_libraries(xbox_video PUBLIC
++                PkgConfig::DXVK PkgConfig::VKD3D_UTILS SDL2::SDL2 platform)
++            message(STATUS "xbox_video: D3D11 renderer on DXVK-native ${DXVK_dxvk-d3d11_VERSION}")
++        else()
++            message(WARNING "xbox_video: DXVK-native, vkd3d-utils or SDL2 not found; "
++                            "the D3D11 renderer is a stub")
++        endif()
++    endif()
+ endif()
+diff --git a/src/video/d3d11_posix.h b/src/video/d3d11_posix.h
+new file mode 100644
+index 0000000..5299f50
+--- /dev/null
++++ b/src/video/d3d11_posix.h
+@@ -0,0 +1,290 @@
++/*
++ * d3d11_posix.h -- what nv2a_d3d11.c needs from Windows, on Linux.
++ *
++ * The renderer is written against D3D11. On Linux DXVK-native provides that
++ * API on Vulkan (its <windows.h> carries the COM and D3D types, and
++ * libdxvk_d3d11/libdxvk_dxgi the entry points), vkd3d-utils provides
++ * D3DCompile, and the window is the SDL window fb_present.c opens: with
++ * DXVK's SDL2 WSI an HWND *is* an SDL_Window*.
++ *
++ * What remains is the handful of Win32 calls the renderer makes besides D3D:
++ * a critical section, a condition variable and an SRW lock, interlocked
++ * operations, the performance counter, a worker thread, the frame-pacing
++ * timer and the client area. They are defined here over pthreads rather than
++ * taken from platform/win32_compat.h, whose Xbox WCHAR and handle types would
++ * collide with DXVK's.
++ */
++#ifndef XBOXRECOMP_D3D11_POSIX_H
++#define XBOXRECOMP_D3D11_POSIX_H
++
++#define COBJMACROS
++#define INITGUID
++#include <windows.h>
++#include <d3d11_1.h>
++#include <dxgi1_6.h>
++#include <d3dcompiler.h>
++
++
++#include <errno.h>
++#include <pthread.h>
++#include <sched.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++#if defined(__x86_64__)
++/* ---- D3DCompile on x86-64 --------------------------------------------
++ * vkd3d-utils keeps Windows' calling convention on x86-64 (its WINAPI and
++ * its COM methods are ms_abi, for Wine's sake), while DXVK-native uses the
++ * host's. The one call into vkd3d goes through an ms_abi declaration of the
++ * same symbol, and the blobs it returns, whose methods are ms_abi as well,
++ * are copied into blobs of the host's convention. Elsewhere (aarch64) there
++ * is one convention and D3DCompile is called directly. */
++typedef struct D3dPosixVkd3dBlob D3dPosixVkd3dBlob;
++struct D3dPosixVkd3dBlobVtbl {
++    HRESULT (__attribute__((ms_abi)) *QueryInterface)(D3dPosixVkd3dBlob *, REFIID, void **);
++    ULONG (__attribute__((ms_abi)) *AddRef)(D3dPosixVkd3dBlob *);
++    ULONG (__attribute__((ms_abi)) *Release)(D3dPosixVkd3dBlob *);
++    void *(__attribute__((ms_abi)) *GetBufferPointer)(D3dPosixVkd3dBlob *);
++    SIZE_T (__attribute__((ms_abi)) *GetBufferSize)(D3dPosixVkd3dBlob *);
++};
++struct D3dPosixVkd3dBlob { const struct D3dPosixVkd3dBlobVtbl *lpVtbl; };
++extern HRESULT __attribute__((ms_abi)) d3d_posix_vkd3d_compile(
++    const void *data, SIZE_T size, const char *name, const D3D_SHADER_MACRO *defines,
++    ID3DInclude *include, const char *entry, const char *target, UINT flags1,
++    UINT flags2, D3dPosixVkd3dBlob **code, D3dPosixVkd3dBlob **errors) __asm__("D3DCompile");
++
++typedef struct { ID3D10Blob iface; LONG ref; SIZE_T size; } D3dPosixBlob;
++static HRESULT STDMETHODCALLTYPE d3d_posix_blob_qi(ID3D10Blob *b, REFIID iid, void **out)
++{ (void)b; (void)iid; *out = NULL; return E_NOINTERFACE; }
++static ULONG STDMETHODCALLTYPE d3d_posix_blob_addref(ID3D10Blob *b)
++{ return (ULONG)__atomic_add_fetch(&((D3dPosixBlob *)b)->ref, 1, __ATOMIC_SEQ_CST); }
++static ULONG STDMETHODCALLTYPE d3d_posix_blob_release(ID3D10Blob *b)
++{
++    LONG n = __atomic_sub_fetch(&((D3dPosixBlob *)b)->ref, 1, __ATOMIC_SEQ_CST);
++    if (!n) free(b);
++    return (ULONG)n;
++}
++static void *STDMETHODCALLTYPE d3d_posix_blob_ptr(ID3D10Blob *b)
++{ return (D3dPosixBlob *)b + 1; }
++static SIZE_T STDMETHODCALLTYPE d3d_posix_blob_size(ID3D10Blob *b)
++{ return ((D3dPosixBlob *)b)->size; }
++static ID3D10BlobVtbl d3d_posix_blob_vtbl = {
++    d3d_posix_blob_qi, d3d_posix_blob_addref, d3d_posix_blob_release,
++    d3d_posix_blob_ptr, d3d_posix_blob_size };
++
++static ID3D10Blob *d3d_posix_blob_from_vkd3d(D3dPosixVkd3dBlob *v)
++{
++    D3dPosixBlob *b;
++    SIZE_T n;
++    if (!v) return NULL;
++    n = v->lpVtbl->GetBufferSize(v);
++    if ((b = (D3dPosixBlob *)malloc(sizeof *b + n)) != NULL) {
++        b->iface.lpVtbl = &d3d_posix_blob_vtbl;
++        b->ref = 1;
++        b->size = n;
++        memcpy(b + 1, v->lpVtbl->GetBufferPointer(v), n);
++    }
++    v->lpVtbl->Release(v);
++    return b ? &b->iface : NULL;
++}
++
++static inline HRESULT d3d_posix_compile(const void *data, SIZE_T size, const char *name,
++                                        const D3D_SHADER_MACRO *defines, ID3DInclude *include,
++                                        const char *entry, const char *target, UINT flags1,
++                                        UINT flags2, ID3DBlob **code, ID3DBlob **errors)
++{
++    D3dPosixVkd3dBlob *c = NULL, *e = NULL;
++    HRESULT hr = d3d_posix_vkd3d_compile(data, size, name, defines, include, entry,
++                                         target, flags1, flags2, &c, &e);
++    if (code) *code = d3d_posix_blob_from_vkd3d(c);
++    else if (c) c->lpVtbl->Release(c);
++    if (errors) *errors = d3d_posix_blob_from_vkd3d(e);
++    else if (e) e->lpVtbl->Release(e);
++    if (SUCCEEDED(hr) && code && !*code) hr = E_OUTOFMEMORY;
++    return hr;
++}
++#define D3DCompile d3d_posix_compile
++#endif
++
++#ifndef INFINITE
++#define INFINITE 0xFFFFFFFFu
++#endif
++#ifndef INVALID_FILE_ATTRIBUTES
++#define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
++#endif
++#ifndef __cdecl
++#define __cdecl
++#endif
++
++#include "fb_present.h"   /* the window: handle, drawable and display size */
++
++/* ---- interlocked ---------------------------------------------------- */
++static inline LONG InterlockedExchange(volatile LONG *p, LONG v)
++{ return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
++static inline LONG InterlockedIncrement(volatile LONG *p)
++{ return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
++static inline LONG InterlockedDecrement(volatile LONG *p)
++{ return __atomic_sub_fetch(p, 1, __ATOMIC_SEQ_CST); }
++static inline LONG InterlockedCompareExchange(volatile LONG *p, LONG v, LONG cmp)
++{ __atomic_compare_exchange_n(p, &cmp, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return cmp; }
++
++/* ---- time ------------------------------------------------------------ */
++static inline uint64_t d3d_posix_ns(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++}
++static inline BOOL QueryPerformanceFrequency(LARGE_INTEGER *f)
++{ f->QuadPart = 1000000000ll; return TRUE; }
++static inline BOOL QueryPerformanceCounter(LARGE_INTEGER *c)
++{ c->QuadPart = (LONGLONG)d3d_posix_ns(); return TRUE; }
++static inline DWORD GetTickCount(void)
++{ return (DWORD)(d3d_posix_ns() / 1000000ull); }
++static inline void Sleep(DWORD ms)
++{
++    struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000l };
++    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
++}
++static inline void SwitchToThread(void) { sched_yield(); }
++#if defined(__aarch64__)
++#define YieldProcessor() __asm__ volatile("yield")
++#elif defined(__x86_64__) || defined(__i386__)
++#define YieldProcessor() __builtin_ia32_pause()
++#else
++#define YieldProcessor() ((void)0)
++#endif
++
++/* ---- locks ----------------------------------------------------------- */
++typedef pthread_mutex_t CRITICAL_SECTION;
++typedef pthread_cond_t CONDITION_VARIABLE;
++typedef pthread_rwlock_t SRWLOCK;
++#define SRWLOCK_INIT PTHREAD_RWLOCK_INITIALIZER
++static inline void InitializeCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_init(cs, NULL); }
++static inline void EnterCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_lock(cs); }
++static inline void LeaveCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_unlock(cs); }
++static inline void InitializeConditionVariable(CONDITION_VARIABLE *cv) { pthread_cond_init(cv, NULL); }
++static inline void WakeConditionVariable(CONDITION_VARIABLE *cv) { pthread_cond_signal(cv); }
++static inline BOOL SleepConditionVariableCS(CONDITION_VARIABLE *cv, CRITICAL_SECTION *cs, DWORD ms)
++{
++    if (ms == INFINITE)
++        return pthread_cond_wait(cv, cs) == 0;
++    {
++        struct timespec ts;
++        clock_gettime(CLOCK_REALTIME, &ts);
++        ts.tv_sec += ms / 1000;
++        ts.tv_nsec += (long)(ms % 1000) * 1000000l;
++        if (ts.tv_nsec >= 1000000000l) { ts.tv_sec++; ts.tv_nsec -= 1000000000l; }
++        return pthread_cond_timedwait(cv, cs, &ts) == 0;
++    }
++}
++static inline void AcquireSRWLockShared(SRWLOCK *l) { pthread_rwlock_rdlock(l); }
++static inline void ReleaseSRWLockShared(SRWLOCK *l) { pthread_rwlock_unlock(l); }
++static inline void AcquireSRWLockExclusive(SRWLOCK *l) { pthread_rwlock_wrlock(l); }
++static inline void ReleaseSRWLockExclusive(SRWLOCK *l) { pthread_rwlock_unlock(l); }
++
++/* ---- threads and the pacing timer ------------------------------------
++ * The renderer starts one detached worker and waits on one timer; a HANDLE
++ * here is either a finished pthread_create (never waited on) or a timer. */
++typedef DWORD (*LPTHREAD_START_ROUTINE)(LPVOID);
++#define THREAD_PRIORITY_BELOW_NORMAL (-1)
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x2u
++#define TIMER_ALL_ACCESS 0x1F0003u
++
++typedef struct { LPTHREAD_START_ROUTINE fn; LPVOID arg; } D3dPosixThreadStart;
++static void *d3d_posix_thread(void *p)
++{
++    D3dPosixThreadStart s = *(D3dPosixThreadStart *)p;
++    free(p);
++    s.fn(s.arg);
++    return NULL;
++}
++static inline HANDLE CreateThread(void *sa, SIZE_T stack, LPTHREAD_START_ROUTINE fn,
++                                  LPVOID arg, DWORD flags, DWORD *id)
++{
++    pthread_t t;
++    D3dPosixThreadStart *s = (D3dPosixThreadStart *)malloc(sizeof *s);
++    (void)sa; (void)stack; (void)flags; (void)id;
++    if (!s) return NULL;
++    s->fn = fn; s->arg = arg;
++    if (pthread_create(&t, NULL, d3d_posix_thread, s) != 0) { free(s); return NULL; }
++    pthread_detach(t);
++    return (HANDLE)(uintptr_t)1;
++}
++static inline BOOL SetThreadPriority(HANDLE h, int p) { (void)h; (void)p; return TRUE; }
++
++typedef struct { int64_t due_ns; } D3dPosixTimer;
++static inline HANDLE CreateWaitableTimerExW(void *sa, const void *name, DWORD flags, DWORD access)
++{
++    (void)sa; (void)name; (void)flags; (void)access;
++    return (HANDLE)calloc(1, sizeof(D3dPosixTimer));
++}
++static inline BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *due, LONG period,
++                                    void *fn, void *arg, BOOL resume)
++{
++    D3dPosixTimer *t = (D3dPosixTimer *)h;
++    (void)period; (void)fn; (void)arg; (void)resume;
++    if (!t || !due) return FALSE;
++    /* negative: relative, in 100 ns units */
++    t->due_ns = (int64_t)d3d_posix_ns() +
++                (due->QuadPart < 0 ? -due->QuadPart * 100 : 0);
++    return TRUE;
++}
++static inline DWORD WaitForSingleObject(HANDLE h, DWORD ms)
++{
++    D3dPosixTimer *t = (D3dPosixTimer *)h;
++    struct timespec ts;
++    (void)ms;
++    if (!t) return 0;
++    ts.tv_sec = (time_t)(t->due_ns / 1000000000ll);
++    ts.tv_nsec = (long)(t->due_ns % 1000000000ll);
++    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
++    return 0;
++}
++static inline BOOL CloseHandle(HANDLE h) { (void)h; return TRUE; }
++
++/* ---- window and monitor ---------------------------------------------- */
++static inline BOOL GetClientRect(HWND h, RECT *rc)
++{
++    unsigned w, hh;
++    (void)h;
++    if (!xbox_FramebufferWindowClientSize(&w, &hh)) return FALSE;
++    rc->left = rc->top = 0;
++    rc->right = (LONG)w;
++    rc->bottom = (LONG)hh;
++    return TRUE;
++}
++#define MONITOR_DEFAULTTOPRIMARY 0x1u
++typedef struct { DWORD cbSize; RECT rcMonitor; RECT rcWork; DWORD dwFlags; } MONITORINFO;
++static inline HMONITOR MonitorFromWindow(HWND h, DWORD flags)
++{ (void)h; (void)flags; return (HMONITOR)(uintptr_t)1; }
++static inline BOOL GetMonitorInfoA(HMONITOR m, MONITORINFO *mi)
++{
++    unsigned w, h;
++    (void)m;
++    if (!xbox_FramebufferDisplaySize(&w, &h)) return FALSE;
++    mi->rcMonitor.left = mi->rcMonitor.top = 0;
++    mi->rcMonitor.right = (LONG)w;
++    mi->rcMonitor.bottom = (LONG)h;
++    mi->rcWork = mi->rcMonitor;
++    return TRUE;
++}
++#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((void *)(intptr_t)-4)
++static inline void *SetThreadDpiAwarenessContext(void *c) { return c; }
++
++/* ---- RenderDoc hook and its flag file -------------------------------- */
++static inline HMODULE GetModuleHandleA(const char *name) { (void)name; return NULL; }
++static inline void *GetProcAddress(HMODULE m, const char *name) { (void)m; (void)name; return NULL; }
++static inline DWORD GetFileAttributesA(const char *path)
++{
++    struct stat st;
++    return stat(path, &st) == 0 ? 0x80u : INVALID_FILE_ATTRIBUTES;
++}
++static inline BOOL DeleteFileA(const char *path) { return unlink(path) == 0; }
++
++#endif /* XBOXRECOMP_D3D11_POSIX_H */
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index 3582912..0d89183 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -17,8 +17,16 @@
+ #include <stdint.h>
+ #include "fb_present.h"
+ 
++#if defined(_WIN32) || defined(XBOXRECOMP_DXVK)
+ #if defined(_WIN32)
+ #include <windows.h>
++#else
++/* Linux: an SDL2 window that DXVK's SDL2 WSI presents into. */
++#include "platform/win32_compat.h"
++#include <SDL.h>
++#include <SDL_vulkan.h>
++#include <unistd.h>
++#endif
+ #include <stdio.h>
+ #include "platform/recomp_profile.h"
+ #include <stdlib.h>
+@@ -167,14 +175,14 @@ static void pvideo_poll(void)
+                     char path[1024];
+                     FILE *f;
+                     int n = snprintf(path, sizeof(path), "%s.frame%02ld.bank%u.regs.bin",
+-                                     capture, frame, bank);
++                                     capture, (long)frame, bank);
+                     f = n > 0 && (size_t)n < sizeof(path) ? fopen(path, "wb") : NULL;
+                     if (f) {
+                         fwrite(regs, 1, sizeof(regs), f);
+                         fclose(f);
+                     }
+                     n = snprintf(path, sizeof(path), "%s.frame%02ld.bank%u.yuy2",
+-                                 capture, frame, bank);
++                                 capture, (long)frame, bank);
+                     f = n > 0 && (size_t)n < sizeof(path) ? fopen(path, "wb") : NULL;
+                     if (f) {
+                         fwrite(snapshot, 1, (size_t)bytes, f);
+@@ -182,7 +190,7 @@ static void pvideo_poll(void)
+                     }
+                     fprintf(stderr,
+                             "  [PVIDEO] captured frame=%ld bank=%u physical=0x%llX format=0x%08X pitch=%u size=%ux%u bytes=%llu\n",
+-                            frame, bank, (unsigned long long)physical,
++                            (long)frame, bank, (unsigned long long)physical,
+                             regs[(NV_PVIDEO_FORMAT + bank * 4) / 4], pitch,
+                             regs[(NV_PVIDEO_SIZE_IN + bank * 4) / 4] & 0x7ff,
+                             height, (unsigned long long)bytes);
+@@ -367,6 +375,7 @@ int xbox_FramebufferMouse(float *x, float *y)
+  * borderless window rather than DXGI exclusive mode: no mode switch, no
+  * device loss, and alt-tab behaves. The renderer resizes its swap chain to
+  * whatever the client area becomes. */
++#if defined(_WIN32)
+ static void fb_toggle_fullscreen(HWND h)
+ {
+     static WINDOWPLACEMENT saved = { sizeof(WINDOWPLACEMENT) };
+@@ -576,6 +585,322 @@ void xbox_FramebufferWindowStart(void)
+         InterlockedExchange(&s_fb_running, 0);
+ }
+ 
++#else /* SDL2 */
++
++/* The same window on Linux, opened with SDL2 so DXVK's SDL2 WSI can present
++ * into it: there an HWND is an SDL_Window *. SDL wants its video calls and
++ * its event pump on one thread, so the window thread brings SDL's video up
++ * itself, and the renderer waits for it (xbox_FramebufferWindowWait) before
++ * it creates its device -- DXVK asks SDL for Vulkan's instance extensions. */
++static volatile LONG s_fb_ready;            /* 1 open, -1 failed, 0 not yet */
++
++int xbox_FramebufferWindowClientSize(unsigned *w, unsigned *h)
++{
++    SDL_Window *win = (SDL_Window *)s_hwnd;
++    int cw = 0, ch = 0;
++    if (!win || (SDL_GetWindowFlags(win) & SDL_WINDOW_MINIMIZED))
++        return 0;
++    SDL_Vulkan_GetDrawableSize(win, &cw, &ch);
++    if (cw <= 0 || ch <= 0)
++        return 0;
++    *w = (unsigned)cw;
++    *h = (unsigned)ch;
++    return 1;
++}
++
++int xbox_FramebufferDisplaySize(unsigned *w, unsigned *h)
++{
++    SDL_DisplayMode mode;
++    int display = s_hwnd ? SDL_GetWindowDisplayIndex((SDL_Window *)s_hwnd) : 0;
++    if (SDL_GetDesktopDisplayMode(display < 0 ? 0 : display, &mode) != 0 ||
++        mode.w <= 0 || mode.h <= 0)
++        return 0;
++    *w = (unsigned)mode.w;
++    *h = (unsigned)mode.h;
++    return 1;
++}
++
++/* Borderless fullscreen, as on Windows: no mode switch, and the renderer
++ * resizes its swap chain to whatever the drawable becomes. */
++static void fb_toggle_fullscreen(SDL_Window *win)
++{
++    int full = (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
++    SDL_SetWindowFullscreen(win, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
++    SDL_ShowCursor(full ? SDL_ENABLE : SDL_DISABLE);
++}
++
++/* SDL's physical key to the Windows virtual key the input layer binds
++ * (RECOMP_KEYMAP is written in VK codes). */
++static int fb_vk(SDL_Scancode sc)
++{
++    if (sc >= SDL_SCANCODE_A && sc <= SDL_SCANCODE_Z) return 'A' + (sc - SDL_SCANCODE_A);
++    if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_9) return '1' + (sc - SDL_SCANCODE_1);
++    if (sc >= SDL_SCANCODE_F1 && sc <= SDL_SCANCODE_F12) return VK_F1 + (sc - SDL_SCANCODE_F1);
++    if (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_9) return VK_NUMPAD1 + (sc - SDL_SCANCODE_KP_1);
++    switch (sc) {
++    case SDL_SCANCODE_0:            return '0';
++    case SDL_SCANCODE_KP_0:         return VK_NUMPAD0;
++    case SDL_SCANCODE_RETURN:
++    case SDL_SCANCODE_KP_ENTER:     return VK_RETURN;
++    case SDL_SCANCODE_ESCAPE:       return VK_ESCAPE;
++    case SDL_SCANCODE_BACKSPACE:    return VK_BACK;
++    case SDL_SCANCODE_TAB:          return VK_TAB;
++    case SDL_SCANCODE_SPACE:        return VK_SPACE;
++    case SDL_SCANCODE_LEFT:         return VK_LEFT;
++    case SDL_SCANCODE_RIGHT:        return VK_RIGHT;
++    case SDL_SCANCODE_UP:           return VK_UP;
++    case SDL_SCANCODE_DOWN:         return VK_DOWN;
++    case SDL_SCANCODE_INSERT:       return VK_INSERT;
++    case SDL_SCANCODE_DELETE:       return VK_DELETE;
++    case SDL_SCANCODE_HOME:         return VK_HOME;
++    case SDL_SCANCODE_END:          return VK_END;
++    case SDL_SCANCODE_PAGEUP:       return VK_PRIOR;
++    case SDL_SCANCODE_PAGEDOWN:     return VK_NEXT;
++    case SDL_SCANCODE_PAUSE:        return VK_PAUSE;
++    case SDL_SCANCODE_CAPSLOCK:     return VK_CAPITAL;
++    case SDL_SCANCODE_LSHIFT:       return VK_LSHIFT;
++    case SDL_SCANCODE_RSHIFT:       return VK_RSHIFT;
++    case SDL_SCANCODE_LCTRL:        return VK_LCONTROL;
++    case SDL_SCANCODE_RCTRL:        return VK_RCONTROL;
++    case SDL_SCANCODE_LALT:         return VK_LMENU;
++    case SDL_SCANCODE_RALT:         return VK_RMENU;
++    case SDL_SCANCODE_KP_MULTIPLY:  return VK_MULTIPLY;
++    case SDL_SCANCODE_KP_PLUS:      return VK_ADD;
++    case SDL_SCANCODE_KP_MINUS:     return VK_SUBTRACT;
++    case SDL_SCANCODE_KP_DIVIDE:    return VK_DIVIDE;
++    case SDL_SCANCODE_KP_PERIOD:    return VK_DECIMAL;
++    case SDL_SCANCODE_SEMICOLON:    return VK_OEM_1;
++    case SDL_SCANCODE_EQUALS:       return VK_OEM_PLUS;
++    case SDL_SCANCODE_COMMA:        return VK_OEM_COMMA;
++    case SDL_SCANCODE_MINUS:        return VK_OEM_MINUS;
++    case SDL_SCANCODE_PERIOD:       return VK_OEM_PERIOD;
++    case SDL_SCANCODE_SLASH:        return VK_OEM_2;
++    case SDL_SCANCODE_GRAVE:        return VK_OEM_3;
++    case SDL_SCANCODE_LEFTBRACKET:  return VK_OEM_4;
++    case SDL_SCANCODE_BACKSLASH:    return VK_OEM_5;
++    case SDL_SCANCODE_RIGHTBRACKET: return VK_OEM_6;
++    case SDL_SCANCODE_APOSTROPHE:   return VK_OEM_7;
++    default:                        return 0;
++    }
++}
++
++static void fb_key(const SDL_KeyboardEvent *k, SDL_Window *win)
++{
++    int down = k->type == SDL_KEYDOWN, vk;
++    SDL_Scancode sc = k->keysym.scancode;
++    if (down && (sc == SDL_SCANCODE_F11 ||
++                 (sc == SDL_SCANCODE_RETURN && (k->keysym.mod & KMOD_ALT)))) {
++        if (!k->repeat)
++            fb_toggle_fullscreen(win);
++        return;
++    }
++    if (!(vk = fb_vk(sc)))
++        return;
++    s_key_down[vk] = (unsigned char)down;
++    /* Windows reports either shift as VK_SHIFT, and the default keymap binds
++     * that; keep the generic codes as the union of the sided ones. */
++    s_key_down[VK_SHIFT] = s_key_down[VK_LSHIFT] | s_key_down[VK_RSHIFT];
++    s_key_down[VK_CONTROL] = s_key_down[VK_LCONTROL] | s_key_down[VK_RCONTROL];
++    s_key_down[VK_MENU] = s_key_down[VK_LMENU] | s_key_down[VK_RMENU];
++    if (down && !k->repeat && getenv("RECOMP_KEY_TRACE")) {
++        static unsigned n;
++        if (n++ < 40) {
++            fprintf(stderr, "  [KEY] down vk=0x%02X\n", (unsigned)vk);
++            fflush(stderr);
++        }
++    }
++}
++
++static void fb_mouse_button(const SDL_MouseButtonEvent *b)
++{
++    unsigned char down = b->type == SDL_MOUSEBUTTONDOWN;
++    switch (b->button) {
++    case SDL_BUTTON_LEFT:   s_key_down[VK_LBUTTON] = down; break;
++    case SDL_BUTTON_RIGHT:  s_key_down[VK_RBUTTON] = down; break;
++    case SDL_BUTTON_MIDDLE: s_key_down[VK_MBUTTON] = down; break;
++    case SDL_BUTTON_X1:     s_key_down[VK_XBUTTON1] = down; break;
++    case SDL_BUTTON_X2:     s_key_down[VK_XBUTTON2] = down; break;
++    }
++}
++
++/* The pointer as a fraction of the window, as WM_MOUSEMOVE reports it. */
++static void fb_mouse_move(const SDL_MouseMotionEvent *m, SDL_Window *win)
++{
++    static int last_x = -1, last_y = -1;
++    int w = 0, h = 0;
++    SDL_GetWindowSize(win, &w, &h);
++    if (w > 0 && h > 0) {
++        s_mouse_x = (float)m->x / (float)w;
++        s_mouse_y = (float)m->y / (float)h;
++    }
++    if (last_x != -1 && (m->x != last_x || m->y != last_y))
++        InterlockedIncrement(&s_mouse_moves);
++    last_x = m->x;
++    last_y = m->y;
++}
++
++/* Closing the window ends the game. (On Windows the next clear opens a new
++ * one; on a handheld launched from Steam a process with no window is just
++ * one more thing to kill.) SIGINT and SIGTERM arrive as SDL_QUIT too. */
++static void fb_quit(void)
++{
++    fprintf(stderr, "  [FBWIN] window closed, exiting\n");
++    fflush(stderr);
++    fflush(stdout);
++    _exit(0);
++}
++
++static void fb_event(const SDL_Event *e, SDL_Window *win)
++{
++    switch (e->type) {
++    case SDL_QUIT:
++        fb_quit();
++        break;
++    case SDL_WINDOWEVENT:
++        switch (e->window.event) {
++        case SDL_WINDOWEVENT_CLOSE:
++            fb_quit();
++            break;
++        /* Switching away with a key held would leave it held for ever. */
++        case SDL_WINDOWEVENT_FOCUS_LOST:
++            memset((void *)s_key_down, 0, sizeof s_key_down);
++            InterlockedExchange(&s_inactive, 1);
++            break;
++        case SDL_WINDOWEVENT_FOCUS_GAINED:
++            InterlockedExchange(&s_inactive, 0);
++            break;
++        }
++        break;
++    case SDL_KEYDOWN:
++    case SDL_KEYUP:
++        fb_key(&e->key, win);
++        break;
++    case SDL_MOUSEMOTION:
++        fb_mouse_move(&e->motion, win);
++        break;
++    case SDL_MOUSEBUTTONDOWN:
++    case SDL_MOUSEBUTTONUP:
++        fb_mouse_button(&e->button);
++        break;
++    }
++}
++
++/* The initial size: RECOMP_WINDOW_SIZE=WxH, else the display aspect at about
++ * two thirds of the usable desktop's height. */
++extern float nv2a_d3d_display_aspect(void);
++
++static void fb_initial_size(int *w, int *h)
++{
++    const char *e = getenv("RECOMP_WINDOW_SIZE");
++    SDL_Rect work;
++    if (e && sscanf(e, "%dx%d", w, h) == 2 && *w >= 64 && *h >= 48)
++        return;
++    if (SDL_GetDisplayUsableBounds(0, &work) != 0 || work.h < 600) {
++        *h = 720;
++        *w = (int)(720 * nv2a_d3d_display_aspect() + 0.5f);
++        return;
++    }
++    *h = work.h * 2 / 3;
++    *w = (int)(*h * nv2a_d3d_display_aspect() + 0.5f);
++    if (*w > work.w) {
++        *w = work.w;
++        *h = (int)(*w / nv2a_d3d_display_aspect() + 0.5f);
++    }
++}
++
++static void fb_update_title(SDL_Window *win)
++{
++    static Uint32 t0;
++    static LONG f0;
++    Uint32 now = SDL_GetTicks();
++    char tb[192];
++    int i, n = 0;
++    LONG f;
++    if (t0 && now - t0 < 1000)
++        return;
++    f = s_flips;
++    /* s_title holds UTF-32 code points here; SDL wants UTF-8. */
++    for (i = 0; s_title[i] && n < 140; i++) {
++        uint32_t c = (uint32_t)s_title[i];
++        if (c < 0x80) tb[n++] = (char)c;
++        else if (c < 0x800) { tb[n++] = (char)(0xC0 | c >> 6); tb[n++] = (char)(0x80 | (c & 0x3F)); }
++        else { tb[n++] = (char)(0xE0 | (c >> 12 & 0x0F)); tb[n++] = (char)(0x80 | (c >> 6 & 0x3F));
++               tb[n++] = (char)(0x80 | (c & 0x3F)); }
++    }
++    snprintf(tb + n, sizeof tb - (size_t)n, " | FPS: %.1f | draws: %ld",
++             t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0, (long)s_frame_draws);
++    SDL_SetWindowTitle(win, tb);
++    t0 = now;
++    f0 = f;
++}
++
++static int fb_thread(void *unused)
++{
++    SDL_Window *win;
++    int cw, ch;
++    Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
++
++    (void)unused;
++    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
++        fprintf(stderr, "  [FBWIN] SDL video: %s\n", SDL_GetError());
++        InterlockedExchange(&s_fb_ready, -1);
++        return 0;
++    }
++    fb_initial_size(&cw, &ch);
++    if (getenv("RECOMP_FULLSCREEN"))
++        flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
++    win = SDL_CreateWindow("Xbox Recomp - Framebuffer", SDL_WINDOWPOS_CENTERED,
++                           SDL_WINDOWPOS_CENTERED, cw, ch, flags);
++    if (!win) {
++        fprintf(stderr, "  [FBWIN] SDL window: %s\n", SDL_GetError());
++        InterlockedExchange(&s_fb_ready, -1);
++        return 0;
++    }
++    if (flags & SDL_WINDOW_FULLSCREEN_DESKTOP)
++        SDL_ShowCursor(SDL_DISABLE);
++    s_hwnd = win;
++    InterlockedExchange(&s_fb_ready, 1);
++    fprintf(stderr, "  [FBWIN] framebuffer window open (%dx%d client)\n", cw, ch);
++
++    for (;;) {
++        SDL_Event e;
++        if (SDL_WaitEventTimeout(&e, 250)) {
++            do
++                fb_event(&e, win);
++            while (SDL_PollEvent(&e));
++        }
++        fb_update_title(win);
++    }
++    return 0;
++}
++
++void xbox_FramebufferWindowStart(void)
++{
++    SDL_Thread *th;
++
++    if (!getenv("RECOMP_FB_WINDOW"))
++        return;
++    if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
++        return;
++    th = SDL_CreateThread(fb_thread, "fb-window", NULL);
++    if (th)
++        SDL_DetachThread(th);
++    else
++        InterlockedExchange(&s_fb_ready, -1);
++}
++
++int xbox_FramebufferWindowWait(void)
++{
++    int i;
++    xbox_FramebufferWindowStart();
++    if (!s_fb_running)
++        return 0;
++    for (i = 0; i < 2000 && !s_fb_ready; i++)
++        SDL_Delay(5);
++    return s_fb_ready > 0;
++}
++#endif
++
+ #else
+ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
+ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
+diff --git a/src/video/fb_present.h b/src/video/fb_present.h
+index 9676e02..81c2a0a 100644
+--- a/src/video/fb_present.h
++++ b/src/video/fb_present.h
+@@ -12,6 +12,17 @@
+ #include <windows.h>
+ /* The window to present into, or NULL until it exists. */
+ HWND xbox_FramebufferWindowHandle(void);
++#elif defined(XBOXRECOMP_DXVK)
++/* The SDL_Window * to present into (DXVK's SDL2 WSI takes it as the HWND),
++ * or NULL until it exists. */
++void *xbox_FramebufferWindowHandle(void);
++/* Its drawable size in pixels; 0 while there is none or it is minimised. */
++int xbox_FramebufferWindowClientSize(unsigned *w, unsigned *h);
++/* The desktop size of the display it is on (or the first one). */
++int xbox_FramebufferDisplaySize(unsigned *w, unsigned *h);
++/* Opens the window if RECOMP_FB_WINDOW asks for one and waits for it, which
++ * also brings up SDL's video; 0 if there is no window. */
++int xbox_FramebufferWindowWait(void);
+ #endif
+ 
+ /* A buffer the display reads straight from guest memory because the title is
+diff --git a/src/video/nv2a_d3d11.c b/src/video/nv2a_d3d11.c
+index 92a2c30..726c305 100644
+--- a/src/video/nv2a_d3d11.c
++++ b/src/video/nv2a_d3d11.c
+@@ -15,6 +15,7 @@
+  *   - a surface the CPU wrote (loading screens) is detected by hashing its
+  *     guest memory and uploaded before it is drawn over or shown.
+  */
++#if defined(_WIN32) || defined(XBOXRECOMP_DXVK)
+ #if defined(_WIN32)
+ #define COBJMACROS
+ #define WIN32_LEAN_AND_MEAN
+@@ -22,6 +23,9 @@
+ #include <d3d11_1.h>
+ #include <dxgi1_6.h>
+ #include <d3dcompiler.h>
++#else
++#include "d3d11_posix.h"        /* DXVK-native, vkd3d's D3DCompile, pthreads */
++#endif
+ #include <math.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -330,6 +334,10 @@ static uint64_t hash_mem(const uint8_t *p, size_t n)
+ /* ---------------------------------------------------------------- shaders */
+ 
+ static const char s_hlsl[] =
++/* RT_SAMPLES: GetRenderTargetSampleCount() is pixel-only, and vkd3d's
++ * compiler rejects it even in functions a vertex shader never calls, so
++ * vertex targets compile with it defined to 1 (compile_def). */
++"#ifndef RT_SAMPLES\n#define RT_SAMPLES GetRenderTargetSampleCount()\n#endif\n"
+ /* FLATQ: nointerpolation for the flat-shaded pixel shader variant. Under
+  * MSAA the rest interpolate at the centroid: an edge pixel's centre can lie
+  * outside its triangle, and texcoords extrapolated there read past the tile
+@@ -630,7 +638,7 @@ static const char s_hlsl[] =
+ "      dots[n] = dot(c.xyz, dotmap(T[inp].rgb, dm)); t = float4(0, 0, 0, 0);\n"
+ "    } else if (mode == 9) {\n"
+ "      dots[n] = dot(c.xyz, dotmap(T[inp].rgb, dm));\n"
+-"      t = samp2(n, float2(dots[n - 1], dots[n]) * tex_scale[n].xy);\n"
++"      t = samp2(n, float2(dots[(n - 1u) & 3u], dots[n]) * tex_scale[n].xy);\n"
+ "    } else if (mode == 13 || mode == 14 || mode == 12 || mode == 18 || mode == 11) {\n"
+ "      dots[n] = dot(c.xyz, dotmap(T[inp].rgb, dm));\n"
+ "      float3 N = float3(dots[1], dots[2], dots[3]);\n"
+@@ -725,7 +733,7 @@ static const char s_hlsl[] =
+ "    case 0x202: ok = v == r; break; case 0x203: ok = v <= r; e = r + 0.5 - a8; break;\n"
+ "    case 0x204: ok = v > r; e = a8 - (r + 0.5); break; case 0x205: ok = v != r; break;\n"
+ "    case 0x206: ok = v >= r; e = a8 - (r - 0.5); break; }\n"
+-"    uint ns = GetRenderTargetSampleCount();\n"
++"    uint ns = RT_SAMPLES;\n"
+ "    bool ineq = alpha_func == 0x201 || alpha_func == 0x203 || alpha_func == 0x204 || alpha_func == 0x206;\n"
+ "    if (ns > 1 && ineq) {\n"
+ "      uint k = (uint)round(saturate(e / fw + 0.5) * ns);\n"
+@@ -763,7 +771,7 @@ static const char s_hlsl[] =
+ "      float b = 1.0 - exp((k - x) / (1.0 - k));\n"
+ "      uint2 q = uint2(i.pos.xy) & 1u;\n"
+ "      float r = (float)(q.x * 2u + (q.x ^ q.y)) * 0.25;\n"
+-"      uint ns = GetRenderTargetSampleCount(), kk = (uint)floor((1.0 - b) * ns + r);\n"
++"      uint ns = RT_SAMPLES, kk = (uint)floor((1.0 - b) * ns + r);\n"
+ "      if (kk == 0) discard;\n"
+ "      if (ns > 1 && kk < ns) cov &= (1u << kk) - 1u;\n"
+ "    }\n"
+@@ -900,10 +908,32 @@ static void display_config(int now);
+ 
+ static ID3DBlob *compile_def(const char *entry, const char *target, const D3D_SHADER_MACRO *def)
+ {
++    static const D3D_SHADER_MACRO vs_def[] = { { "RT_SAMPLES", "1u" }, { NULL, NULL } };
+     ID3DBlob *code = NULL, *err = NULL;
+-    HRESULT hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "nv2a_d3d11", def, NULL,
+-                            entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+-                            &code, &err);
++    const char *src = s_hlsl;
++    size_t len = sizeof s_hlsl - 1;
++    HRESULT hr;
++#if !defined(_WIN32)
++    /* vkd3d's HLSL compiler has no isnan(). */
++    static char *posix_src;
++    static size_t posix_len;
++    if (!posix_src) {
++        static const char prefix[] = "#define isnan(x) ((x) != (x))\n";
++        char *b = (char *)malloc(sizeof prefix - 1 + len + 1);
++        if (b) {
++            memcpy(b, prefix, sizeof prefix - 1);
++            memcpy(b + sizeof prefix - 1, s_hlsl, len + 1);
++            posix_len = sizeof prefix - 1 + len;
++            posix_src = b;
++        }
++    }
++    if (posix_src) { src = posix_src; len = posix_len; }
++#endif
++    if (!def && target[0] == 'v')
++        def = vs_def;
++    hr = D3DCompile(src, len, "nv2a_d3d11", def, NULL,
++                    entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
++                    &code, &err);
+     if (FAILED(hr)) {
+         fprintf(stderr, "[D3D11] shader %s: %s\n", entry,
+                 err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+@@ -1102,6 +1132,19 @@ int nv2a_d3d_init(void)
+         return s_init_state > 0;
+     s_init_state = -1;
+     nv2a_d3d_prof_enabled();
++#if !defined(_WIN32)
++    /* DXVK needs to be told whose window an HWND is, and its SDL2 WSI asks
++     * SDL for Vulkan's instance extensions, which takes SDL's video being up:
++     * the window thread brings it up, so the device waits for the window. */
++    setenv("DXVK_WSI_DRIVER", "SDL2", 0);
++    /* vkd3d's HLSL compiler reports every construct it leaves unfolded. */
++    setenv("VKD3D_DEBUG", "err", 0);
++    setenv("VKD3D_SHADER_DEBUG", "err", 0);
++    if (!xbox_FramebufferWindowWait()) {
++        fprintf(stderr, "[D3D11] no window to present into (RECOMP_FB_WINDOW unset?)\n");
++        return 0;
++    }
++#endif
+     /* Real pixels for the swap chain: a DPI-unaware thread sees the
+      * window's client area scaled down and DWM stretches the result. */
+     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+diff --git a/tests/d3d11_dxvk_posix/CMakeLists.txt b/tests/d3d11_dxvk_posix/CMakeLists.txt
+new file mode 100644
+index 0000000..f11ba8d
+--- /dev/null
++++ b/tests/d3d11_dxvk_posix/CMakeLists.txt
+@@ -0,0 +1,16 @@
++cmake_minimum_required(VERSION 3.20)
++project(d3d11_dxvk_posix_test C)
++# The D3D11 renderer on Linux, up to the first presented frame: DXVK-native's
++# device on Vulkan, every renderer shader through vkd3d's D3DCompile, and the
++# SDL2 window as the swap chain's target. Needs a display and a Vulkan driver
++# (Xvfb and lavapipe do); without a display it skips.
++if(WIN32)
++    message(FATAL_ERROR "This regression covers the Linux renderer")
++endif()
++set(CMAKE_C_STANDARD 11)
++add_subdirectory(../.. runtime)
++add_executable(d3d11_dxvk_posix_test test_main.c)
++target_link_libraries(d3d11_dxvk_posix_test PRIVATE xboxrecomp)
++enable_testing()
++add_test(NAME d3d11_dxvk_posix_test COMMAND d3d11_dxvk_posix_test)
++set_tests_properties(d3d11_dxvk_posix_test PROPERTIES SKIP_RETURN_CODE 77)
+diff --git a/tests/d3d11_dxvk_posix/test_main.c b/tests/d3d11_dxvk_posix/test_main.c
+new file mode 100644
+index 0000000..def0231
+--- /dev/null
++++ b/tests/d3d11_dxvk_posix/test_main.c
+@@ -0,0 +1,51 @@
++/*
++ * d3d11_dxvk_posix - the D3D11 renderer brought up on Linux.
++ *
++ * nv2a_d3d_init() is the whole of it: it opens the framebuffer window (SDL2),
++ * creates the device through DXVK-native and compiles every shader the
++ * renderer starts with through vkd3d's D3DCompile, stopping at the first one
++ * that fails. A few ticks then present into the window's swap chain.
++ */
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "video/nv2a_d3d11.h"
++#include "video/fb_present.h"
++
++/* Provided by the generated title; the renderer pulls in the kernel, which
++ * refers to them. Nothing here calls a guest function. */
++typedef void (*recomp_func_t)(void);
++recomp_func_t recomp_lookup(uint32_t xbox_va);
++recomp_func_t recomp_lookup(uint32_t xbox_va) { (void)xbox_va; return NULL; }
++recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
++recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NULL; }
++
++int main(void)
++{
++    unsigned w = 0, h = 0;
++    int i;
++    if (!getenv("DISPLAY") && !getenv("WAYLAND_DISPLAY")) {
++        puts("SKIP: no display");
++        return 77;
++    }
++#if !defined(XBOXRECOMP_DXVK)
++    puts("SKIP: built without DXVK-native");
++    return 77;
++#else
++    setenv("RECOMP_FB_WINDOW", "1", 1);
++    setenv("RECOMP_WINDOW_SIZE", "640x480", 1);
++    if (!nv2a_d3d_init()) {
++        puts("FAIL: nv2a_d3d_init");
++        return 1;
++    }
++    if (!xbox_FramebufferWindowClientSize(&w, &h) || w != 640 || h != 480) {
++        printf("FAIL: client size %ux%u\n", w, h);
++        return 1;
++    }
++    for (i = 0; i < 3; i++)
++        nv2a_d3d_tick();
++    puts("0 failure(s)");
++    return 0;
++#endif
++}

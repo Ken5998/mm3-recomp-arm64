@@ -1,0 +1,92 @@
+From 1dd52f9ca2b2d9418b261de5a2d60106d9468d16 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 02:49:32 +0000
+Subject: [PATCH 5/9] fix(kernel): find game files whatever the case of their
+ path on linux
+
+Titles spell paths the way they like; NTFS ignores case, Linux file systems do not. Re-case each component of a translated path to the directory entry that exists.
+---
+ src/kernel/kernel_path.c | 56 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
+index a7ebaad..601e0ce 100644
+--- a/src/kernel/kernel_path.c
++++ b/src/kernel/kernel_path.c
+@@ -483,6 +483,8 @@ translate:
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <errno.h>
++#include <dirent.h>
++#include <strings.h>
+ 
+ static char s_game_dir[MAX_PATH];
+ static char s_save_dir[MAX_PATH];
+@@ -517,6 +519,59 @@ static void mkdir_p(const char* path)
+         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "mkdir %s: %s", tmp, strerror(errno));
+ }
+ 
++/* Xbox paths are case-insensitive and titles do not spell a file the way
++ * the disc does ("D:\DATA\Foo.ARF" for data/foo.arf); NTFS hides that, a
++ * Linux file system does not. Re-case each component after the first `keep`
++ * bytes to the entry that exists, in place (ASCII case folding keeps the
++ * length). A component with no match ends the walk: the rest is a file or
++ * directory about to be created, and keeps the title's spelling. */
++static void resolve_case(char* path, size_t keep)
++{
++    struct stat st;
++    char* comp;
++
++    if (stat(path, &st) == 0)
++        return;
++    for (comp = path + keep; *comp == '/'; comp++)
++        ;
++    while (*comp) {
++        char* end = strchr(comp, '/');
++        char  saved = end ? *end : '\0';
++        DIR* dir;
++        struct dirent* de;
++        int found = 0;
++
++        if (end)
++            *end = '\0';
++        if (stat(path, &st) != 0) {
++            /* The parent is comp[-1] == '/': list it for a match. */
++            comp[-1] = '\0';
++            dir = opendir(path[0] ? path : "/");
++            comp[-1] = '/';
++            if (dir) {
++                while ((de = readdir(dir)) != NULL) {
++                    if (strcasecmp(de->d_name, comp) == 0) {
++                        memcpy(comp, de->d_name, strlen(comp));
++                        found = 1;
++                        break;
++                    }
++                }
++                closedir(dir);
++            }
++            if (!found) {
++                if (end)
++                    *end = saved;
++                return;
++            }
++        }
++        if (!end)
++            return;
++        *end = saved;
++        for (comp = end; *comp == '/'; comp++)
++            ;
++    }
++}
++
+ void xbox_path_init(const char* game_dir, const char* save_dir)
+ {
+     if (game_dir) {
+@@ -613,6 +668,7 @@ translate:
+             while (n > 1 && host_path_buf[n - 1] == '/')
+                 host_path_buf[--n] = '\0';
+         }
++        resolve_case(host_path_buf, strlen(base_dir));
+ 
+         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
+         return TRUE;

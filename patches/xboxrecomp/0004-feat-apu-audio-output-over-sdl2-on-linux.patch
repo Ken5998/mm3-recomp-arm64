@@ -1,0 +1,154 @@
+From 168cb2e95ab4735e2296e47fe003b032e39926df Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 02:31:41 +0000
+Subject: [PATCH 4/9] feat(apu): audio output over sdl2 on linux
+
+The xa2_* backend was a stub off Windows, so the APU mixed in silence.
+It now queues the mixed frames on an SDL2 audio device with XAudio2's
+bounds: 64 buffers deep, a silence cushion after running dry, quiet
+while the window is in the background, RECOMP_XA2_PCM_DUMP. The APU
+declares its link edge to xbox_video for xbox_FramebufferPaused.
+---
+ src/apu/CMakeLists.txt |   3 ++
+ src/apu/apu_xaudio2.c  | 110 ++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 105 insertions(+), 8 deletions(-)
+
+diff --git a/src/apu/CMakeLists.txt b/src/apu/CMakeLists.txt
+index b29948d..4be4cae 100644
+--- a/src/apu/CMakeLists.txt
++++ b/src/apu/CMakeLists.txt
+@@ -51,3 +51,6 @@ else()
+     find_package(SDL2 REQUIRED)
+     target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
+ endif()
++# The output goes quiet while the window is in the background
++# (xbox_FramebufferPaused, src/video/fb_present.c).
++target_link_libraries(xbox_apu PRIVATE xbox_video)
+diff --git a/src/apu/apu_xaudio2.c b/src/apu/apu_xaudio2.c
+index 2a07180..4f09715 100644
+--- a/src/apu/apu_xaudio2.c
++++ b/src/apu/apu_xaudio2.c
+@@ -12,8 +12,7 @@
+ #include <string.h>
+ #include "apu_xaudio2.h"
+ 
+-/* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
+- * stubbed to report inactive; real audio output via SDL2 comes later. */
++/* XAudio2 on Windows; elsewhere the same calls over an SDL2 audio queue. */
+ #if defined(_WIN32)
+ 
+ #define COBJMACROS
+@@ -243,12 +242,107 @@ int xa2_get_buffer_size(void)
+     return XA2_BUF_SAMPLES;
+ }
+ 
+-#else /* !_WIN32 -- POSIX stubs (no audio output yet) */
++#else /* !_WIN32 -- SDL2 */
+ 
+-int  xa2_init(void)                                   { return 0; }
+-void xa2_shutdown(void)                               {}
+-int  xa2_is_active(void)                              { return 0; }
+-int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return -1; }
+-int  xa2_get_buffer_size(void)                        { return 0; }
++/* The same contract over SDL2's audio queue: the APU pushes 256-frame
++ * buffers in real time and the queue is bounded like XAudio2's buffer
++ * slots, with the same silence cushion in front after running dry. */
++#include <SDL.h>
++
++#define XA2_SAMPLE_RATE   48000
++#define XA2_CHANNELS      2
++#define XA2_BUF_SAMPLES   1024
++#define XA2_NUM_BUFS      64
++#define XA2_CUSHION       8
++
++static SDL_AudioDeviceID g_xa2_dev;
++static int   g_xa2_frames_written;
++static FILE *g_xa2_pcm_dump;
++
++int xa2_init(void)
++{
++    SDL_AudioSpec want, have;
++    if (g_xa2_dev) return 1;
++    if (!SDL_WasInit(SDL_INIT_AUDIO) && SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
++        fprintf(stderr, "[XA2] SDL audio: %s\n", SDL_GetError());
++        return 0;
++    }
++    SDL_zero(want);
++    want.freq = XA2_SAMPLE_RATE;
++    want.format = AUDIO_S16SYS;
++    want.channels = XA2_CHANNELS;
++    want.samples = 512;
++    g_xa2_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
++    if (!g_xa2_dev) {
++        fprintf(stderr, "[XA2] SDL_OpenAudioDevice: %s\n", SDL_GetError());
++        return 0;
++    }
++    SDL_PauseAudioDevice(g_xa2_dev, 0);
++    g_xa2_frames_written = 0;
++    {
++        const char *path = getenv("RECOMP_XA2_PCM_DUMP");
++        if (path && *path) {
++            g_xa2_pcm_dump = fopen(path, "wb");
++            fprintf(stderr, "[XA2] PCM capture %s: %s (s16le stereo 48000 Hz)\n",
++                    g_xa2_pcm_dump ? "opened" : "failed", path);
++        }
++    }
++    fprintf(stderr, "[XA2] SDL2 audio initialized (%s, %d Hz stereo 16-bit)\n",
++            SDL_GetCurrentAudioDriver(), XA2_SAMPLE_RATE);
++    return 1;
++}
++
++void xa2_shutdown(void)
++{
++    if (g_xa2_pcm_dump) {
++        fclose(g_xa2_pcm_dump);
++        g_xa2_pcm_dump = NULL;
++    }
++    if (!g_xa2_dev) return;
++    SDL_CloseAudioDevice(g_xa2_dev);
++    g_xa2_dev = 0;
++    fprintf(stderr, "[XA2] Shut down (%d frames written)\n", g_xa2_frames_written);
++}
++
++int xa2_is_active(void)
++{
++    return g_xa2_dev != 0;
++}
++
++int xa2_submit_samples(const int16_t *samples, int num_samples)
++{
++    static const int16_t silence[XA2_BUF_SAMPLES][2];
++    extern int xbox_FramebufferPaused(void);
++    Uint32 bytes = (Uint32)num_samples * XA2_CHANNELS * sizeof(int16_t);
++    Uint32 queued;
++    if (!samples || num_samples <= 0 || num_samples > XA2_BUF_SAMPLES) return -1;
++    if (!g_xa2_dev) return -1;
++    queued = SDL_GetQueuedAudioSize(g_xa2_dev);
++    if (queued >= (Uint32)XA2_NUM_BUFS * bytes) return 0;
++    if (queued == 0) {
++        int i;
++        if (g_xa2_frames_written)
++            fprintf(stderr, "[XA2] underrun after %d buffers\n", g_xa2_frames_written);
++        for (i = 0; i < XA2_CUSHION; i++)
++            if (SDL_QueueAudio(g_xa2_dev, silence, bytes) != 0)
++                break;
++    }
++    /* Paused in the background (fb_present.c): quiet, not a held note. */
++    if (SDL_QueueAudio(g_xa2_dev, xbox_FramebufferPaused() ? (const void *)silence
++                                                           : (const void *)samples,
++                       bytes) != 0)
++        return -1;
++    if (g_xa2_pcm_dump) {
++        fwrite(samples, 1, bytes, g_xa2_pcm_dump);
++        fflush(g_xa2_pcm_dump);
++    }
++    g_xa2_frames_written++;
++    return 1;
++}
++
++int xa2_get_buffer_size(void)
++{
++    return XA2_BUF_SAMPLES;
++}
+ 
+ #endif /* _WIN32 */

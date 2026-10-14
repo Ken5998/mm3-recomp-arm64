@@ -1,0 +1,441 @@
+From 375b307b6d5de828b3c74510e7a516fd7f66b948 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 23:00:07 +0000
+Subject: [PATCH 3/9] feat(input): xinput over sdl2 game controllers on linux
+
+The POSIX input backend was a separate SDL2 path without the keyboard
+pad, RECOMP_KEYMAP, RECOMP_PADMAP, the menu pointer or hotplug. Linux now
+runs the same code as Windows over xinput_sdl.c, which implements the
+XInput calls with SDL2 game controllers (hotplug, packet numbers that
+move only on change, held rumble). The keymap regression runs on Linux.
+---
+ src/input/CMakeLists.txt    |   1 +
+ src/input/xinput_device.c   | 140 ++----------------------------
+ src/input/xinput_sdl.c      | 168 ++++++++++++++++++++++++++++++++++++
+ src/input/xinput_sdl.h      |  42 +++++++++
+ tests/keymap/CMakeLists.txt |  12 ++-
+ 5 files changed, 225 insertions(+), 138 deletions(-)
+ create mode 100644 src/input/xinput_sdl.c
+ create mode 100644 src/input/xinput_sdl.h
+
+diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
+index caef326..623d85a 100644
+--- a/src/input/CMakeLists.txt
++++ b/src/input/CMakeLists.txt
+@@ -10,6 +10,7 @@ if(WIN32)
+     target_link_libraries(xbox_input PUBLIC platform xinput)
+ else()
+     find_package(SDL2 REQUIRED)
++    target_sources(xbox_input PRIVATE xinput_sdl.c)
+     target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2)
+ endif()
+ 
+diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
+index ed413a8..ee9350d 100644
+--- a/src/input/xinput_device.c
++++ b/src/input/xinput_device.c
+@@ -7,20 +7,20 @@
+  * (digital face buttons, trigger axes).
+  *
+  *   _WIN32 -> Windows XInput
+- *   POSIX  -> SDL2 GameController
++ *   POSIX  -> the same XInput calls over SDL2 game controllers (xinput_sdl.c)
+  */
+ 
+ #include "xinput_xbox.h"
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+-/* ======================================================================== */
+ #if defined(_WIN32)
+-/* ====================  XInput backend  ================================== */
+-/* ======================================================================== */
+-
+ #include <xinput.h>
+ #pragma comment(lib, "xinput.lib")
++#else
++#include "xinput_sdl.h"
++#endif
+ 
+ static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
+ static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
+@@ -456,133 +456,3 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
+     pCaps->Flags = xi_caps.Flags;
+     return ERROR_SUCCESS;
+ }
+-
+-/* ======================================================================== */
+-#else /* !_WIN32 */
+-/* ====================  SDL2 GameController backend  ===================== */
+-/* ======================================================================== */
+-
+-#include <SDL.h>
+-
+-static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
+-static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
+-static DWORD g_packet[XBOX_MAX_CONTROLLERS];
+-
+-/* Open up to XBOX_MAX_CONTROLLERS attached game controllers. */
+-static void open_controllers(void)
+-{
+-    int slot = 0;
+-    for (int i = 0; i < SDL_NumJoysticks() && slot < XBOX_MAX_CONTROLLERS; i++) {
+-        if (!SDL_IsGameController(i))
+-            continue;
+-        if (!g_pads[slot]) {
+-            g_pads[slot] = SDL_GameControllerOpen(i);
+-            g_controller_connected[slot] = (g_pads[slot] != NULL);
+-        }
+-        slot++;
+-    }
+-}
+-
+-void xbox_InputInit(void)
+-{
+-    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
+-        SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+-    open_controllers();
+-}
+-
+-DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+-{
+-    if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
+-        return ERROR_DEVICE_NOT_CONNECTED;
+-
+-    SDL_GameController *c = g_pads[dwPort];
+-    if (!c || !SDL_GameControllerGetAttached(c)) {
+-        g_controller_connected[dwPort] = FALSE;
+-        return ERROR_DEVICE_NOT_CONNECTED;
+-    }
+-
+-    SDL_GameControllerUpdate();
+-    g_controller_connected[dwPort] = TRUE;
+-
+-    memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+-    pState->dwPacketNumber = ++g_packet[dwPort];
+-
+-    WORD btn = 0;
+-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_UP))    btn |= XBOX_GAMEPAD_DPAD_UP;
+-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  btn |= XBOX_GAMEPAD_DPAD_DOWN;
+-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  btn |= XBOX_GAMEPAD_DPAD_LEFT;
+-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) btn |= XBOX_GAMEPAD_DPAD_RIGHT;
+-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_START))      btn |= XBOX_GAMEPAD_START;
+-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_BACK))       btn |= XBOX_GAMEPAD_BACK;
+-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSTICK))  btn |= XBOX_GAMEPAD_LEFT_THUMB;
+-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_RIGHTSTICK)) btn |= XBOX_GAMEPAD_RIGHT_THUMB;
+-    pState->Gamepad.wButtons = btn;
+-
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] =
+-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_A) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] =
+-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_B) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] =
+-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_X) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
+-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_Y) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
+-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) ? 255 : 0;
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
+-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) ? 255 : 0;
+-
+-    /* SDL trigger axes are 0..32767 -> Xbox analog button 0..255 */
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] =
+-        (BYTE)(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERLEFT) >> 7);
+-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] =
+-        (BYTE)(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) >> 7);
+-
+-    /* SDL Y axis points down; the Xbox Y axis points up -- invert.
+-     * Use (-1 - v) so v = -32768 does not overflow SHORT. */
+-    pState->Gamepad.sThumbLX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX);
+-    pState->Gamepad.sThumbLY =
+-        (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTY));
+-    pState->Gamepad.sThumbRX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX);
+-    pState->Gamepad.sThumbRY =
+-        (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
+-
+-    return ERROR_SUCCESS;
+-}
+-
+-DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
+-{
+-    if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
+-        return ERROR_DEVICE_NOT_CONNECTED;
+-
+-    SDL_GameController *c = g_pads[dwPort];
+-    if (!c) return ERROR_DEVICE_NOT_CONNECTED;
+-
+-    /* SDL rumble needs a duration; refresh for ~1s on each call (the game
+-     * polls vibration continuously). */
+-    SDL_GameControllerRumble(c, pVibration->wLeftMotorSpeed,
+-                             pVibration->wRightMotorSpeed, 1000);
+-    return ERROR_SUCCESS;
+-}
+-
+-BOOL xbox_InputIsConnected(DWORD dwPort)
+-{
+-    if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
+-    return g_controller_connected[dwPort];
+-}
+-
+-DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
+-{
+-    (void)dwFlags;
+-    if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
+-        return ERROR_DEVICE_NOT_CONNECTED;
+-    if (!g_pads[dwPort])
+-        return ERROR_DEVICE_NOT_CONNECTED;
+-
+-    memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
+-    pCaps->Type    = 1;   /* XINPUT_DEVTYPE_GAMEPAD */
+-    pCaps->SubType = 1;   /* XINPUT_DEVSUBTYPE_GAMEPAD */
+-    pCaps->Flags   = 0;
+-    return ERROR_SUCCESS;
+-}
+-
+-#endif /* _WIN32 */
+diff --git a/src/input/xinput_sdl.c b/src/input/xinput_sdl.c
+new file mode 100644
+index 0000000..f07a464
+--- /dev/null
++++ b/src/input/xinput_sdl.c
+@@ -0,0 +1,168 @@
++/**
++ * XInput over SDL2 game controllers. See xinput_sdl.h.
++ */
++#include "xinput_sdl.h"
++
++#include <SDL.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <string.h>
++
++#define PORTS 4
++
++static SDL_GameController *s_pad[PORTS];
++static XINPUT_STATE s_last[PORTS];
++static XINPUT_VIBRATION s_rumble[PORTS];
++static Uint32 s_rumble_at[PORTS];
++/* The USB pad model and the title's own XInput calls may poll from
++ * different threads; the ports and their last states are shared. */
++static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
++
++/* Drop pads that went away and give new ones the first free port. Cheap
++ * enough to run on every poll that finds its port empty, but rate-limited
++ * anyway: enumerating opens device nodes. */
++static void rescan(void)
++{
++    static Uint32 last;
++    Uint32 now = SDL_GetTicks();
++    int i, p;
++    if (last && now - last < 500)
++        return;
++    last = now;
++    for (p = 0; p < PORTS; p++)
++        if (s_pad[p] && !SDL_GameControllerGetAttached(s_pad[p])) {
++            SDL_GameControllerClose(s_pad[p]);
++            s_pad[p] = NULL;
++        }
++    for (i = 0; i < SDL_NumJoysticks(); i++) {
++        SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(i);
++        int taken = 0;
++        if (!SDL_IsGameController(i))
++            continue;
++        for (p = 0; p < PORTS; p++)
++            if (s_pad[p] && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(s_pad[p])) == id)
++                taken = 1;
++        if (taken)
++            continue;
++        for (p = 0; p < PORTS && s_pad[p]; p++) {}
++        if (p == PORTS)
++            break;
++        if ((s_pad[p] = SDL_GameControllerOpen(i)) != NULL)
++            fprintf(stderr, "[INPUT] port %d: %s\n", p, SDL_GameControllerName(s_pad[p]));
++    }
++}
++
++/* Called with s_lock held. */
++static SDL_GameController *pad(DWORD port)
++{
++    static int init;
++    if (!init) {
++        init = 1;
++        if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
++            SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
++    }
++    SDL_GameControllerUpdate();
++    if (!s_pad[port] || !SDL_GameControllerGetAttached(s_pad[port]))
++        rescan();
++    return s_pad[port] && SDL_GameControllerGetAttached(s_pad[port]) ? s_pad[port] : NULL;
++}
++
++static WORD buttons(SDL_GameController *c)
++{
++    static const struct { SDL_GameControllerButton b; WORD bit; } map[] = {
++        { SDL_CONTROLLER_BUTTON_DPAD_UP, XINPUT_GAMEPAD_DPAD_UP },
++        { SDL_CONTROLLER_BUTTON_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_DOWN },
++        { SDL_CONTROLLER_BUTTON_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_LEFT },
++        { SDL_CONTROLLER_BUTTON_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_RIGHT },
++        { SDL_CONTROLLER_BUTTON_START, XINPUT_GAMEPAD_START },
++        { SDL_CONTROLLER_BUTTON_BACK, XINPUT_GAMEPAD_BACK },
++        { SDL_CONTROLLER_BUTTON_LEFTSTICK, XINPUT_GAMEPAD_LEFT_THUMB },
++        { SDL_CONTROLLER_BUTTON_RIGHTSTICK, XINPUT_GAMEPAD_RIGHT_THUMB },
++        { SDL_CONTROLLER_BUTTON_LEFTSHOULDER, XINPUT_GAMEPAD_LEFT_SHOULDER },
++        { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER },
++        { SDL_CONTROLLER_BUTTON_A, XINPUT_GAMEPAD_A },
++        { SDL_CONTROLLER_BUTTON_B, XINPUT_GAMEPAD_B },
++        { SDL_CONTROLLER_BUTTON_X, XINPUT_GAMEPAD_X },
++        { SDL_CONTROLLER_BUTTON_Y, XINPUT_GAMEPAD_Y },
++    };
++    WORD w = 0;
++    size_t i;
++    for (i = 0; i < sizeof map / sizeof map[0]; i++)
++        if (SDL_GameControllerGetButton(c, map[i].b))
++            w |= map[i].bit;
++    return w;
++}
++
++static void rumble(DWORD port, SDL_GameController *c, const XINPUT_VIBRATION *v)
++{
++    s_rumble[port] = *v;
++    s_rumble_at[port] = SDL_GetTicks();
++    SDL_GameControllerRumble(c, v->wLeftMotorSpeed, v->wRightMotorSpeed, 0xFFFF);
++}
++
++DWORD XInputGetState(DWORD port, XINPUT_STATE *state)
++{
++    SDL_GameController *c;
++    XINPUT_GAMEPAD g;
++    if (port >= PORTS || !state)
++        return ERROR_DEVICE_NOT_CONNECTED;
++    pthread_mutex_lock(&s_lock);
++    if (!(c = pad(port))) {
++        pthread_mutex_unlock(&s_lock);
++        return ERROR_DEVICE_NOT_CONNECTED;
++    }
++    memset(&g, 0, sizeof g);
++    g.wButtons = buttons(c);
++    /* SDL's triggers run 0..32767, XInput's 0..255. */
++    g.bLeftTrigger = (BYTE)(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERLEFT) >> 7);
++    g.bRightTrigger = (BYTE)(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) >> 7);
++    /* SDL's Y axes point down, XInput's up. */
++    g.sThumbLX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX);
++    g.sThumbLY = (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTY));
++    g.sThumbRX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX);
++    g.sThumbRY = (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
++    /* XInput moves the packet number only when the state changes. */
++    if (memcmp(&g, &s_last[port].Gamepad, sizeof g)) {
++        s_last[port].Gamepad = g;
++        s_last[port].dwPacketNumber++;
++    }
++    /* SDL rumble runs for a set time; keep a held setting going. */
++    if ((s_rumble[port].wLeftMotorSpeed || s_rumble[port].wRightMotorSpeed) &&
++        SDL_GetTicks() - s_rumble_at[port] > 30000)
++        rumble(port, c, &s_rumble[port]);
++    *state = s_last[port];
++    pthread_mutex_unlock(&s_lock);
++    return ERROR_SUCCESS;
++}
++
++DWORD XInputSetState(DWORD port, XINPUT_VIBRATION *vibration)
++{
++    SDL_GameController *c;
++    DWORD r = ERROR_DEVICE_NOT_CONNECTED;
++    if (port >= PORTS || !vibration)
++        return r;
++    pthread_mutex_lock(&s_lock);
++    if ((c = s_pad[port]) != NULL && SDL_GameControllerGetAttached(c)) {
++        rumble(port, c, vibration);
++        r = ERROR_SUCCESS;
++    }
++    pthread_mutex_unlock(&s_lock);
++    return r;
++}
++
++DWORD XInputGetCapabilities(DWORD port, DWORD flags, XINPUT_CAPABILITIES *caps)
++{
++    (void)flags;
++    int connected;
++    if (port >= PORTS || !caps)
++        return ERROR_DEVICE_NOT_CONNECTED;
++    pthread_mutex_lock(&s_lock);
++    connected = pad(port) != NULL;
++    pthread_mutex_unlock(&s_lock);
++    if (!connected)
++        return ERROR_DEVICE_NOT_CONNECTED;
++    memset(caps, 0, sizeof *caps);
++    caps->Type = XINPUT_DEVTYPE_GAMEPAD;
++    caps->SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
++    return ERROR_SUCCESS;
++}
+diff --git a/src/input/xinput_sdl.h b/src/input/xinput_sdl.h
+new file mode 100644
+index 0000000..691240c
+--- /dev/null
++++ b/src/input/xinput_sdl.h
+@@ -0,0 +1,42 @@
++/**
++ * The slice of Windows XInput that xinput_device.c calls, over SDL2's
++ * GameController API, so the keyboard pad, RECOMP_KEYMAP, RECOMP_PADMAP and
++ * the menu pointer work the same on Linux as on Windows.
++ *
++ * Ports are SDL game controllers in the order they were found; a pad plugged
++ * in later takes the first free port. Steam's virtual pads (and the handheld
++ * controls Steam Input exposes as one) are game controllers like any other.
++ */
++#ifndef XBOXRECOMP_XINPUT_SDL_H
++#define XBOXRECOMP_XINPUT_SDL_H
++
++#include "platform/win32_compat.h"
++
++/* XINPUT_GAMEPAD, XINPUT_STATE and the button bits come from win32_compat.h,
++ * along with a disconnected XInputGetState stub for code that only needs to
++ * link; the backend here goes by its own names, mapped onto XInput's below. */
++#define XINPUT_DEVTYPE_GAMEPAD          0x01
++#define XINPUT_DEVSUBTYPE_GAMEPAD       0x01
++
++typedef struct {
++    WORD wLeftMotorSpeed;
++    WORD wRightMotorSpeed;
++} XINPUT_VIBRATION;
++
++typedef struct {
++    BYTE             Type;
++    BYTE             SubType;
++    WORD             Flags;
++    XINPUT_GAMEPAD   Gamepad;
++    XINPUT_VIBRATION Vibration;
++} XINPUT_CAPABILITIES;
++
++DWORD xinput_sdl_get_state(DWORD port, XINPUT_STATE *state);
++DWORD xinput_sdl_set_state(DWORD port, XINPUT_VIBRATION *vibration);
++DWORD xinput_sdl_get_capabilities(DWORD port, DWORD flags, XINPUT_CAPABILITIES *caps);
++
++#define XInputGetState        xinput_sdl_get_state
++#define XInputSetState        xinput_sdl_set_state
++#define XInputGetCapabilities xinput_sdl_get_capabilities
++
++#endif
+diff --git a/tests/keymap/CMakeLists.txt b/tests/keymap/CMakeLists.txt
+index 31da9ec..13efc17 100644
+--- a/tests/keymap/CMakeLists.txt
++++ b/tests/keymap/CMakeLists.txt
+@@ -1,9 +1,15 @@
+ cmake_minimum_required(VERSION 3.20)
+ project(keymap_regression LANGUAGES C)
++# The keyboard pad and RECOMP_PADMAP sit above XInput, which is Windows'
++# own or, elsewhere, xinput_sdl.c's over SDL2: the same logic on both.
++add_executable(keymap-test keymap_test.c)
++target_include_directories(keymap-test PRIVATE ../../src ../../src/input)
+ if(NOT WIN32)
+-    message(FATAL_ERROR "The keyboard pad is the Windows XInput backend.")
++    set(CMAKE_C_STANDARD 11)
++    find_package(SDL2 REQUIRED)
++    add_subdirectory(../../src/platform platform)
++    target_sources(keymap-test PRIVATE ../../src/input/xinput_sdl.c)
++    target_link_libraries(keymap-test PRIVATE platform SDL2::SDL2)
+ endif()
+-add_executable(keymap-test keymap_test.c)
+-target_include_directories(keymap-test PRIVATE ../../src)
+ enable_testing()
+ add_test(NAME keymap COMMAND keymap-test)
