@@ -1,0 +1,503 @@
+From 1ee6814794e81ef3f392cf721206452360032133 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 17:04:29 +0000
+Subject: [PATCH] fix(posix): fail waits on handles the compat layer never made
+
+On POSIX a HANDLE is the address of its object, so a value that is not one
+of ours was dereferenced. The kernel bridge passes untagged guest values
+through as handles: Midtown Madness 3's D3D waits with KeWaitForSingleObject
+on an object in its own data at its first loading screen, and the wait
+locked a mutex at that guest address and faulted. Windows answers the same
+wait with WAIT_FAILED and ERROR_INVALID_HANDLE, and the title carries on.
+
+Keep a table of the objects this layer made and look every handle up in it:
+an unknown one fails the call as on Windows, and a multi-object wait with
+one fails whole. tests/win32_handles_posix covers foreign, closed and live
+handles.
+---
+ src/platform/win32_compat.c              | 169 +++++++++++++++++++----
+ tests/win32_handles_posix/CMakeLists.txt |  13 ++
+ tests/win32_handles_posix/test_main.c    |  94 +++++++++++++
+ 3 files changed, 249 insertions(+), 27 deletions(-)
+ create mode 100644 tests/win32_handles_posix/CMakeLists.txt
+ create mode 100644 tests/win32_handles_posix/test_main.c
+
+diff --git a/src/platform/win32_compat.c b/src/platform/win32_compat.c
+index a4c00d8..2708fa2 100644
+--- a/src/platform/win32_compat.c
++++ b/src/platform/win32_compat.c
+@@ -327,6 +327,102 @@ DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
+ HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
+ HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
+ 
++/* The objects this layer made. Windows answers a HANDLE it never issued with
++ * ERROR_INVALID_HANDLE; here a HANDLE is the object's address, so one this
++ * layer did not make has to be caught before it is dereferenced. The kernel
++ * bridge passes untagged guest values through as handles -- Midtown Madness
++ * 3's D3D waits with KeWaitForSingleObject on an object in its own data at its
++ * first loading screen -- and the wait locked a "mutex" at that guest address
++ * and faulted, where Windows fails the wait and the title carries on. */
++static pthread_mutex_t s_live_lock = PTHREAD_MUTEX_INITIALIZER;
++static uintptr_t *s_live;       /* open addressing: 0 empty, 1 removed */
++static size_t     s_live_cap;   /* a power of two */
++static size_t     s_live_used;  /* slots not empty, removed ones included */
++static size_t     s_live_count;
++
++static size_t live_slot(uintptr_t key)
++{
++    uint64_t x = (uint64_t)key;
++    x ^= x >> 33;
++    x *= 0xff51afd7ed558ccdULL;
++    x ^= x >> 33;
++    return (size_t)x & (s_live_cap - 1);
++}
++
++static void live_put(uintptr_t key)
++{
++    size_t i = live_slot(key);
++    while (s_live[i] > 1)
++        i = (i + 1) & (s_live_cap - 1);
++    if (s_live[i] == 0)
++        s_live_used++;
++    s_live[i] = key;
++}
++
++static void live_add(w32_object *o)
++{
++    pthread_mutex_lock(&s_live_lock);
++    if ((s_live_used + 1) * 2 > s_live_cap) {
++        uintptr_t *old = s_live;
++        size_t old_cap = s_live_cap, cap = 64, i;
++        while (cap < (s_live_count + 1) * 4)
++            cap <<= 1;
++        s_live = (uintptr_t *)calloc(cap, sizeof *s_live);
++        if (!s_live) {
++            fprintf(stderr, "win32_compat: out of memory for the handle table\n");
++            abort();
++        }
++        s_live_cap = cap;
++        s_live_used = 0;
++        for (i = 0; i < old_cap; i++)
++            if (old[i] > 1)
++                live_put(old[i]);
++        free(old);
++    }
++    live_put((uintptr_t)o);
++    s_live_count++;
++    pthread_mutex_unlock(&s_live_lock);
++}
++
++static void live_remove(w32_object *o)
++{
++    pthread_mutex_lock(&s_live_lock);
++    if (s_live_cap) {
++        size_t i = live_slot((uintptr_t)o);
++        while (s_live[i] != 0) {
++            if (s_live[i] == (uintptr_t)o) {
++                s_live[i] = 1;
++                s_live_count--;
++                break;
++            }
++            i = (i + 1) & (s_live_cap - 1);
++        }
++    }
++    pthread_mutex_unlock(&s_live_lock);
++}
++
++/* The object behind h, or NULL with ERROR_INVALID_HANDLE. */
++static w32_object *obj_of(HANDLE h)
++{
++    uintptr_t key = (uintptr_t)h;
++    w32_object *o = NULL;
++    pthread_mutex_lock(&s_live_lock);
++    if (s_live_cap && key > 1) {
++        size_t i = live_slot(key);
++        while (s_live[i] != 0) {
++            if (s_live[i] == key) {
++                o = (w32_object *)h;
++                break;
++            }
++            i = (i + 1) & (s_live_cap - 1);
++        }
++    }
++    pthread_mutex_unlock(&s_live_lock);
++    if (!o)
++        SetLastError(ERROR_INVALID_HANDLE);
++    return o;
++}
++
+ static w32_object *obj_alloc(w32_kind kind)
+ {
+     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
+@@ -335,6 +431,7 @@ static w32_object *obj_alloc(w32_kind kind)
+     pthread_mutex_init(&o->lock, NULL);
+     pthread_cond_init(&o->cond, NULL);
+     pthread_cond_init(&o->gate, NULL);
++    live_add(o);
+     return o;
+ }
+ 
+@@ -342,6 +439,7 @@ static void obj_release(w32_object *o)
+ {
+     if (InterlockedDecrement(&o->refcount) > 0)
+         return;
++    live_remove(o);
+     if (o->kind == K_FILE) {
+         if (o->fd >= 0) close(o->fd);
+         free(o->file_path);
+@@ -367,13 +465,13 @@ HANDLE w32_open_handle(int fd, const char *host_path)
+ 
+ int w32_handle_fd(HANDLE h)
+ {
+-    w32_object *o = (w32_object *)h;
++    w32_object *o = obj_of(h);
+     return (o && o->kind == K_FILE) ? o->fd : -1;
+ }
+ 
+ const char *w32_handle_path(HANDLE h)
+ {
+-    w32_object *o = (w32_object *)h;
++    w32_object *o = obj_of(h);
+     return (o && o->kind == K_FILE) ? o->file_path : NULL;
+ }
+ 
+@@ -382,7 +480,10 @@ BOOL CloseHandle(HANDLE h)
+     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
+         h == INVALID_HANDLE_VALUE)
+         return TRUE;
+-    obj_release((w32_object *)h);
++    w32_object *o = obj_of(h);
++    if (!o)
++        return FALSE;
++    obj_release(o);
+     return TRUE;
+ }
+ 
+@@ -394,7 +495,7 @@ BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
+     if (src == PSEUDO_CURRENT_THREAD)  src = GetCurrentThread();
+     if (src == PSEUDO_CURRENT_PROCESS) { *dst = src; return TRUE; }
+     if (src == PSEUDO_CURRENT_THREAD || !src) { *dst = src; return TRUE; }
+-    w32_object *o = (w32_object *)src;
++    w32_object *o = obj_of(src);
+     InterlockedIncrement(&o->refcount);
+     *dst = src;
+     if (options & DUPLICATE_CLOSE_SOURCE)
+@@ -514,7 +615,8 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
+ {
+     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
+         return WAIT_OBJECT_0;
+-    return wait_single((w32_object *)h, ms);
++    w32_object *o = obj_of(h);
++    return o ? wait_single(o, ms) : WAIT_FAILED;
+ }
+ 
+ DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
+@@ -540,19 +642,32 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
+     int timed = (ms != INFINITE);
+     if (timed) deadline_from_ms(ms, &ts);
+ 
++    /* Like Windows, one handle that is not an object fails the whole wait,
++     * whatever the others' states. */
++    for (DWORD i = 0; i < count; i++) {
++        HANDLE h = handles[i];
++        if (h && h != PSEUDO_CURRENT_THREAD && h != PSEUDO_CURRENT_PROCESS && !obj_of(h))
++            return WAIT_FAILED;
++    }
++
+     for (;;) {
+         if (alertable && drain_apcs() > 0)
+             return WAIT_IO_COMPLETION;
+ 
+         if (waitAll) {
+             DWORD got = 0;
+-            for (DWORD i = 0; i < count; i++)
+-                if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0) got++;
++            for (DWORD i = 0; i < count; i++) {
++                DWORD r = WaitForSingleObject(handles[i], 0);
++                if (r == WAIT_FAILED) return WAIT_FAILED;
++                if (r == WAIT_OBJECT_0) got++;
++            }
+             if (got == count) return WAIT_OBJECT_0;
+         } else {
+-            for (DWORD i = 0; i < count; i++)
+-                if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0)
+-                    return WAIT_OBJECT_0 + i;
++            for (DWORD i = 0; i < count; i++) {
++                DWORD r = WaitForSingleObject(handles[i], 0);
++                if (r == WAIT_FAILED) return WAIT_FAILED;
++                if (r == WAIT_OBJECT_0) return WAIT_OBJECT_0 + i;
++            }
+         }
+ 
+         if (timed) {
+@@ -586,7 +701,7 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
+ 
+ BOOL SetEvent(HANDLE h)
+ {
+-    w32_object *o = (w32_object *)h;
++    w32_object *o = obj_of(h);
+     if (!o || o->kind != K_EVENT) return FALSE;
+     pthread_mutex_lock(&o->lock);
+     o->signaled = 1;
+@@ -597,7 +712,7 @@ BOOL SetEvent(HANDLE h)
+ 
+ BOOL ResetEvent(HANDLE h)
+ {
+-    w32_object *o = (w32_object *)h;
++    w32_object *o = obj_of(h);
+     if (!o || o->kind != K_EVENT) return FALSE;
+     pthread_mutex_lock(&o->lock);
+     o->signaled = 0;
+@@ -607,7 +722,7 @@ BOOL ResetEvent(HANDLE h)
+ 
+ BOOL PulseEvent(HANDLE h)
+ {
+-    w32_object *o = (w32_object *)h;
++    w32_object *o = obj_of(h);
+     if (!o || o->kind != K_EVENT) return FALSE;
+     pthread_mutex_lock(&o->lock);
+     o->signaled = 1;
+@@ -637,7 +752,7 @@ HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LP
+ 
+ BOOL ReleaseSemaphore(HANDLE h, LONG releaseCount, PLONG previousCount)
+ {
+-    w32_object *o = (w32_object *)h;
++    w32_object *o = obj_of(h);
+     if (!o || o->kind != K_SEM) return FALSE;
+     pthread_mutex_lock(&o->lock);
+     if (previousCount) *previousCount = (LONG)o->sem_count;
+@@ -667,7 +782,7 @@ HANDLE CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCWSTR name)
+ 
+ BOOL ReleaseMutex(HANDLE h)
+ {
+-    w32_object *o = (w32_object *)h;
++    w32_object *o = obj_of(h);
+     if (!o || o->kind != K_MUTEX) {
+         SetLastError(ERROR_INVALID_HANDLE);
+         return FALSE;
+@@ -764,7 +879,7 @@ VOID ExitThread(DWORD exitCode)
+ 
+ BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
+ {
+-    w32_object *o = (w32_object *)h;
++    w32_object *o = obj_of(h);
+     if (!o || o->kind != K_THREAD || !exitCode) return FALSE;
+     pthread_mutex_lock(&o->lock);
+     *exitCode = o->exited ? o->exit_code : STILL_ACTIVE;
+@@ -774,7 +889,7 @@ BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
+ 
+ DWORD ResumeThread(HANDLE h)
+ {
+-    w32_object *o = (w32_object *)h;
++    w32_object *o = obj_of(h);
+     if (!o || o->kind != K_THREAD) return (DWORD)-1;
+     pthread_mutex_lock(&o->lock);
+     DWORD prev = (DWORD)o->suspend_count;
+@@ -788,7 +903,7 @@ DWORD SuspendThread(HANDLE h)
+ {
+     /* True mid-run suspension is not supported on POSIX; only the
+      * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
+-    w32_object *o = (w32_object *)h;
++    w32_object *o = obj_of(h);
+     if (!o || o->kind != K_THREAD) return (DWORD)-1;
+     pthread_mutex_lock(&o->lock);
+     DWORD prev = (DWORD)o->suspend_count;
+@@ -799,7 +914,7 @@ DWORD SuspendThread(HANDLE h)
+ 
+ BOOL TerminateThread(HANDLE h, DWORD exitCode)
+ {
+-    w32_object *o = (w32_object *)h;
++    w32_object *o = obj_of(h);
+     if (!o || o->kind != K_THREAD) return FALSE;
+     pthread_cancel(o->thread);
+     pthread_mutex_lock(&o->lock);
+@@ -813,14 +928,14 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
+ 
+ BOOL SetThreadPriority(HANDLE h, int priority)
+ {
+-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
++    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_of(h);
+     if (o && o->kind == K_THREAD) o->priority = priority;
+     return TRUE;   /* real RT priorities need privileges; tracked only */
+ }
+ 
+ int GetThreadPriority(HANDLE h)
+ {
+-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
++    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_of(h);
+     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
+ }
+ 
+@@ -828,7 +943,7 @@ VOID SwitchToThread(void) { sched_yield(); }
+ 
+ DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
+ {
+-    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)thread;
++    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_of(thread);
+     if (!o || o->kind != K_THREAD) return 0;
+     pthread_mutex_lock(&o->lock);
+     DWORD ok = 0;
+@@ -923,7 +1038,7 @@ BOOL CreateTimerQueueTimer(PHANDLE newTimer, HANDLE timerQueue,
+ BOOL ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG period)
+ {
+     (void)timerQueue;
+-    w32_object *o = (w32_object *)timer;
++    w32_object *o = obj_of(timer);
+     if (!o || o->kind != K_TIMER) return FALSE;
+     o->timer_due    = dueTime;
+     o->timer_period = period;
+@@ -933,7 +1048,7 @@ BOOL ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG
+ BOOL DeleteTimerQueueTimer(HANDLE timerQueue, HANDLE timer, HANDLE completionEvent)
+ {
+     (void)timerQueue;
+-    w32_object *o = (w32_object *)timer;
++    w32_object *o = obj_of(timer);
+     if (!o || o->kind != K_TIMER) return FALSE;
+     o->timer_cancel = 1;
+     if (completionEvent) SetEvent(completionEvent);
+@@ -980,7 +1095,7 @@ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR
+ BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
+                       PTIMERAPCROUTINE completion, PVOID arg, BOOL resume)
+ {
+-    w32_object *o = (w32_object *)h;
++    w32_object *o = obj_of(h);
+     (void)completion; (void)arg; (void)resume;
+     if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) return FALSE;
+     pthread_mutex_lock(&o->lock);
+@@ -1012,7 +1127,7 @@ BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
+ 
+ BOOL CancelWaitableTimer(HANDLE h)
+ {
+-    w32_object *o = (w32_object *)h;
++    w32_object *o = obj_of(h);
+     if (!o || o->kind != K_WAITABLE_TIMER) return FALSE;
+     pthread_mutex_lock(&o->lock);
+     o->waitable_triggered = 0;
+@@ -1653,7 +1768,7 @@ HANDLE CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
+ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
+                        SIZE_T count, LPVOID baseAddr)
+ {
+-    w32_object *o = (w32_object *)mapping;
++    w32_object *o = obj_of(mapping);
+     if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
+ 
+     off_t  off = ((off_t)offHigh << 32) | offLow;
+diff --git a/tests/win32_handles_posix/CMakeLists.txt b/tests/win32_handles_posix/CMakeLists.txt
+new file mode 100644
+index 0000000..43125a0
+--- /dev/null
++++ b/tests/win32_handles_posix/CMakeLists.txt
+@@ -0,0 +1,13 @@
++cmake_minimum_required(VERSION 3.20)
++project(win32_handles_posix_test C)
++# Handles on a POSIX host: win32_compat.c answers a HANDLE it never made the
++# way Windows does, instead of dereferencing it.
++if(WIN32)
++    message(FATAL_ERROR "This regression covers the POSIX handle layer")
++endif()
++set(CMAKE_C_STANDARD 11)
++add_subdirectory(../../src/platform platform)
++add_executable(win32_handles_posix_test test_main.c)
++target_link_libraries(win32_handles_posix_test PRIVATE platform)
++enable_testing()
++add_test(NAME win32_handles_posix_test COMMAND win32_handles_posix_test)
+diff --git a/tests/win32_handles_posix/test_main.c b/tests/win32_handles_posix/test_main.c
+new file mode 100644
+index 0000000..30396fc
+--- /dev/null
++++ b/tests/win32_handles_posix/test_main.c
+@@ -0,0 +1,94 @@
++/*
++ * win32_handles_posix - a HANDLE win32_compat.c did not make.
++ *
++ * On POSIX a HANDLE is the address of the object behind it, so a value that
++ * is not one of ours used to be dereferenced. The kernel bridge passes untagged
++ * guest values through as handles: Midtown Madness 3's D3D waits with
++ * KeWaitForSingleObject on an object in its own data (0x0035185C) at its first
++ * loading screen, and the wait locked a mutex at that address and faulted. On
++ * Windows the same wait fails with ERROR_INVALID_HANDLE and the title carries
++ * on, which is what is checked here, along with the objects that are ours
++ * still working once the table that tells them apart has grown and shrunk.
++ */
++#include <stdint.h>
++#include <stdio.h>
++
++#include "win32_compat.h"
++
++static int failures;
++#define CHECK(name, cond) \
++    do { if (!(cond)) { printf("FAIL: %s\n", name); failures++; } } while (0)
++
++static DWORD WINAPI worker(LPVOID param)
++{
++    SetEvent((HANDLE)param);
++    return 7;
++}
++
++int main(void)
++{
++    /* An unmapped guest address, and one that is mapped but not an object. */
++    static uint8_t not_an_object[256];
++    HANDLE foreign[] = { (HANDLE)(uintptr_t)0x0035185Cu, (HANDLE)not_an_object };
++    HANDLE ev = CreateEventA(NULL, TRUE, FALSE, NULL);
++    HANDLE many[1000];
++    DWORD code = 0;
++
++    CHECK("event created", ev != NULL);
++    CHECK("unsignalled event times out", WaitForSingleObject(ev, 0) == WAIT_TIMEOUT);
++    CHECK("SetEvent", SetEvent(ev));
++    CHECK("signalled event", WaitForSingleObject(ev, INFINITE) == WAIT_OBJECT_0);
++
++    for (int i = 0; i < 2; i++) {
++        HANDLE h = foreign[i];
++        SetLastError(0);
++        CHECK("foreign wait fails", WaitForSingleObjectEx(h, INFINITE, FALSE) == WAIT_FAILED);
++        CHECK("foreign wait sets ERROR_INVALID_HANDLE", GetLastError() == ERROR_INVALID_HANDLE);
++        CHECK("foreign SetEvent fails", !SetEvent(h));
++        CHECK("foreign ResetEvent fails", !ResetEvent(h));
++        CHECK("foreign ReleaseSemaphore fails", !ReleaseSemaphore(h, 1, NULL));
++        CHECK("foreign ReleaseMutex fails", !ReleaseMutex(h));
++        CHECK("foreign CloseHandle fails", !CloseHandle(h));
++        {
++            HANDLE pair[2] = { ev, h };
++            CHECK("wait-any with a foreign handle fails",
++                  WaitForMultipleObjects(2, pair, FALSE, INFINITE) == WAIT_FAILED);
++            CHECK("wait-all with a foreign handle fails",
++                  WaitForMultipleObjects(2, pair, TRUE, INFINITE) == WAIT_FAILED);
++        }
++    }
++
++    /* Enough objects to grow the table several times, then half of them gone. */
++    for (int i = 0; i < 1000; i++)
++        many[i] = CreateEventA(NULL, TRUE, i & 1, NULL);
++    for (int i = 0; i < 1000; i += 2)
++        CHECK("CloseHandle", CloseHandle(many[i]));
++    for (int i = 0; i < 1000; i++) {
++        DWORD r = WaitForSingleObject(many[i], 0);
++        if (i & 1)
++            CHECK("live event still signalled", r == WAIT_OBJECT_0);
++        else
++            CHECK("closed event is no longer a handle", r == WAIT_FAILED);
++    }
++    for (int i = 1; i < 1000; i += 2)
++        CloseHandle(many[i]);
++
++    CHECK("ResetEvent", ResetEvent(ev));
++    {
++        HANDLE t = CreateThread(NULL, 0, worker, ev, 0, NULL);
++        CHECK("thread created", t != NULL);
++        CHECK("event set by the thread", WaitForSingleObject(ev, 5000) == WAIT_OBJECT_0);
++        CHECK("thread finished", WaitForSingleObject(t, 5000) == WAIT_OBJECT_0);
++        CHECK("thread exit code", GetExitCodeThread(t, &code) && code == 7);
++        CHECK("thread handle closes", CloseHandle(t));
++    }
++    CHECK("event closes", CloseHandle(ev));
++    CHECK("closed event cannot be set", !SetEvent(ev));
++
++    if (failures) {
++        printf("%d check(s) failed\n", failures);
++        return 1;
++    }
++    printf("win32 handles: all checks passed\n");
++    return 0;
++}
