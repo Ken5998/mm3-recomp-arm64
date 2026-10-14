@@ -52,10 +52,10 @@ is installed, the build reuses its LLVM instead of downloading it again.
 
 ## Status
 
-This is the first release of the port. The runtime and its tests build and
-pass on ARM64 in CI, and the game starts on ARM64 under emulation up to its
-renderer; the first runs on a handheld are still to come. mm3-recomp itself
-is a work in progress, so expect rough edges, and back up your saves.
+This is an early release of the port. On a Retroid Pocket 6 the launcher
+builds the game in about 20 minutes and the game starts on its GPU (Turnip);
+playing it through is still being tested. mm3-recomp itself is a work in
+progress, so expect rough edges, and back up your saves.
 
 ## If something goes wrong
 
