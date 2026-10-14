@@ -95,7 +95,7 @@ ninja="$(ls -d "$data"/toolchain/ninja-*/ninja)"
 build="$work/build"
 "$cmake" -S "$src" -B "$build" -G Ninja -DCMAKE_MAKE_PROGRAM="$ninja" \
     -DCMAKE_TOOLCHAIN_FILE="$toolchain" -DCMAKE_BUILD_TYPE=Release -DMM3_LAUNCHER_ONLY=ON \
-    -DCMAKE_EXE_LINKER_FLAGS=-s \
+    -DCMAKE_EXE_LINKER_FLAGS_RELEASE=-s \
     -DFETCHCONTENT_SOURCE_DIR_RMLUI="$src/third_party/rmlui" \
     -DFETCHCONTENT_SOURCE_DIR_FREETYPE="$src/third_party/freetype" \
     -DFETCHCONTENT_FULLY_DISCONNECTED=ON

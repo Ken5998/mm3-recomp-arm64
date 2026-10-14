@@ -325,7 +325,9 @@ set(CMAKE_C_COMPILER "{llvm}/clang")
 set(CMAKE_CXX_COMPILER "{llvm}/clang++")
 set(CMAKE_C_COMPILER_TARGET aarch64-linux-gnu)
 set(CMAKE_CXX_COMPILER_TARGET aarch64-linux-gnu)
-set(_mm3_link "-fuse-ld=lld --ld-path={bin_dir}/ld.lld -static-libstdc++ -static-libgcc")
+# An RPATH rather than a RUNPATH: it also serves the libraries the game
+# loads from lib/ (vkd3d-utils loads vkd3d, d3d11 loads dxgi).
+set(_mm3_link "-fuse-ld=lld --ld-path={bin_dir}/ld.lld -static-libstdc++ -static-libgcc -Wl,--disable-new-dtags")
 set(CMAKE_EXE_LINKER_FLAGS_INIT "${{_mm3_link}}")
 set(CMAKE_SHARED_LINKER_FLAGS_INIT "${{_mm3_link}}")
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
@@ -451,9 +453,7 @@ def compile_game(tools: dict[str, Path], toolchain: Path) -> Path:
     run([cmake, "-S", SOURCE, "-B", build, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}",
          f"-DCMAKE_TOOLCHAIN_FILE={toolchain}", "-DCMAKE_BUILD_TYPE=Release",
          "-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG", "-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG",
-         # lib/ for the game and, as an RPATH rather than a RUNPATH, for the
-         # libraries it loads too (vkd3d-utils loads vkd3d, d3d11 loads dxgi).
-         "-DCMAKE_BUILD_RPATH=$ORIGIN/../lib", "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--disable-new-dtags",
+         "-DCMAKE_BUILD_RPATH=$ORIGIN/../lib",
          f"-DFETCHCONTENT_SOURCE_DIR_RMLUI={SOURCE / 'third_party/rmlui'}",
          f"-DFETCHCONTENT_SOURCE_DIR_FREETYPE={SOURCE / 'third_party/freetype'}",
          "-DFETCHCONTENT_FULLY_DISCONNECTED=ON"], cwd=SOURCE)
