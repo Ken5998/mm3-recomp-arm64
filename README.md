@@ -53,9 +53,9 @@ is installed, the build reuses its LLVM instead of downloading it again.
 ## Status
 
 This is an early release of the port. On a Retroid Pocket 6 the launcher
-builds the game in about 20 minutes, and the game plays its intros on the
-handheld's GPU (Turnip) and then stops on its first loading screen, which is
-being worked on. mm3-recomp itself is a work in progress, so expect rough
+builds the game in about 20 minutes, and the game starts on the handheld's
+GPU (Turnip) and reaches its menus. Drawing the menus and races, and audio
+that keeps up with real time, are being worked on. mm3-recomp itself is a work in progress, so expect rough
 edges, and back up your saves.
 
 ## If something goes wrong
