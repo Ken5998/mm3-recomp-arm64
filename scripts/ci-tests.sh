@@ -3,7 +3,8 @@
 # a handheld (package-launcher.sh sets it up) and runs them: the device
 # register traps, the D3D11 renderer on DXVK, the OpenGL D3D8 path, audio
 # decoding and the x87 and MMX helpers. The renderer and D3D8 tests need a
-# display and drivers (Xvfb, lavapipe, llvmpipe); without them they skip.
+# display and drivers (Xvfb, lavapipe, llvmpipe): with DISPLAY set, a test
+# that skips counts as failed.
 #
 #   scripts/ci-tests.sh SOURCE   (SOURCE made by prepare-source.sh)
 #
@@ -25,6 +26,7 @@ tests=(
     dsp cpu_helpers fist fp_precision mmx_rounding nv2a_combiner nv2a_vsh
 )
 failed=()
+summary=()
 for test in "${tests[@]}"; do
     echo "::group::$test"
     build="$work/$test"
@@ -33,14 +35,18 @@ for test in "${tests[@]}"; do
             -DCMAKE_MAKE_PROGRAM="$ninja" -DCMAKE_TOOLCHAIN_FILE="$toolchain" \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE=-O2 -DCMAKE_CXX_FLAGS_RELEASE=-O2 \
         && "$ninja" -C "$build" \
-        && (cd "$build" && "$ctest" --output-on-failure --timeout 600); then
+        && (cd "$build" && "$ctest" --output-on-failure --timeout 600 | tee "$build/ctest.log") \
+        && { [ -z "${DISPLAY:-}" ] || ! grep -q "Skipped\|Not Run" "$build/ctest.log"; }; then
         echo "::endgroup::"
+        summary+=("passed  $test: $(grep -c ' Passed ' "$build/ctest.log") ctest tests")
     else
         echo "::endgroup::"
         echo "::error::$test failed"
         failed+=("$test")
+        summary+=("FAILED  $test")
     fi
 done
+printf '%s\n' "${summary[@]}"
 rm -rf "$work"
 if [ "${#failed[@]}" -gt 0 ]; then
     echo "Failed: ${failed[*]}" >&2
