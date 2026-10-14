@@ -36,7 +36,7 @@ packages=(
 # Only for building DXVK and vkd3d; not copied into the sysroot.
 tools=(
     g++-14 meson ninja-build glslang-tools git ca-certificates curl xz-utils python3
-    autoconf automake libtool make bison flex mingw-w64-tools spirv-headers
+    autoconf automake libtool make bison flex mingw-w64-tools spirv-headers libjson-perl
 )
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
