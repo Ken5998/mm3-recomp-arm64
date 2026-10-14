@@ -1,0 +1,55 @@
+name: ARM64 sysroot
+
+# Builds the ARM64 sysroot (scripts/build-sysroot.sh) and publishes it as
+# release sysroot-VERSION. scripts/pin-sysroot.py then pins it in
+# toolchain.json, from where the launcher downloads it. Run it again only to
+# refresh the sysroot; launcher releases keep the one pinned.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    container: ubuntu:24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the ARM64 sysroot
+        run: scripts/build-sysroot.sh out/sysroot "$(date -u +%Y.%m.%d).$GITHUB_RUN_NUMBER"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: arm64-sysroot
+          path: out/sysroot/
+          retention-days: 3
+          compression-level: 0
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
+        with:
+          name: arm64-sysroot
+          path: out/sysroot
+      - name: Publish the sysroot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="$(ls out/sysroot/mm3-arm64-sysroot-*.tar.xz)"
+          name="$(basename "$archive" .tar.xz)"
+          version="${name#mm3-arm64-sysroot-}"
+          sha256="$(sha256sum "$archive" | cut -d' ' -f1)"
+          cat > notes.md <<NOTES
+          The ARM64 sysroot the launcher downloads to build Midtown Madness 3 on a handheld: Ubuntu 24.04 arm64 packages (glibc 2.39, GCC 14's libstdc++, SDL2, epoxy, OpenSSL and Vulkan development files, pkgconf) with DXVK-native 2.7.1 and vkd3d 2.0 built from source. It holds no game files.
+
+          The packages and versions inside are in $name.packages.txt, and each one's licence in usr/share/doc. The Ubuntu packages' sources are on https://launchpad.net/ubuntu; DXVK's on https://github.com/doitsujin/dxvk and vkd3d's on https://gitlab.winehq.org/wine/vkd3d.
+
+          Pin it with \`scripts/pin-sysroot.py $name.tar.xz\`. SHA-256: \`$sha256\`
+          NOTES
+          gh release create "sysroot-$version" "$archive" "out/sysroot/$name.packages.txt" \
+            --title "ARM64 sysroot $version" --notes-file notes.md --latest=false

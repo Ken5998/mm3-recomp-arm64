@@ -1,0 +1,81 @@
+name: ARM64 CI
+
+# Builds the ARM64 sysroot (scripts/build-sysroot.sh), then, in a bare
+# Fedora 44 (the release ArmadaOS is built on) on GitHub's ARM64 runner, sets
+# up the build tools exactly as the launcher does on a handheld, packages the
+# launcher with them and runs the runtime's tests built with them. No game
+# files are involved: the game is only ever built on the player's handheld.
+
+on:
+  push:
+    branches: ['**']
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sysroot:
+    runs-on: ubuntu-24.04-arm
+    container: ubuntu:24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the ARM64 sysroot
+        run: scripts/build-sysroot.sh out/sysroot
+      - uses: actions/upload-artifact@v7
+        with:
+          name: arm64-sysroot
+          path: out/sysroot/
+          retention-days: 3
+          compression-level: 0
+
+  launcher:
+    needs: sysroot
+    runs-on: ubuntu-24.04-arm
+    container: registry.fedoraproject.org/fedora:44
+    timeout-minutes: 90
+    steps:
+      # No compilers or development files, as on ArmadaOS: the launcher brings
+      # them. The libraries a handheld has, and a virtual display with Mesa's
+      # software drivers for the renderer tests.
+      - name: Install git, Python and a desktop's libraries
+        run: |
+          dnf install -y --setopt=install_weak_deps=False git-core python3 tar xz gzip \
+            findutils zlib-ng-compat sdl2-compat vulkan-loader mesa-vulkan-drivers \
+            mesa-dri-drivers mesa-libGL mesa-libEGL libglvnd-glx xorg-x11-server-Xvfb \
+            openssl-libs fontconfig dejavu-sans-fonts
+      - uses: actions/checkout@v5
+      # The launcher's data folder, where it keeps the build tools.
+      - name: Keep the launcher's data in the workspace
+        run: echo "XDG_DATA_HOME=$GITHUB_WORKSPACE/.data" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v7
+        with:
+          name: arm64-sysroot
+          path: out/sysroot
+      - uses: actions/cache@v4
+        with:
+          path: .data/MidtownMadness3/toolchain
+          key: device-tools-${{ hashFiles('toolchain.json') }}
+      - name: Check out upstream and apply the patches
+        run: scripts/prepare-source.sh "$RUNNER_TEMP/mm3-recomp"
+      - name: Use the sysroot built above
+        run: |
+          scripts/pin-sysroot.py out/sysroot/mm3-arm64-sysroot-*.tar.xz --local "$RUNNER_TEMP/sysroot.json"
+          echo "MM3_TOOLCHAIN_OVERRIDE=$RUNNER_TEMP/sysroot.json" >> "$GITHUB_ENV"
+      - name: Package the launcher with the device's build tools
+        run: scripts/package-launcher.sh "$RUNNER_TEMP/mm3-recomp" out/launcher
+      - name: Build and run the runtime tests
+        run: |
+          Xvfb :99 -screen 0 1280x720x24 &
+          export DISPLAY=:99 SDL_AUDIODRIVER=dummy
+          scripts/ci-tests.sh "$RUNNER_TEMP/mm3-recomp"
+      - name: Setup log
+        if: failure()
+        run: tail -n 60 "$XDG_DATA_HOME/MidtownMadness3/logs/build.log" || true
+      - uses: actions/upload-artifact@v7
+        with:
+          name: MidtownMadness3-Launcher-linux-arm64
+          path: out/launcher/MidtownMadness3-Launcher-linux-arm64.tar.gz
+          retention-days: 7
