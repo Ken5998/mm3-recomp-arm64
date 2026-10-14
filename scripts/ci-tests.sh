@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Builds xboxrecomp's runtime tests with the toolchain the launcher installs on
 # a handheld (package-launcher.sh sets it up) and runs them: the device
-# register traps, the D3D11 renderer on DXVK, the OpenGL D3D8 path, audio
-# decoding and the x87 and MMX helpers. The renderer and D3D8 tests need a
-# display and drivers (Xvfb, lavapipe, llvmpipe): with DISPLAY set, a test
-# that skips counts as failed.
+# register traps, the D3D11 renderer on DXVK, audio decoding and DSP, and the
+# x87 and MMX helpers; d3d8_smoke, whose checks are Windows only, builds the
+# whole runtime. The renderer test needs a display and a Vulkan driver (Xvfb
+# and lavapipe): with DISPLAY set, a test that skips counts as failed.
 #
 #   scripts/ci-tests.sh SOURCE   (SOURCE made by prepare-source.sh)
 #
@@ -38,7 +38,7 @@ for test in "${tests[@]}"; do
         && (cd "$build" && "$ctest" --output-on-failure --timeout 600 | tee "$build/ctest.log") \
         && { [ -z "${DISPLAY:-}" ] || ! grep -q "Skipped\|Not Run" "$build/ctest.log"; }; then
         echo "::endgroup::"
-        summary+=("passed  $test: $(grep -c ' Passed ' "$build/ctest.log") ctest tests")
+        summary+=("passed  $test: $(grep -c ' Passed ' "$build/ctest.log" || true) tests")
     else
         echo "::endgroup::"
         echo "::error::$test failed"

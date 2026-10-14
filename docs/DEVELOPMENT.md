@@ -21,7 +21,7 @@ not be published ([LEGAL.md](../LEGAL.md)).
 | `scripts/pin-sysroot.py ARCHIVE` | Pins a published sysroot in `toolchain.json`; with `--local` writes an override for one built locally (`MM3_TOOLCHAIN_OVERRIDE`). |
 | `scripts/package-launcher.sh SOURCE OUTDIR` | On ARM64 Linux: sets up the build tools as the launcher does, builds `mm3-launcher` with them and packages it with `setup/` (the setup, the pins, the icon and the patched source, with RmlUi, FreeType and the pinned translator so the handheld builds offline). |
 | `scripts/ci-tests.sh SOURCE` | Builds the runtime's tests with the launcher's build tools and runs them. |
-| `.github/workflows/ci.yml` | On every push: builds the sysroot, then on GitHub's `ubuntu-24.04-arm` runner in a bare Fedora 44 (the base of ArmadaOS) packages the launcher with that sysroot and runs 13 runtime tests, the DXVK renderer and OpenGL ones on Xvfb with Mesa's software drivers. |
+| `.github/workflows/ci.yml` | On every push: builds the sysroot, then on GitHub's `ubuntu-24.04-arm` runner in a bare Fedora 44 (the base of ArmadaOS) packages the launcher with that sysroot, builds the runtime with the launcher's build tools and runs its tests, the DXVK renderer's on Xvfb with Mesa's lavapipe. |
 | `.github/workflows/sysroot.yml` | On demand: publishes the sysroot as release `sysroot-VERSION`. |
 | `.github/workflows/release.yml` | On demand: publishes the launcher as release `vVERSION` (the `VERSION` file). |
 
