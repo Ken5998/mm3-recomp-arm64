@@ -53,9 +53,10 @@ is installed, the build reuses its LLVM instead of downloading it again.
 ## Status
 
 This is an early release of the port. On a Retroid Pocket 6 the launcher
-builds the game in about 20 minutes and the game starts on its GPU (Turnip);
-playing it through is still being tested. mm3-recomp itself is a work in
-progress, so expect rough edges, and back up your saves.
+builds the game in about 20 minutes, and the game plays its intros on the
+handheld's GPU (Turnip) and then stops on its first loading screen, which is
+being worked on. mm3-recomp itself is a work in progress, so expect rough
+edges, and back up your saves.
 
 ## If something goes wrong
 
