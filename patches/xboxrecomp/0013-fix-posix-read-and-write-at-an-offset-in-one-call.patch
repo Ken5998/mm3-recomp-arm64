@@ -1,0 +1,61 @@
+From 26b621430661e2974610125d6a73dc1046fb79a3 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:00:40 +0000
+Subject: [PATCH 13/13] fix(posix): read and write at an offset in one call
+
+NtReadFile at an offset was a seek and a read, so a second thread reading the
+same handle between them moved the first one's data. ReadFile with an
+OVERLAPPED offset, which the Windows backend uses, is one call; pread and
+pwrite are its POSIX equivalent, and the file pointer still ends after the
+data as it does there.
+---
+ src/kernel/kernel_file.c | 29 +++++++++++++++++++++--------
+ 1 file changed, 21 insertions(+), 8 deletions(-)
+
+diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
+index 18eaabc..7e4822d 100644
+--- a/src/kernel/kernel_file.c
++++ b/src/kernel/kernel_file.c
+@@ -896,10 +896,18 @@ NTSTATUS __stdcall xbox_NtReadFile(
+         return STATUS_INVALID_HANDLE;
+     }
+ 
+-    if (ByteOffset && ByteOffset->QuadPart >= 0)
+-        lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
+-
+-    ssize_t n = read(fd, Buffer, Length);
++    /* At an offset, read there in one call, as ReadFile with an OVERLAPPED
++     * does: a seek and a read are two, and a second thread reading the same
++     * handle between them moves the first one's data. The file pointer still
++     * ends after the data, as it does on Windows. */
++    ssize_t n;
++    if (ByteOffset && ByteOffset->QuadPart >= 0) {
++        n = pread(fd, Buffer, Length, (off_t)ByteOffset->QuadPart);
++        if (n >= 0)
++            lseek(fd, (off_t)ByteOffset->QuadPart + n, SEEK_SET);
++    } else {
++        n = read(fd, Buffer, Length);
++    }
+     if (n < 0) {
+         XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
+         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+@@ -932,10 +940,15 @@ NTSTATUS __stdcall xbox_NtWriteFile(
+         return STATUS_INVALID_HANDLE;
+     }
+ 
+-    if (ByteOffset && ByteOffset->QuadPart >= 0)
+-        lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
+-
+-    ssize_t n = write(fd, Buffer, Length);
++    /* In one call at an offset, for the reason NtReadFile gives. */
++    ssize_t n;
++    if (ByteOffset && ByteOffset->QuadPart >= 0) {
++        n = pwrite(fd, Buffer, Length, (off_t)ByteOffset->QuadPart);
++        if (n >= 0)
++            lseek(fd, (off_t)ByteOffset->QuadPart + n, SEEK_SET);
++    } else {
++        n = write(fd, Buffer, Length);
++    }
+     if (n < 0) {
+         XBOX_TRACE(XBOX_LOG_FILE, "NtWriteFile(handle=%p) errno=%d", FileHandle, errno);
+         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;

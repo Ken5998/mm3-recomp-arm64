@@ -1,0 +1,48 @@
+From e9f69162dad481ac2f674c72f9c892d044ee6dab Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:00:52 +0000
+Subject: [PATCH 5/6] fix(linux): build the runtime with msvc's integer and
+ char semantics
+
+Only the translated code was built with -fno-strict-aliasing, -fwrapv and
+-ffp-contract=off; the runtime it calls got GCC's and Clang's defaults, which
+MSVC does not share: strict aliasing, signed overflow as undefined, and on
+arm64 an unsigned char. The runtime's DSP56300 interpreter comes from xemu,
+which QEMU builds with -fwrapv and -fno-strict-aliasing. Everything is now
+built the way the code was written to be, with a signed char as on x86.
+---
+ CMakeLists.txt | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 25b15bf..b741889 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -23,6 +23,16 @@ if(MM3_TRACY)
+     add_subdirectory("${MM3_TRACY_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/tracy" EXCLUDE_FROM_ALL)
+ endif()
+ 
++# GCC and Clang build everything with the semantics the code was written
++# against under MSVC: memory read through any type, wrapping signed
++# arithmetic, a signed char (unsigned by default on arm64), and no fused
++# multiply-adds (arm64 compilers fuse by default, which moves the physics off
++# the x86 results). The runtime's DSP56300 interpreter comes from xemu, which
++# QEMU builds with -fwrapv and -fno-strict-aliasing too.
++if(NOT MSVC)
++    add_compile_options(-fno-strict-aliasing -fwrapv -fsigned-char -ffp-contract=off)
++endif()
++
+ if(NOT MM3_LAUNCHER_ONLY)
+     add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
+ endif()
+@@ -270,10 +280,6 @@ endif()
+ if(MSVC)
+     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
+ else()
+-    # The translated code keeps what MSVC gives it: memory read through any
+-    # type, wrapping signed arithmetic, and no fused multiply-adds (arm64
+-    # compilers fuse by default, which moves the physics off the x86 results).
+-    target_compile_options(${PROJECT_NAME} PRIVATE -fno-strict-aliasing -fwrapv -ffp-contract=off)
+     # The translated runtime entries (recomp_runtime_entries.c) hold
+     # unreachable tail jumps to functions nothing declares; MSVC warns about
+     # the implicit declarations, Clang 16 and GCC 14 refuse them.
