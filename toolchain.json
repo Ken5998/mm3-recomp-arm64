@@ -1,0 +1,84 @@
+{
+  "llvm": {
+    "label": "LLVM 20.1.8",
+    "version": "20.1.8",
+    "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/LLVM-20.1.8-Linux-ARM64.tar.xz",
+    "sha256": "b855cc17d935fdd83da82206b7a7cfc680095efd1e9e8182c4a05e761958bef8",
+    "size": 1859437192,
+    "strip": 1,
+    "members": [
+      "bin/clang",
+      "bin/clang++",
+      "bin/clang-20",
+      "bin/lld",
+      "bin/ld.lld",
+      "lib/clang/20/include/"
+    ],
+    "check": [
+      "bin/clang-20",
+      "bin/lld",
+      "lib/clang/20/include/stddef.h"
+    ],
+    "borrow": [
+      ".local/share/PinyonShift/source/*/.local/toolchain/llvm-20.1.8-linux-aarch64"
+    ]
+  },
+  "cmake": {
+    "label": "CMake 3.31.10",
+    "version": "3.31.10",
+    "url": "https://github.com/Kitware/CMake/releases/download/v3.31.10/cmake-3.31.10-linux-aarch64.tar.gz",
+    "sha256": "a343c6294f770742904e6a6792e0956b5ff8212abfb63cac99237de2e210fa0f",
+    "size": 56317563,
+    "strip": 1,
+    "members": [
+      "bin/cmake",
+      "bin/ctest",
+      "share/cmake-3.31/"
+    ]
+  },
+  "ninja": {
+    "label": "Ninja 1.13.2",
+    "version": "1.13.2",
+    "url": "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-linux-aarch64.zip",
+    "sha256": "fd2cacc8050a7f12a16a2e48f9e06fca5c14fc4c2bee2babb67b58be17a607fc",
+    "size": 126256
+  },
+  "python": {
+    "label": "Python 3.13",
+    "version": "3.13.16",
+    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261003/cpython-3.13.16%2B20261003-aarch64-unknown-linux-gnu-install_only.tar.gz",
+    "sha256": "6477121f22904963a066ac8ff89983baae781510815590e894daa3c11ce86652",
+    "size": 57628954,
+    "strip": 1
+  },
+  "capstone": {
+    "label": "Capstone 5.0.9",
+    "version": "5.0.9",
+    "url": "https://files.pythonhosted.org/packages/45/d9/dbeadb9fcd461e608ce79b1cb647fed6baa812fa6e1c68b0ba5ef81291af/capstone-5.0.9-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+    "sha256": "41772ad0c71aa5d3e97d541e802593c2e71fb94ac7e20d4202f97ce2a3eb8ed5",
+    "size": 1461016,
+    "members": [
+      "capstone/",
+      "capstone.libs/"
+    ]
+  },
+  "pillow": {
+    "label": "Pillow 12.0.0",
+    "version": "12.0.0",
+    "url": "https://files.pythonhosted.org/packages/20/39/c685d05c06deecfd4e2d1950e9a908aa2ca8bc4e6c3b12d93b9cafbd7837/pillow-12.0.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+    "sha256": "0b817e7035ea7f6b942c13aa03bb554fc44fea70838ea21f8eb31c638326584e",
+    "size": 6345553,
+    "members": [
+      "PIL/",
+      "pillow.libs/"
+    ]
+  },
+  "runtime_libraries": [
+    "libdxvk_d3d11.so.0",
+    "libdxvk_dxgi.so.0",
+    "libvkd3d-utils.so.1",
+    "libvkd3d.so.1",
+    "libvkd3d-shader.so.1",
+    "libepoxy.so.0"
+  ]
+}

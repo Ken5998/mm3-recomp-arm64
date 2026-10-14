@@ -1,0 +1,7 @@
+out/
+.data/
+__pycache__/
+*.iso
+*.xiso
+game_files/
+default.xbe

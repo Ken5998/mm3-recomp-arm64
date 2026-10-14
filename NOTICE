@@ -1,0 +1,39 @@
+mm3-recomp-arm64
+================
+
+ARM64 Linux port of mm3-recomp: patches, scripts and a launcher that build
+Midtown Madness 3 on an ARM64 handheld from the player's own disc.
+
+This repository's own files are licensed under the GNU General Public
+License, version 3 (LICENSE), the licence of the project they patch.
+
+It builds on, and its patches modify:
+
+- mm3-recomp, https://github.com/MattSG/mm3-recomp
+  Copyright the mm3-recomp contributors. GPL-3.0-only.
+- xboxrecomp (MattSG's fork, https://github.com/MattSG/xboxrecomp, of
+  https://github.com/sp00nznet/xboxrecomp)
+  Copyright (c) 2026 sp00nz and contributors. MIT; the parts derived from
+  xemu are LGPL-2.1-or-later (tools/xboxrecomp/LICENSES in the source).
+
+The launcher's source payload also carries, unmodified:
+
+- RmlUi 6.3, https://github.com/mikke89/RmlUi (MIT)
+- FreeType 2.13.3, https://freetype.org (FreeType License)
+
+The ARM64 sysroot the launcher downloads (releases named sysroot-*) holds
+Ubuntu 24.04 arm64 packages, each with its licence in usr/share/doc, and
+builds of:
+
+- DXVK 2.7.1, https://github.com/doitsujin/dxvk (zlib licence)
+- vkd3d 2.0, https://gitlab.winehq.org/wine/vkd3d (LGPL-2.1-or-later)
+
+On the handheld the launcher also downloads, from their own publishers, LLVM
+(Apache-2.0 WITH LLVM-exception), CMake (BSD-3-Clause), Ninja (Apache-2.0),
+Python (PSF-2.0, python-build-standalone), Capstone (BSD-3-Clause) and
+Pillow (MIT-CMU).
+
+Midtown Madness 3 is a trademark of its rights holders. This is an
+unofficial community project, not affiliated with or endorsed by Microsoft,
+Xbox, Digital Illusions CE (DICE) or the game's other rights holders. No
+game files are part of this repository or its releases.
