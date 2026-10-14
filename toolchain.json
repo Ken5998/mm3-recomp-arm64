@@ -12,11 +12,14 @@
       "bin/clang-20",
       "bin/lld",
       "bin/ld.lld",
+      "bin/llvm-ar",
+      "bin/llvm-ranlib",
       "lib/clang/20/include/"
     ],
     "check": [
       "bin/clang-20",
       "bin/lld",
+      "bin/llvm-ar",
       "lib/clang/20/include/stddef.h"
     ],
     "borrow": [

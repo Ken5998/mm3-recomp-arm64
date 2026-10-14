@@ -66,7 +66,7 @@ jobs:
           cat > notes.md <<NOTES
           Midtown Madness 3 for ARM64 Linux handhelds, such as the Retroid Pocket 6 on ArmadaOS, built from [mm3-recomp ${commit:0:7}](https://github.com/MattSG/mm3-recomp/commit/$commit).
 
-          On the handheld, in Desktop Mode: unpack $(basename "$archive"), start MidtownMadness3/mm3-launcher and choose your own disc image of Midtown Madness 3 (USA or Europe). The launcher checks it, downloads its build tools and the ARM64 sysroot $sysroot, builds the game on the handheld (about 10 GB free; keep it on the charger) and offers Play and Add to Steam. See the README for details.
+          On the handheld, in Desktop Mode: unpack $(basename "$archive"), start MidtownMadness3/mm3-launcher and choose your own disc image of Midtown Madness 3 (USA or Europe). The launcher checks it, downloads its build tools and the ARM64 sysroot $sysroot, builds the game on the handheld (about 6 GB free on top of the image's size; keep it on the charger) and offers Play and Add to Steam. See the README for details.
 
           No game files are included. SHA-256: \`$sha256\`
           NOTES

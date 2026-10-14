@@ -323,6 +323,8 @@ set(CMAKE_SYSTEM_PROCESSOR aarch64)
 set(CMAKE_SYSROOT "{sysroot}")
 set(CMAKE_C_COMPILER "{llvm}/clang")
 set(CMAKE_CXX_COMPILER "{llvm}/clang++")
+set(CMAKE_AR "{llvm}/llvm-ar" CACHE FILEPATH "")
+set(CMAKE_RANLIB "{llvm}/llvm-ranlib" CACHE FILEPATH "")
 set(CMAKE_C_COMPILER_TARGET aarch64-linux-gnu)
 set(CMAKE_CXX_COMPILER_TARGET aarch64-linux-gnu)
 # An RPATH rather than a RUNPATH: it also serves the libraries the game
