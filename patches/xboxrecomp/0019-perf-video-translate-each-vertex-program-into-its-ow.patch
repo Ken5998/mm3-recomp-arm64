@@ -1,0 +1,726 @@
+From 412ea79b81c60b8c83f4405fcdb76b442f647a97 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 14:42:35 +0000
+Subject: [PATCH 19/19] perf(video): translate each vertex program into its own
+ shader
+
+ub_vs interprets the vertex program per vertex, keeping the temporaries,
+inputs and outputs in arrays it indexes at run time. Adreno puts such
+arrays in memory, not registers: on the Retroid Pocket 6 the game ran at
+10-12 fps at 1280x720 with the GPU at 100%.
+
+Each program (the slots from the start slot to the final flag) now gets
+a variant written out by vs_source as straight-line HLSL, one block per
+instruction with every field a constant and every register its own
+variable, compiled on the pixel variants' workers. Draws keep using
+ub_vs until the variant is ready, so nothing changes on screen while it
+compiles. Pre-transformed draws get a variant of their own without the
+interpreter. RECOMP_VS_SPEC=0 turns this off, =sync compiles on the
+drawing thread (for tests).
+
+vkd3d's HLSL compiler is slow, so a variant leaves out what it cannot
+reach: the pixel shaders' source (vertex variants need nothing past
+ub_vs), the other kind of draw's branch and the operands an instruction
+does not read. A 30-instruction program compiles in about 150 ms instead
+of 1.4 s.
+
+With RECOMP_SHADER_CACHE naming a directory, every compiled shader
+(variants and the renderer's own) is kept there, keyed by a hash of its
+source, entry, target, defines and the build time, and later runs load it
+instead of compiling.
+
+tests/nv2a_vsh_gpu runs every case through the variants too (spec), adds
+min/max over an input and log, and checks the cache fills and loads.
+---
+ src/video/nv2a_d3d11.c            | 456 ++++++++++++++++++++++++++++--
+ tests/nv2a_vsh_gpu/CMakeLists.txt |  12 +
+ tests/nv2a_vsh_gpu/test_main.c    |  25 +-
+ 3 files changed, 475 insertions(+), 18 deletions(-)
+
+diff --git a/src/video/nv2a_d3d11.c b/src/video/nv2a_d3d11.c
+index 8378ae0..6468d33 100644
+--- a/src/video/nv2a_d3d11.c
++++ b/src/video/nv2a_d3d11.c
+@@ -27,6 +27,7 @@
+ #include "d3d11_posix.h"        /* DXVK-native, vkd3d's D3DCompile, pthreads */
+ #endif
+ #include <math.h>
++#include <stdarg.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -402,11 +403,22 @@ static const char s_hlsl[] =
+ "  if (isnan(f)) f = 1.0;\n"
+ "  return saturate(f);\n"
+ "}\n"
++/* VSPEC: a variant with one vertex program translated to straight-line code
++ * (vs_source), so no register is indexed dynamically; the program's text
++ * goes in at this marker. */
++"/*VSPEC_FN*/\n"
+ "PSIn ub_vs(uint vid : SV_VertexID) {\n"
+ "  PSIn o;\n"
+ "  float4 P, d0, d1, t0, t1, t2, t3;\n"
+ "  float fog = 1.0;\n"
+ "  if (ub_info.y) {\n"
++"#ifdef VSPEC\n"
++"#if VSPEC_PT\n"
++"    P = d0 = d1 = t0 = t1 = t2 = t3 = float4(0, 0, 0, 0);\n"
++"#else\n"
++"    vs_prog(vid, P, d0, d1, fog, t0, t1, t2, t3);\n"
++"#endif\n"
++"#else\n"
+ "    INPUT_LOOP for (uint i = 0; i < 16; i++) V[i] = fetch(i, vid);\n"
+ "    [unroll] for (uint j = 0; j < 13; j++) { R[j] = float4(0, 0, 0, 0); O[j] = float4(0, 0, 0, 0); }\n"
+ "    O[3].w = 1; O[4].w = 1; O[9].w = 1; O[10].w = 1; O[11].w = 1; O[12].w = 1;\n"
+@@ -461,13 +473,20 @@ static const char s_hlsl[] =
+ "    }\n"
+ "    P = R[12]; d0 = O[3]; d1 = O[4]; fog = ub_fog(O[5].x);\n"
+ "    t0 = O[9]; t1 = O[10]; t2 = O[11]; t3 = O[12];\n"
++"#endif\n"
+ "  } else {\n"
++/* A program's variant never draws pre-transformed, nor the pre-transformed
++ * variant (VSPEC_PT) a program: each leaves the other branch out. */
++"#if defined(VSPEC) && !VSPEC_PT\n"
++"    P = d0 = d1 = t0 = t1 = t2 = t3 = float4(0, 0, 0, 0);\n"
++"#else\n"
+ "    /* Pre-transformed: position (x, y, z, rhw), diffuse 3, specular 4,\n"
+ "     * texture coordinates 9-12. */\n"
+ "    float4 p0 = fetch(0, vid);\n"
+ "    P = float4(p0.xyz, at[0].w == 4u && p0.w > 0.0 ? 1.0 / p0.w : 1.0);\n"
+ "    d0 = fetch(3, vid); d1 = fetch(4, vid);\n"
+ "    t0 = fetch(9, vid); t1 = fetch(10, vid); t2 = fetch(11, vid); t3 = fetch(12, vid);\n"
++"#endif\n"
+ "  }\n"
+ "  float px = P.x;\n"
+ "  if (ub_info.z != 0xFFFFFFFFu) px += asfloat(VB.Load(ub_info.z + vid * 4u));\n"
+@@ -501,6 +520,8 @@ static const char s_hlsl[] =
+ "  o.t0 = t0; o.t1 = t1; o.t2 = t2; o.t3 = t3;\n"
+ "  return o;\n"
+ "}\n"
++/* A vertex variant needs nothing below: parsing it was most of its compile. */
++"#ifndef VSPEC\n"
+ /* SPEC: a variant specialised to one combiner configuration. The control
+  * words below become constants (SPEC_DECL) so the compiler folds the
+  * interpreter away; the cbuffer keeps its layout under other names. */
+@@ -879,7 +900,8 @@ static const char s_hlsl[] =
+ "  if (s > 1.0 && d < 1.0) { float x = d * s; d = x <= k ? x : k + (1.0 - k) * (1.0 - exp((k - x) / (1.0 - k))); }\n"
+ "  float y = (float)((uint)round(saturate(d) * 16777215.0) >> 8) / 65535.0;\n"
+ "  return float4(y, y, y, 1);\n"
+-"}\n";
++"}\n"
++"#endif\n";
+ 
+ typedef struct {
+     uint32_t c_icw[8], a_icw[8], c_ocw[8], a_ocw[8];
+@@ -913,13 +935,11 @@ typedef struct {
+ 
+ static void display_config(int now);
+ 
+-static ID3DBlob *compile_def(const char *entry, const char *target, const D3D_SHADER_MACRO *def)
++/* The renderer's HLSL as this platform compiles it. */
++static const char *hlsl_source(size_t *out_len)
+ {
+-    static const D3D_SHADER_MACRO vs_def[] = { { "RT_SAMPLES", "1u" }, { NULL, NULL } };
+-    ID3DBlob *code = NULL, *err = NULL;
+     const char *src = s_hlsl;
+     size_t len = sizeof s_hlsl - 1;
+-    HRESULT hr;
+ #if !defined(_WIN32)
+     /* vkd3d's HLSL compiler has no isnan(), and needs ub_vs's inputs
+      * written from a loop (INPUT_LOOP). */
+@@ -937,8 +957,103 @@ static ID3DBlob *compile_def(const char *entry, const char *target, const D3D_SH
+     }
+     if (posix_src) { src = posix_src; len = posix_len; }
+ #endif
++    *out_len = len;
++    return src;
++}
++
++/* ------------------------------------------------- compiled shader cache
++ * vkd3d's HLSL compiler takes from tens of milliseconds to seconds a shader,
++ * so with RECOMP_SHADER_CACHE naming a directory every compiled shader is
++ * kept there, named by a hash of its source, entry, target and defines and
++ * of this build's time (a new build starts afresh), and later runs load it
++ * instead of compiling. */
++typedef struct { ID3D10Blob iface; volatile LONG ref; SIZE_T size; } CacheBlob;
++static HRESULT STDMETHODCALLTYPE cache_blob_qi(ID3D10Blob *b, REFIID iid, void **out)
++{ (void)b; (void)iid; *out = NULL; return E_NOINTERFACE; }
++static ULONG STDMETHODCALLTYPE cache_blob_addref(ID3D10Blob *b)
++{ return (ULONG)InterlockedIncrement(&((CacheBlob *)b)->ref); }
++static ULONG STDMETHODCALLTYPE cache_blob_release(ID3D10Blob *b)
++{
++    LONG n = InterlockedDecrement(&((CacheBlob *)b)->ref);
++    if (!n) free(b);
++    return (ULONG)n;
++}
++static void *STDMETHODCALLTYPE cache_blob_ptr(ID3D10Blob *b) { return (CacheBlob *)b + 1; }
++static SIZE_T STDMETHODCALLTYPE cache_blob_size(ID3D10Blob *b) { return ((CacheBlob *)b)->size; }
++static ID3D10BlobVtbl s_cache_blob_vtbl = {
++    cache_blob_qi, cache_blob_addref, cache_blob_release, cache_blob_ptr, cache_blob_size };
++
++static uint64_t cache_hash(uint64_t h, const char *p, size_t n)
++{
++    while (n--) h = (h ^ (uint8_t)*p++) * 0x100000001b3ull;
++    return (h ^ 0xFF) * 0x100000001b3ull;           /* a separator */
++}
++
++/* The cache file for this compile, or 0 without a cache directory. */
++static int cache_path(char *path, size_t cap, const char *src, size_t len, const char *entry,
++                      const char *target, const D3D_SHADER_MACRO *def)
++{
++    static const char build[] = __DATE__ " " __TIME__;
++    const char *dir = getenv("RECOMP_SHADER_CACHE");
++    uint64_t h = 0xcbf29ce484222325ull;
++    if (!dir || !*dir) return 0;
++    h = cache_hash(h, build, sizeof build - 1);
++    h = cache_hash(h, src, len);
++    h = cache_hash(h, entry, strlen(entry));
++    h = cache_hash(h, target, strlen(target));
++    for (; def && def->Name; def++) {
++        h = cache_hash(h, def->Name, strlen(def->Name));
++        h = cache_hash(h, def->Definition ? def->Definition : "", def->Definition ? strlen(def->Definition) : 0);
++    }
++    return snprintf(path, cap, "%s/%016llx.dxbc", dir, (unsigned long long)h) < (int)cap;
++}
++
++static ID3DBlob *cache_load(const char *path)
++{
++    FILE *f = fopen(path, "rb");
++    CacheBlob *b = NULL;
++    long n;
++    if (!f) return NULL;
++    if (fseek(f, 0, SEEK_END) == 0 && (n = ftell(f)) > 4 && fseek(f, 0, SEEK_SET) == 0 &&
++        (b = (CacheBlob *)malloc(sizeof *b + (size_t)n)) != NULL) {
++        b->iface.lpVtbl = &s_cache_blob_vtbl;
++        b->ref = 1;
++        b->size = (SIZE_T)n;
++        if (fread(b + 1, 1, (size_t)n, f) != (size_t)n || memcmp(b + 1, "DXBC", 4)) {
++            free(b);
++            b = NULL;
++        }
++    }
++    fclose(f);
++    return b ? &b->iface : NULL;
++}
++
++/* Written beside the final name and renamed over it, so a reader never sees
++ * half a file. */
++static void cache_store(const char *path, ID3DBlob *code)
++{
++    char tmp[1100];
++    FILE *f;
++    size_t n = ID3D10Blob_GetBufferSize(code);
++    if (snprintf(tmp, sizeof tmp, "%s.%p.tmp", path, (void *)code) >= (int)sizeof tmp) return;
++    if (!(f = fopen(tmp, "wb"))) return;
++    if (fwrite(ID3D10Blob_GetBufferPointer(code), 1, n, f) != n) { fclose(f); remove(tmp); return; }
++    if (fclose(f) != 0 || rename(tmp, path) != 0) remove(tmp);
++}
++
++static ID3DBlob *compile_text(const char *src, size_t len, const char *entry,
++                              const char *target, const D3D_SHADER_MACRO *def)
++{
++    static const D3D_SHADER_MACRO vs_def[] = { { "RT_SAMPLES", "1u" }, { NULL, NULL } };
++    ID3DBlob *code = NULL, *err = NULL;
++    HRESULT hr;
++    char path[1024];
++    int cached;
+     if (!def && target[0] == 'v')
+         def = vs_def;
++    cached = cache_path(path, sizeof path, src, len, entry, target, def);
++    if (cached && (code = cache_load(path)) != NULL)
++        return code;
+     hr = D3DCompile(src, len, "nv2a_d3d11", def, NULL,
+                     entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                     &code, &err);
+@@ -948,9 +1063,17 @@ static ID3DBlob *compile_def(const char *entry, const char *target, const D3D_SH
+         fflush(stderr);
+     }
+     if (err) ID3D10Blob_Release(err);
++    if (SUCCEEDED(hr) && code && cached) cache_store(path, code);
+     return SUCCEEDED(hr) ? code : NULL;
+ }
+ 
++static ID3DBlob *compile_def(const char *entry, const char *target, const D3D_SHADER_MACRO *def)
++{
++    size_t len;
++    const char *src = hlsl_source(&len);
++    return compile_text(src, len, entry, target, def);
++}
++
+ static ID3DBlob *compile(const char *entry, const char *target)
+ {
+     return compile_def(entry, target, NULL);
+@@ -986,6 +1109,36 @@ static CRITICAL_SECTION s_spec_cs;
+ static CONDITION_VARIABLE s_spec_cv;
+ static volatile LONG s_spec_ready;
+ 
++/* ------------------------------------------------- specialised vertex shaders
++ * ub_vs interprets the vertex program per vertex, keeping the temporaries,
++ * inputs and outputs in arrays it indexes at run time. Mobile GPUs (Adreno)
++ * put such arrays in memory rather than registers, and the interpreter was
++ * most of a frame's GPU time there. Each program (the slots from the start
++ * slot to the final flag) gets a variant translated to straight-line code by
++ * vs_source, compiled on the same workers as the pixel variants; draws use
++ * ub_vs until it is ready. A variant with no program serves pre-transformed
++ * draws. Constants, input formats and everything else stay in the cbuffers.
++ * RECOMP_VS_SPEC=0 disables this; =sync compiles on the drawing thread. */
++#define VS_SPEC_MAX 136             /* program slots */
++typedef struct {
++    uint32_t n;                     /* instructions; 0 for pre-transformed */
++    uint32_t w[VS_SPEC_MAX][4];
++} VsKey;
++
++typedef struct {
++    VsKey key;
++    volatile LONG state;            /* 0 empty, 1 queued, 2 ready, 3 failed */
++    ID3D11VertexShader *vs;         /* valid once state is 2 */
++} VsSpec;
++
++#define VS_SPEC_SLOTS 1024          /* power of two */
++#define VS_SPEC_QUEUE 256
++static VsSpec *s_vspec;
++static VsSpec *s_vspec_q[VS_SPEC_QUEUE];
++static unsigned s_vspec_head, s_vspec_tail;  /* guarded by s_spec_cs */
++static volatile LONG s_vspec_ready;
++static void vs_compile(VsSpec *e);
++
+ static DWORD WINAPI spec_worker(LPVOID arg)
+ {
+     (void)arg;
+@@ -997,8 +1150,14 @@ static DWORD WINAPI spec_worker(LPVOID arg)
+         int flat;
+         D3D_SHADER_MACRO m[4];
+         EnterCriticalSection(&s_spec_cs);
+-        while (s_spec_head == s_spec_tail)
++        while (s_spec_head == s_spec_tail && s_vspec_head == s_vspec_tail)
+             SleepConditionVariableCS(&s_spec_cv, &s_spec_cs, INFINITE);
++        if (s_vspec_head != s_vspec_tail) {    /* vertex programs first */
++            VsSpec *v = s_vspec_q[s_vspec_tail++ % VS_SPEC_QUEUE];
++            LeaveCriticalSection(&s_spec_cs);
++            vs_compile(v);
++            continue;
++        }
+         e = s_spec_q[s_spec_tail++ % PS_SPEC_QUEUE];
+         LeaveCriticalSection(&s_spec_cs);
+         k = &e->key;
+@@ -1048,6 +1207,22 @@ static DWORD WINAPI spec_worker(LPVOID arg)
+     }
+ }
+ 
++/* The compile workers, shared by pixel and vertex variants; started once. */
++static int spec_start(void)
++{
++    static int started;
++    int threads = 2;
++    if (started) return 1;
++    started = 1;
++    InitializeCriticalSection(&s_spec_cs);
++    InitializeConditionVariable(&s_spec_cv);
++    while (threads--) {
++        HANDLE t = CreateThread(NULL, 0, spec_worker, NULL, 0, NULL);
++        if (t) { SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL); CloseHandle(t); }
++    }
++    return 1;
++}
++
+ /* The specialised shader for this configuration, or NULL (not ready yet). */
+ static ID3D11PixelShader *spec_ps(const PSConsts *pc, uint32_t variant)
+ {
+@@ -1058,18 +1233,10 @@ static ID3D11PixelShader *spec_ps(const PSConsts *pc, uint32_t variant)
+     PsSpec *e;
+     if (enabled < 0) {
+         const char *v = getenv("RECOMP_PS_SPEC");
+-        int threads = 2;
+         enabled = !(v && *v == '0');
+         if (enabled) s_spec = (PsSpec *)calloc(PS_SPEC_SLOTS, sizeof *s_spec);
+         if (!s_spec) enabled = 0;
+-        if (enabled) {
+-            InitializeCriticalSection(&s_spec_cs);
+-            InitializeConditionVariable(&s_spec_cv);
+-            while (threads--) {
+-                HANDLE t = CreateThread(NULL, 0, spec_worker, NULL, 0, NULL);
+-                if (t) { SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL); CloseHandle(t); }
+-            }
+-        }
++        if (enabled) enabled = spec_start();
+     }
+     if (!enabled) return NULL;
+     memset(&k, 0, sizeof k);
+@@ -1104,6 +1271,259 @@ static ID3D11PixelShader *spec_ps(const PSConsts *pc, uint32_t variant)
+     return NULL;
+ }
+ 
++/* Appends to a growing string; on overflow the text is dropped (len = cap). */
++typedef struct { char *p; size_t len, cap; } VsText;
++static void vt(VsText *t, const char *fmt, ...)
++{
++    va_list ap;
++    int n;
++    if (t->len >= t->cap) return;
++    va_start(ap, fmt);
++    n = vsnprintf(t->p + t->len, t->cap - t->len, fmt, ap);
++    va_end(ap);
++    t->len = n < 0 || (size_t)n >= t->cap - t->len ? t->cap : t->len + (size_t)n;
++}
++
++/* One operand as ub_vs's rd() reads it, with the fields as constants. */
++static void vs_operand(VsText *t, uint32_t swz, uint32_t neg, uint32_t mux, uint32_t reg,
++                       uint32_t vi, uint32_t ci, int rel)
++{
++    static const char comp[] = "xyzw";
++    char base[40];
++    if (mux == 1) snprintf(base, sizeof base, "R%u", reg < 13u ? reg : 0u);
++    else if (mux == 2) snprintf(base, sizeof base, "V%u", vi);
++    else if (rel) snprintf(base, sizeof base, "C[vs_ci(a0 + %u)]", ci);
++    else snprintf(base, sizeof base, "C[%u]", ci < 192u ? ci : 0u);
++    vt(t, "%s%s.%c%c%c%c", neg ? "-" : "", base, comp[(swz >> 6) & 3], comp[(swz >> 4) & 3],
++       comp[(swz >> 2) & 3], comp[swz & 3]);
++}
++
++static const char *vs_mask(uint32_t m)
++{
++    static const char *const names[16] = { "", "w", "z", "zw", "y", "yw", "yz", "yzw",
++        "x", "xw", "xz", "xzw", "xy", "xyw", "xyz", "xyzw" };
++    return names[m & 15u];
++}
++
++/* The HLSL of vs_prog for one program: ub_vs's loop body once per
++ * instruction, every field a constant, every register its own variable.
++ * Returns the text's length, or 0 if it did not fit. */
++static size_t vs_source(const VsKey *k, char *buf, size_t cap)
++{
++    VsText t = { buf, 0, cap };
++    uint32_t used = 0, s, i;
++    for (s = 0; s < k->n; s++) {
++        const uint32_t *w = k->w[s];
++        uint32_t mac = (w[1] >> 21) & 15u, ilu = (w[1] >> 25) & 7u;
++        if ((mac != 0u && ((w[2] >> 26) & 3u) == 2u) ||
++            ((mac == 2u || (mac >= 4u && mac <= 12u)) && ((w[2] >> 11) & 3u) == 2u) ||
++            ((mac == 3u || mac == 4u || ilu != 0u) && ((w[3] >> 28) & 3u) == 2u))
++            used |= 1u << ((w[1] >> 9) & 15u);
++    }
++    vt(&t, "uint vs_ci(int c) { return c >= 0 && c < 192 ? (uint)c : 0u; }\n"
++           "void vs_prog(uint vid, out float4 P, out float4 d0, out float4 d1, out float fog,\n"
++           "    out float4 t0, out float4 t1, out float4 t2, out float4 t3) {\n"
++           "  float4 R0 = 0, R1 = 0, R2 = 0, R3 = 0, R4 = 0, R5 = 0, R6 = 0, R7 = 0, R8 = 0,"
++           " R9 = 0, R10 = 0, R11 = 0, R12 = 0;\n"
++           "  float4 O3 = float4(0, 0, 0, 1), O4 = float4(0, 0, 0, 1), O5 = 0;\n"
++           "  float4 O9 = float4(0, 0, 0, 1), O10 = float4(0, 0, 0, 1), O11 = float4(0, 0, 0, 1),"
++           " O12 = float4(0, 0, 0, 1);\n"
++           "  int a0 = 0;\n");
++    for (i = 0; i < 16; i++)
++        if (used & (1u << i)) vt(&t, "  float4 V%u = fetch(%uu, vid);\n", i, i);
++    for (s = 0; s < k->n; s++) {
++        const uint32_t *w = k->w[s];
++        uint32_t mac = (w[1] >> 21) & 15u, ilu = (w[1] >> 25) & 7u, vi = (w[1] >> 9) & 15u;
++        uint32_t ci = (w[1] >> 13) & 255u;
++        int rel = (int)((w[3] >> 1) & 1u);
++        uint32_t mm = (w[3] >> 24) & 15u, im = (w[3] >> 16) & 15u, td = (w[3] >> 20) & 15u;
++        uint32_t om = (w[3] >> 12) & 15u, oa = (w[3] >> 3) & 255u;
++        uint32_t osel = (w[3] >> 2) & 1u;
++        /* Only what the instruction uses: vkd3d's compile time grows with
++         * the text, not just with what survives. */
++        int need_b = mac == 2u || (mac >= 4u && mac <= 12u);
++        int need_c = mac == 3u || mac == 4u || ilu != 0u;
++        int mac_w = mac != 0u && mac != 13u && mm != 0u && td < 13u && !(ilu != 0u && td == 1u);
++        int ilu_w = ilu != 0u && im != 0u && (mac ? 1u : td) < 13u;
++        /* Outputs vs_prog returns: oPos (R12), oD0, oD1, oFog, oT0-oT3. */
++        int out_w = om != 0u && ((w[3] >> 11) & 1u) && (osel ? ilu : mac) != 0u && oa < 13u &&
++                    (oa == 0u || (oa >= 3u && oa <= 5u) || oa >= 9u);
++        if (!mac_w && !ilu_w && !out_w && mac != 13u) continue;   /* writes nothing */
++        vt(&t, "  {");
++        if (mac != 0u) {
++            vt(&t, " float4 A = ");
++            vs_operand(&t, w[1] & 255u, (w[1] >> 8) & 1u, (w[2] >> 26) & 3u, (w[2] >> 28) & 15u, vi, ci, rel);
++            vt(&t, ";");
++        }
++        if (need_b) {
++            vt(&t, " float4 B = ");
++            vs_operand(&t, (w[2] >> 17) & 255u, (w[2] >> 25) & 1u, (w[2] >> 11) & 3u, (w[2] >> 13) & 15u,
++                       vi, ci, rel);
++            vt(&t, ";");
++        }
++        if (need_c) {
++            vt(&t, " float4 Cc = ");
++            vs_operand(&t, (w[2] >> 2) & 255u, (w[2] >> 10) & 1u, (w[3] >> 28) & 3u,
++                       ((w[2] & 3u) << 2) | (w[3] >> 30), vi, ci, rel);
++            vt(&t, ";");
++        }
++        if (mac != 0u && mac != 13u && (mac_w || (out_w && !osel))) {
++        vt(&t, "\n    float4 mr = ");
++        switch (mac) {
++        case 0: vt(&t, "float4(0, 0, 0, 0)"); break;
++        case 2: vt(&t, "A * B"); break;
++        case 3: vt(&t, "A + Cc"); break;
++        case 4: vt(&t, "A * B + Cc"); break;
++        case 5: vt(&t, "dot(A.xyz, B.xyz).xxxx"); break;
++        case 6: vt(&t, "(dot(A.xyz, B.xyz) + B.w).xxxx"); break;
++        case 7: vt(&t, "dot(A, B).xxxx"); break;
++        case 8: vt(&t, "float4(1.0, A.y * B.y, A.z, B.w)"); break;
++        case 9: vt(&t, "A < B ? A : B"); break;
++        case 10: vt(&t, "A >= B ? A : B"); break;
++        case 11: vt(&t, "A < B ? 1.0 : 0.0"); break;
++        case 12: vt(&t, "A >= B ? 1.0 : 0.0"); break;
++        default: vt(&t, "A"); break;
++        }
++        vt(&t, ";");
++        }
++        if (ilu != 0u && (ilu_w || (out_w && osel))) {
++        vt(&t, "\n    float x = Cc.x; float4 ir = ");
++        switch (ilu) {
++        case 0: vt(&t, "float4(0, 0, 0, 0)"); break;
++        case 2: vt(&t, "(x == 0.0 ? asfloat(0x7F800000u) : 1.0 / x).xxxx"); break;
++        case 3: vt(&t, "0; { float f = 1.0 / x; float af = clamp(abs(f), 5.42101e-20, 1.884467e19);"
++                       " ir = (f < 0 ? -af : af).xxxx; }"); break;
++        case 4: vt(&t, "(1.0 / sqrt(abs(x))).xxxx"); break;
++        case 5: vt(&t, "0; { float fl = floor(x); ir = float4(exp2(fl), x - fl, exp2(x), 1.0); }"); break;
++        case 6: vt(&t, "0; { float ax = abs(x);\n"
++                       "      if (ax == 0.0) ir = float4(-asfloat(0x7F800000u), 1.0, -asfloat(0x7F800000u), 1.0);\n"
++                       "      else { float e = floor(log2(ax)); ir = float4(e, ax / exp2(e), log2(ax), 1.0); } }");
++                break;
++        case 7: vt(&t, "0; { float nl = max(x, 0.0), nh = max(Cc.y, 0.0), p = clamp(Cc.w, -127.9961, 127.9961);\n"
++                       "      ir = float4(1.0, nl, x > 0.0 ? (p == 0.0 ? 1.0 : pow(nh, p)) : 0.0, 1.0); }");
++                break;
++        default: vt(&t, "Cc"); break;
++        }
++        vt(&t, ";");
++        }
++        vt(&t, "\n");
++        /* MAC 13 (ARL) runs the MAC: an output it selects takes A. */
++        if (mac == 13u && out_w && !osel) vt(&t, "    float4 mr = A;\n");
++        if (mac == 13u) vt(&t, "    a0 = (int)floor(A.x + 0.001);\n");
++        /* As ub_vs (and xemu): paired with an ILU op the MAC cannot write
++         * R1, and an output comes only from a unit that ran. */
++        if (mac_w)
++            vt(&t, "    R%u.%s = mr.%s;\n", td, vs_mask(mm), vs_mask(mm));
++        if (ilu_w)
++            vt(&t, "    R%u.%s = ir.%s;\n", mac ? 1u : td, vs_mask(im), vs_mask(im));
++        if (out_w) {
++            const char *ov = osel ? "ir" : "mr";
++            if (oa == 0u) vt(&t, "    R12.%s = %s.%s;\n", vs_mask(om), ov, vs_mask(om));
++            else vt(&t, "    O%u.%s = %s.%s;\n", oa, vs_mask(om), ov, vs_mask(om));
++        }
++        vt(&t, "  }\n");
++    }
++    vt(&t, "  P = R12; d0 = O3; d1 = O4; fog = ub_fog(O5.x);\n"
++           "  t0 = O9; t1 = O10; t2 = O11; t3 = O12;\n}\n");
++    return t.len < t.cap ? t.len : 0;
++}
++
++static void vs_compile(VsSpec *e)
++{
++    static const char marker[] = "/*VSPEC_FN*/";
++    const char *define = e->key.n ? "#define VSPEC 1\n#define VSPEC_PT 0\n"
++                                  : "#define VSPEC 1\n#define VSPEC_PT 1\n";
++    size_t dl = strlen(define);
++    size_t base_len, fn_len, head, cap = 256 * 1024;
++    const char *base = hlsl_source(&base_len);
++    const char *at = strstr(base, marker);
++    char *fn = (char *)malloc(cap), *src = NULL;
++    ID3DBlob *b = NULL;
++    fn_len = fn && at ? (e->key.n ? vs_source(&e->key, fn, cap) : (fn[0] = ' ', 1)) : 0;
++    if (fn_len) src = (char *)malloc(dl + base_len + fn_len + 1);
++    if (src) {
++        head = (size_t)(at - base);
++        memcpy(src, define, dl);
++        memcpy(src + dl, base, head);
++        memcpy(src + dl + head, fn, fn_len);
++        memcpy(src + dl + head + fn_len, at, base_len - head);
++        b = compile_text(src, dl + base_len + fn_len, "ub_vs", "vs_5_0", NULL);
++    }
++    if (b && SUCCEEDED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(b),
++                                                       ID3D10Blob_GetBufferSize(b), NULL, &e->vs))) {
++        LONG n;
++        InterlockedExchange(&e->state, 2);
++        n = InterlockedIncrement(&s_vspec_ready);
++        if (!(n & (n - 1)))
++            fprintf(stderr, "[D3D11] %ld specialised vertex programs\n", (long)n);
++    } else {
++        InterlockedExchange(&e->state, 3);
++    }
++    if (b) ID3D10Blob_Release(b);
++    free(src);
++    free(fn);
++}
++
++/* The specialised vertex shader for the program from slot start (NULL for a
++ * pre-transformed draw), or NULL if it is not ready yet. pver is the
++ * program memory's change counter: while it and start stay the same the
++ * last answer stands without hashing the program again. */
++static ID3D11VertexShader *spec_vs(const uint32_t (*prog)[4], uint32_t start, uint32_t pver)
++{
++    static int enabled = -1, sync;
++    static VsKey k;
++    static VsSpec *last;
++    static uint32_t last_start = 0xFFFFFFFFu, last_pver;
++    static int last_prog = -1;
++    uint32_t h = 2166136261u, i, words;
++    VsSpec *e;
++    if (enabled < 0) {
++        const char *v = getenv("RECOMP_VS_SPEC");
++        enabled = !(v && *v == '0');
++        sync = v && !strcmp(v, "sync");
++        if (enabled) s_vspec = (VsSpec *)calloc(VS_SPEC_SLOTS, sizeof *s_vspec);
++        if (!s_vspec) enabled = 0;
++        if (enabled && !sync) enabled = spec_start();
++    }
++    if (!enabled) return NULL;
++    if (last && last_prog == (prog != NULL) && (!prog || (start == last_start && pver == last_pver)))
++        return InterlockedCompareExchange(&last->state, 0, 0) == 2 ? last->vs : NULL;
++    memset(&k, 0, sizeof k);
++    if (prog)
++        for (i = start; i < VS_SPEC_MAX; i++) {
++            memcpy(k.w[k.n++], prog[i], 16);
++            if (prog[i][3] & 1u) break;
++        }
++    words = 1 + k.n * 4;
++    for (i = 0; i < words; i++) h = (h ^ ((const uint32_t *)&k)[i]) * 16777619u;
++    for (i = 0; i < VS_SPEC_SLOTS; i++) {
++        e = &s_vspec[(h + i) & (VS_SPEC_SLOTS - 1)];
++        if (!e->state) break;
++        if (!memcmp(&e->key, &k, sizeof k)) {
++            last = e; last_prog = prog != NULL; last_start = start; last_pver = pver;
++            return InterlockedCompareExchange(&e->state, 0, 0) == 2 ? e->vs : NULL;
++        }
++    }
++    if (i == VS_SPEC_SLOTS) return NULL;            /* table full: ub_vs */
++    if (sync) {
++        e->key = k;
++        e->state = 1;
++        vs_compile(e);
++        last = e; last_prog = prog != NULL; last_start = start; last_pver = pver;
++        return e->state == 2 ? e->vs : NULL;
++    }
++    EnterCriticalSection(&s_spec_cs);
++    if (s_vspec_head - s_vspec_tail < VS_SPEC_QUEUE) {
++        e->key = k;
++        e->state = 1;
++        s_vspec_q[s_vspec_head++ % VS_SPEC_QUEUE] = e;
++        WakeConditionVariable(&s_spec_cv);
++        last = e; last_prog = prog != NULL; last_start = start; last_pver = pver;
++    }
++    LeaveCriticalSection(&s_spec_cs);
++    return NULL;
++}
++
+ static ID3D11Buffer *make_buffer(UINT bytes, UINT bind)
+ {
+     D3D11_BUFFER_DESC d;
+@@ -3120,6 +3540,7 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
+     UINT total = 0, at = 0, ib_bytes = ni * 4;
+     float squeeze = 1.0f, shift = 0.0f, yscale = 1.0f;
+     int use_dx = 0;
++    ID3D11VertexShader *vs;
+     int64_t t_draw;
+ 
+     if (!nv2a_d3d_init() || !ni || hi < lo || ib_bytes > IB_BYTES)
+@@ -3233,6 +3654,7 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
+         const uint32_t (*prog)[4] = nv2a_vsh_program(&start, &pver);
+         const float (*consts)[4] = nv2a_vsh_constants(&cver);
+         uc.info[0] = start;
++        vs = spec_vs(prog, start, pver);
+         if (pver != s_prog_version) {
+             upload_cb(s_cb_prog, prog, NV_VSH_SLOTS * 16);
+             s_prog_version = pver;
+@@ -3241,6 +3663,8 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
+             upload_cb(s_cb_vconst, consts, 192 * 16);
+             s_vconst_version = cver;
+         }
++    } else {
++        vs = spec_vs(NULL, 0, 0);
+     }
+     uc.map[0] = 2.0f / (float)gw;
+     uc.map[1] = 2.0f / (float)gh;
+@@ -3271,7 +3695,7 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
+         ID3D11Buffer *vcb[4] = { s_cb_ub, NULL, s_cb_prog, s_cb_vconst };
+         ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+         ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib, DXGI_FORMAT_R32_UINT, s_ib_pos);
+-        ID3D11DeviceContext_VSSetShader(s_ctx, s_ub_vs, NULL, 0);
++        ID3D11DeviceContext_VSSetShader(s_ctx, vs ? vs : s_ub_vs, NULL, 0);
+         ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 4, vcb);
+         ID3D11DeviceContext_VSSetShaderResources(s_ctx, 0, 1, &s_raw_srv);
+         ID3D11DeviceContext_DrawIndexed(s_ctx, ni, 0, 0);
+diff --git a/tests/nv2a_vsh_gpu/CMakeLists.txt b/tests/nv2a_vsh_gpu/CMakeLists.txt
+index 5aacee0..ecc7873 100644
+--- a/tests/nv2a_vsh_gpu/CMakeLists.txt
++++ b/tests/nv2a_vsh_gpu/CMakeLists.txt
+@@ -22,4 +22,16 @@ enable_testing()
+ foreach(samples 1 4)
+     add_test(NAME nv2a_vsh_gpu_${samples}x COMMAND nv2a_vsh_gpu_test ${samples})
+     set_tests_properties(nv2a_vsh_gpu_${samples}x PROPERTIES SKIP_RETURN_CODE 77)
++    add_test(NAME nv2a_vsh_gpu_spec_${samples}x COMMAND nv2a_vsh_gpu_test ${samples} spec)
++    set_tests_properties(nv2a_vsh_gpu_spec_${samples}x PROPERTIES SKIP_RETURN_CODE 77)
+ endforeach()
++# The compiled shader cache: the first run fills it, the second loads from it.
++set(cache ${CMAKE_CURRENT_BINARY_DIR}/shader-cache)
++add_test(NAME nv2a_vsh_gpu_cache_fill COMMAND ${CMAKE_COMMAND} -E env RECOMP_SHADER_CACHE=${cache}
++    $<TARGET_FILE:nv2a_vsh_gpu_test> 1 spec)
++add_test(NAME nv2a_vsh_gpu_cache_load COMMAND ${CMAKE_COMMAND} -E env RECOMP_SHADER_CACHE=${cache}
++    $<TARGET_FILE:nv2a_vsh_gpu_test> 1 spec)
++set_tests_properties(nv2a_vsh_gpu_cache_fill PROPERTIES SKIP_RETURN_CODE 77 FIXTURES_SETUP shader_cache)
++set_tests_properties(nv2a_vsh_gpu_cache_load PROPERTIES SKIP_RETURN_CODE 77 FIXTURES_REQUIRED shader_cache)
++file(REMOVE_RECURSE ${cache})
++file(MAKE_DIRECTORY ${cache})
+diff --git a/tests/nv2a_vsh_gpu/test_main.c b/tests/nv2a_vsh_gpu/test_main.c
+index efea9f9..3fea211 100644
+--- a/tests/nv2a_vsh_gpu/test_main.c
++++ b/tests/nv2a_vsh_gpu/test_main.c
+@@ -11,6 +11,9 @@
+  *
+  * Built with vkd3d's D3DCompile, ub_vs once read the last of its sixteen
+  * inputs whatever the program asked for: every case here drew nothing.
++ *
++ * A second argument "spec" runs the same cases through the variants each
++ * program is translated to (vs_source), compiled as they are first drawn.
+  */
+ #include "video/nv2a_d3d11.c"
+ #include "kernel/nv2a_vsh_interp.h"
+@@ -35,6 +38,7 @@ enum { T = 1, V = 2, C = 3 };            /* source mux */
+ #define YYYY 0x55
+ #define WWWW 0xFF
+ #define WZYX 0xE4
++#define ZYXW_ALIAS 0x93                  /* swizzle z,y,x,w */
+ 
+ /* Instruction encoding: the field table at the top of nv2a_vsh_interp.c. */
+ static uint32_t prog[32][4];
+@@ -134,7 +138,7 @@ static void draw(int program)
+                      quad_idx, 6, 0, 3, NULL);
+ }
+ 
+-static int failures;
++static int failures, spec;
+ 
+ static void expect(const char *name, const int want[4], int alpha)
+ {
+@@ -197,6 +201,8 @@ int main(int argc, char **argv)
+     setenv("RECOMP_MSAA", argc > 1 ? argv[1] : "1", 1);
+     setenv("RECOMP_RENDER_SCALE", "1", 1);
+     setenv("RECOMP_PS_SPEC", "0", 1);
++    spec = argc > 2 && !strcmp(argv[2], "spec");
++    setenv("RECOMP_VS_SPEC", spec ? "sync" : "0", 1);
+     if (!ram || !nv2a_d3d_init()) {
+         puts("FAIL: nv2a_d3d_init");
+         return 1;
+@@ -263,6 +269,21 @@ int main(int argc, char **argv)
+     w = op(1, 0, 0, 0); src(w, 0, T, 10, XYZW, 0); out(w, 3, 0xF);
+     check("R11 and R10");
+ 
+-    printf("%d failure(s)\n", failures);
++    w = op(1, 0, 0, 3); src(w, 0, V, 0, ZYXW_ALIAS, 0); temp(w, 9, 0xF, 0);
++    w = op(9, 0, 101, 0); src(w, 0, T, 9, XYZW, 0); src(w, 1, C, 0, XYZW, 0); temp(w, 9, 0x5, 0);
++    w = op(10, 0, 102, 0); src(w, 0, T, 9, XYZW, 0); src(w, 1, C, 0, XYZW, 0); temp(w, 9, 0x8, 0);
++    w = op(1, 0, 0, 0); src(w, 0, T, 9, XYZW, 0); out(w, 3, 0xF);
++    check("min, max over an input");
++
++    w = op(0, 6, 105, 0); src(w, 2, C, 0, YYYY, 0); temp(w, 2, 0, 0xF);
++    w = op(2, 0, 102, 0); src(w, 0, T, 2, XYZW, 0); src(w, 1, C, 0, XYZW, 0); temp(w, 2, 0xF, 0);
++    w = op(1, 0, 0, 0); src(w, 0, T, 2, WZYX, 0); out(w, 3, 0xF);
++    check("log");
++
++    printf("%d failure(s)%s\n", failures, spec ? " (specialised)" : "");
++    if (spec && s_vspec_ready < 2) {
++        printf("FAIL: only %ld specialised programs compiled\n", (long)s_vspec_ready);
++        failures++;
++    }
+     return failures != 0;
+ }

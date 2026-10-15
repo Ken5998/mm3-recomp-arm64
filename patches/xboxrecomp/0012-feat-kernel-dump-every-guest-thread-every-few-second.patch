@@ -1,7 +1,7 @@
-From 783a293e7aba6e3d345f49dafcff1dca9f6277b4 Mon Sep 17 00:00:00 2001
+From ac90fac7df5c595c435f35c81fac5bd38e809630 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 18:00:40 +0000
-Subject: [PATCH 12/18] feat(kernel): dump every guest thread every few seconds
+Subject: [PATCH 12/19] feat(kernel): dump every guest thread every few seconds
  on request
 
 A title that stops on a loading screen leaves a log that just ends, and the

@@ -502,6 +502,12 @@ def install(binary: Path, tools: dict[str, Path]) -> None:
         f'[ -f "{LOGS}/game.log" ] && mv -f "{LOGS}/game.log" "{LOGS}/game.previous.log"\n'
         "export MM3_LAUNCHER_SKIP=1\n"
         f'export MM3_SAVE_DIR="{DATA}/saves"\n'
+        # Compiled shaders survive between runs (vkd3d takes up to seconds each).
+        f'mkdir -p "{DATA}/cache/shaders"\n'
+        f'export RECOMP_SHADER_CACHE="{DATA}/cache/shaders"\n'
+        # Turnip's shader preambles cost Adreno more than they save, as in
+        # Pinyon Shift and Saints Reborn; a value already set wins.
+        'export IR3_SHADER_DEBUG="${IR3_SHADER_DEBUG:-nopreamble}"\n'
         f'exec "{DATA}/bin/mm3_recomp" "$@" >"{LOGS}/game.log" 2>&1\n')
     START_SCRIPT.chmod(0o755)
 

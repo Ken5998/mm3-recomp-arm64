@@ -1,7 +1,7 @@
-From 3ccf8b8a6a10616f4c4b7f0376d2217f7235050c Mon Sep 17 00:00:00 2001
+From 296ac7657a214d7423f664f9e52c3a7d776ad122 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 22:34:42 +0000
-Subject: [PATCH 01/18] feat(posix): trap device registers on arm64 and x86-64
+Subject: [PATCH 01/19] feat(posix): trap device registers on arm64 and x86-64
  linux
 
 AddVectoredExceptionHandler now installs a SIGSEGV/SIGBUS handler that
