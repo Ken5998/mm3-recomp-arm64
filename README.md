@@ -55,11 +55,13 @@ is installed, the build reuses its LLVM instead of downloading it again.
 This is an early release of the port. On a Retroid Pocket 6 the launcher
 builds the game in about 20 minutes, and the game starts on the handheld's
 GPU (Turnip). Menus and races are drawn in 3D and the first mission can be
-completed. Version 0.1.5 gives each vertex program its own shader (0.1.4 ran
-at 10-12 fps with the GPU at 100%); the first minutes stutter a little while
-shaders compile, and later runs load them from
-`~/.local/share/MidtownMadness3/cache/shaders`. Audio still falls slightly
-behind real time and is being worked on. mm3-recomp itself is a work in
+completed. Since 0.1.5 each vertex program has its own shader, and races run
+at 40-60 fps with the GPU around half busy (0.1.4 managed 10-12 fps at 100%).
+The first seconds stutter while shaders compile; later runs load them from
+`~/.local/share/MidtownMadness3/cache/shaders`. Version 0.1.6 makes the audio
+DSP emulation 1.4x lighter and keeps profiles and progress between runs, in
+`~/.local/share/MidtownMadness3/saves`. Audio can still fall slightly behind.
+mm3-recomp itself is a work in
 progress, so expect rough edges, and back up your saves.
 
 ## If something goes wrong
