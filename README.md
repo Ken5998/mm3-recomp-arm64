@@ -66,7 +66,9 @@ at 40-60 fps with the GPU around half busy (0.1.4 managed 10-12 fps at 100%).
 The first seconds stutter while shaders compile; later runs load them from
 `~/.local/share/MidtownMadness3/cache/shaders`. Version 0.1.6 makes the audio
 DSP emulation 1.4x lighter and keeps profiles and progress between runs, in
-`~/.local/share/MidtownMadness3/saves`. Audio can still fall slightly behind.
+`~/.local/share/MidtownMadness3/saves`. Version 0.1.7 remembers the game's
+language and updates the launcher from its own **Update** button. Audio can
+still cut in and out with music and ambient sounds on.
 mm3-recomp itself is a work in
 progress, so expect rough edges, and back up your saves.
 
