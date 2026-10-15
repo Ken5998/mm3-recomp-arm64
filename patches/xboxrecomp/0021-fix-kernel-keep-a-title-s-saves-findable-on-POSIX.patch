@@ -1,4 +1,4 @@
-From 136c59c5d2ebe301cdc4cab0c8016e912c23d5fd Mon Sep 17 00:00:00 2001
+From 52b7efd99a3c52d604231d549076f863355dcaab Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 15:58:44 +0000
 Subject: [PATCH 21/21] fix(kernel): keep a title's saves findable on POSIX
@@ -20,16 +20,16 @@ Partition1\TDATA and \UDATA, where XAPI mounts T: and U:, now go to the save
 dir rather than under the extracted disc. Opens and listings under the save
 folders are logged as [SAVE] lines. tests/kernel_files_posix covers each case.
 ---
- src/kernel/kernel_file.c                | 120 +++++++++++++++++++---
+ src/kernel/kernel_file.c                | 122 +++++++++++++++++++---
  src/kernel/kernel_path.c                |   5 +
  tests/kernel_files_posix/CMakeLists.txt |  13 +++
  tests/kernel_files_posix/test_main.c    | 128 ++++++++++++++++++++++++
- 4 files changed, 252 insertions(+), 14 deletions(-)
+ 4 files changed, 254 insertions(+), 14 deletions(-)
  create mode 100644 tests/kernel_files_posix/CMakeLists.txt
  create mode 100644 tests/kernel_files_posix/test_main.c
 
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
-index 7e4822d..5e3de43 100644
+index 7e4822d..581c547 100644
 --- a/src/kernel/kernel_file.c
 +++ b/src/kernel/kernel_file.c
 @@ -786,7 +786,10 @@ static int posix_open_flags(ACCESS_MASK access, ULONG disposition)
@@ -127,7 +127,13 @@ index 7e4822d..5e3de43 100644
      if (fd < 0) {
          int e = errno;
          XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
-@@ -966,6 +1018,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
+@@ -962,10 +1014,13 @@ NTSTATUS __stdcall xbox_NtWriteFile(
+     return STATUS_SUCCESS;
+ }
+ 
++void xbox_dir_context_drop(HANDLE FileHandle);
++
+ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
  {
      XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
      if (Handle && Handle != INVALID_HANDLE_VALUE) {
@@ -135,7 +141,7 @@ index 7e4822d..5e3de43 100644
          CloseHandle(Handle);
          return STATUS_SUCCESS;
      }
-@@ -975,8 +1028,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
+@@ -975,8 +1030,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
  NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
  {
      char host_path[MAX_PATH];
@@ -145,7 +151,7 @@ index 7e4822d..5e3de43 100644
          return STATUS_OBJECT_PATH_NOT_FOUND;
      XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %s", host_path);
      if (unlink(host_path) == 0) return STATUS_SUCCESS;
-@@ -1087,7 +1139,7 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
+@@ -1087,7 +1141,7 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
               * matches NT "delete on close" semantics exactly. */
              if (info->DeleteFile) {
                  const char* p = w32_handle_path(FileHandle);
@@ -154,7 +160,7 @@ index 7e4822d..5e3de43 100644
              }
              IoStatusBlock->Status = STATUS_SUCCESS;
              return STATUS_SUCCESS;
-@@ -1167,8 +1219,7 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
+@@ -1167,8 +1221,7 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
  
      if (!FileInformation)
          return STATUS_INVALID_PARAMETER;
@@ -164,7 +170,7 @@ index 7e4822d..5e3de43 100644
          return STATUS_OBJECT_PATH_NOT_FOUND;
      if (stat(host_path, &st) != 0)
          return STATUS_OBJECT_NAME_NOT_FOUND;
-@@ -1195,6 +1246,42 @@ static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
+@@ -1195,6 +1248,42 @@ static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
  static CRITICAL_SECTION s_dir_cs;
  static BOOL s_dir_cs_init = FALSE;
  
@@ -207,7 +213,7 @@ index 7e4822d..5e3de43 100644
  NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
      HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
      PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
-@@ -1230,16 +1317,21 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+@@ -1230,16 +1319,21 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
          const char* dpath = w32_handle_path(FileHandle);
          if (!dpath) { LeaveCriticalSection(&s_dir_cs); return STATUS_UNSUCCESSFUL; }
          ctx->dir = opendir(dpath);
