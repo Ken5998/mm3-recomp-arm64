@@ -508,6 +508,11 @@ def install(binary: Path, tools: dict[str, Path]) -> None:
         # Turnip's shader preambles cost Adreno more than they save, as in
         # Pinyon Shift and Saints Reborn; a value already set wins.
         'export IR3_SHADER_DEBUG="${IR3_SHADER_DEBUG:-nopreamble}"\n'
+        # One GP and one EP frame, about a minute in, kept beside game.log for
+        # profiling the DSP interpreter (it falls behind real time on the
+        # RP6). They hold the title's DSP code: never published.
+        f'export RECOMP_DSP_FRAME_DUMP="${{RECOMP_DSP_FRAME_DUMP-{LOGS}/dsp}}"\n'
+        'export RECOMP_DSP_FRAME_INDEX="${RECOMP_DSP_FRAME_INDEX:-60000}"\n'
         f'exec "{DATA}/bin/mm3_recomp" "$@" >"{LOGS}/game.log" 2>&1\n')
     START_SCRIPT.chmod(0o755)
 
