@@ -1,0 +1,331 @@
+From 1e459a12d65fddd5387959bdb1079b2c9892ebc8 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 09:46:47 +0000
+Subject: [PATCH 18/18] fix(apu): let the title's MMIO through the frame
+ thread's lock on POSIX
+
+The frame thread holds d->lock while it runs behind real time and drops it
+between frames and DSP runs with an unlock, a yield and a lock. With a
+pthread mutex that hands nothing over: the unlock only wakes the waiter and
+the yield returns before it runs, so the lock was taken straight back and
+the title's MMIO waited milliseconds; on a core shared with a busy thread,
+the yield instead gave away milliseconds with nobody waiting.
+
+QemuMutex now counts its waiters on POSIX, which spin for up to 50 us
+before they sleep, and qemu_mutex_let_waiters_in keeps the lock while
+nobody waits and otherwise waits, 500 us at most, until they had it. In
+tests/apu_lock_posix a thread that holds the lock all the time lets another
+in within 15 us on average (2.7 ms before, 27 ms at worst), at 1-3 us to
+the holder. Windows keeps its yields.
+---
+ src/apu/apu_core.c                  |   4 +
+ src/apu/apu_dsp.c                   |   4 +
+ src/nv2a/qemu_shim.h                |  68 ++++++++++++++
+ tests/apu_lock_posix/CMakeLists.txt |  14 +++
+ tests/apu_lock_posix/test_main.c    | 136 ++++++++++++++++++++++++++++
+ 5 files changed, 226 insertions(+)
+ create mode 100644 tests/apu_lock_posix/CMakeLists.txt
+ create mode 100644 tests/apu_lock_posix/test_main.c
+
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index 6963370..793fadb 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -723,9 +723,13 @@ static void *mcpx_apu_frame_thread(void *arg)
+          * thread starved there indefinitely: Burnout 3 froze on its vehicle
+          * select, blocked in voice_lock at raised IRQL, which in turn held
+          * off every USB interrupt. */
++#ifdef _WIN32
+         qemu_mutex_unlock(&d->lock);
+         SwitchToThread();
+         qemu_mutex_lock(&d->lock);
++#else
++        qemu_mutex_let_waiters_in(&d->lock);
++#endif
+     }
+ 
+     qemu_mutex_unlock(&d->lock);
+diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
+index 5904c5b..1dffc5e 100644
+--- a/src/apu/apu_dsp.c
++++ b/src/apu/apu_dsp.c
+@@ -337,9 +337,13 @@ static void run_dsp_frame(MCPXAPUState *d, DSPState *dsp)
+         }
+         if (!dsp_has_work(dsp) || qatomic_read(&d->exiting)) break;
+         /* Guest MMIO must be able to reset or command a continuously running DSP. */
++#ifdef _WIN32
+         qemu_mutex_unlock(&d->lock);
+         Sleep(0);
+         qemu_mutex_lock(&d->lock);
++#else
++        qemu_mutex_let_waiters_in(&d->lock);
++#endif
+         s_dsp_use[index].between_us += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - ran;
+         uint32_t reset = dsp->is_gp ? d->gp.regs[NV_PAPU_GPRST] : d->ep.regs[NV_PAPU_EPRST];
+         uint32_t enabled = NV_PAPU_GPRST_GPRST | NV_PAPU_GPRST_GPDSPRST;
+diff --git a/src/nv2a/qemu_shim.h b/src/nv2a/qemu_shim.h
+index 2a6c746..ed4649d 100644
+--- a/src/nv2a/qemu_shim.h
++++ b/src/nv2a/qemu_shim.h
+@@ -17,6 +17,9 @@
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <assert.h>
++#ifndef _WIN32
++#include <time.h>
++#endif
+ 
+ /* The QEMU shim uses Win32-style threading primitives. On Windows this comes
+  * from <windows.h>; on POSIX it comes from win32_compat (via xbox_winnt.h). */
+@@ -104,6 +107,9 @@ static inline uint64_t muldiv64(uint64_t a, uint32_t b, uint32_t c) {
+ 
+ typedef struct QemuMutex {
+     CRITICAL_SECTION cs;
++#ifndef _WIN32
++    int waiting; /* threads blocked in qemu_mutex_lock */
++#endif
+ } QemuMutex;
+ 
+ typedef struct QemuCond {
+@@ -116,17 +122,79 @@ typedef struct QemuThread {
+ 
+ static inline void qemu_mutex_init(QemuMutex *m) {
+     InitializeCriticalSection(&m->cs);
++#ifndef _WIN32
++    m->waiting = 0;
++#endif
+ }
+ static inline void qemu_mutex_destroy(QemuMutex *m) {
+     DeleteCriticalSection(&m->cs);
+ }
++#ifndef _WIN32
++static inline void qemu_cpu_relax(void) {
++#if defined(__aarch64__)
++    __asm__ __volatile__("yield");
++#elif defined(__x86_64__) || defined(__i386__)
++    __builtin_ia32_pause();
++#endif
++}
++static inline int64_t qemu_monotonic_ns(void) {
++    struct timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return t.tv_sec * 1000000000LL + t.tv_nsec;
++}
++#endif
++
+ static inline void qemu_mutex_lock(QemuMutex *m) {
++#ifndef _WIN32
++    /* Counted for qemu_mutex_let_waiters_in. A waiter spins for up to 50 us
++     * before it sleeps: the frame thread lets it in between DSP runs a few
++     * microseconds apart, and waking a sleeping one costs tens of them. */
++    int64_t start;
++    if (TryEnterCriticalSection(&m->cs)) return;
++    __atomic_add_fetch(&m->waiting, 1, __ATOMIC_ACQ_REL);
++    start = qemu_monotonic_ns();
++    for (unsigned spins = 1; ; spins++) {
++        qemu_cpu_relax();
++        if (TryEnterCriticalSection(&m->cs)) break;
++        if (spins % 64 == 0 && qemu_monotonic_ns() - start > 50000) {
++            EnterCriticalSection(&m->cs);
++            break;
++        }
++    }
++    __atomic_sub_fetch(&m->waiting, 1, __ATOMIC_ACQ_REL);
++#else
+     EnterCriticalSection(&m->cs);
++#endif
+ }
+ static inline void qemu_mutex_unlock(QemuMutex *m) {
+     LeaveCriticalSection(&m->cs);
+ }
+ 
++#ifndef _WIN32
++/* Lets the threads waiting for a lock the caller holds have it, then takes
++ * it back: what the APU's frame thread does between frames and DSP runs, so
++ * the title's MMIO is not starved behind a thread that is never done.
++ *
++ * Windows callers unlock, yield and lock. That does nothing useful with a
++ * pthread mutex: unlocking only wakes a waiter, a yield on a core of its own
++ * returns long before it runs, and the lock was taken straight back -- while
++ * on a core shared with a busy thread, sched_yield gives that thread whole
++ * milliseconds, waiter or not. So with no waiter this keeps the lock, and
++ * with one it waits (spinning, at most 500 us) until the waiters got it. */
++static inline void qemu_mutex_let_waiters_in(QemuMutex *m) {
++    int64_t start;
++    if (!__atomic_load_n(&m->waiting, __ATOMIC_ACQUIRE) ||
++        m->cs.RecursionCount > 1)
++        return;
++    start = qemu_monotonic_ns();
++    LeaveCriticalSection(&m->cs);
++    while (__atomic_load_n(&m->waiting, __ATOMIC_ACQUIRE) &&
++           qemu_monotonic_ns() - start < 500000)
++        qemu_cpu_relax();
++    qemu_mutex_lock(m);
++}
++#endif
++
+ static inline void qemu_cond_init(QemuCond *c) {
+     InitializeConditionVariable(&c->cv);
+ }
+diff --git a/tests/apu_lock_posix/CMakeLists.txt b/tests/apu_lock_posix/CMakeLists.txt
+new file mode 100644
+index 0000000..4359433
+--- /dev/null
++++ b/tests/apu_lock_posix/CMakeLists.txt
+@@ -0,0 +1,14 @@
++cmake_minimum_required(VERSION 3.20)
++project(apu_lock_posix_test C)
++# How the APU's frame thread lets the title's MMIO have its lock on a POSIX
++# host (qemu_mutex_let_waiters_in).
++if(WIN32)
++    message(FATAL_ERROR "This regression covers the POSIX lock")
++endif()
++set(CMAKE_C_STANDARD 11)
++add_subdirectory(../../src/platform platform)
++add_executable(apu_lock_posix_test test_main.c)
++target_include_directories(apu_lock_posix_test PRIVATE ../../src ../../src/apu)
++target_link_libraries(apu_lock_posix_test PRIVATE platform)
++enable_testing()
++add_test(NAME apu_lock_posix_test COMMAND apu_lock_posix_test)
+diff --git a/tests/apu_lock_posix/test_main.c b/tests/apu_lock_posix/test_main.c
+new file mode 100644
+index 0000000..8930bd5
+--- /dev/null
++++ b/tests/apu_lock_posix/test_main.c
+@@ -0,0 +1,136 @@
++/*
++ * The APU lock on a POSIX host: how the frame thread, which holds d->lock
++ * for as long as it runs behind real time, lets the title's MMIO have it.
++ *
++ * It used to unlock, yield and lock, as on Windows. A pthread mutex only
++ * wakes its waiter on unlock, and the yield returned before the waiter ran,
++ * so the frame thread took the lock straight back and the waiter starved;
++ * on a core shared with a busy thread, the same yield instead gave that
++ * thread milliseconds with no waiter at all. qemu_mutex_let_waiters_in keeps
++ * the lock while nobody waits and otherwise waits until the waiters had it.
++ */
++#include "apu_shim.h"
++
++#include <pthread.h>
++#include <stdio.h>
++#include <time.h>
++
++static int failures;
++
++static void check(int ok, const char *what)
++{
++    printf("  %-62s %s\n", what, ok ? "PASS" : "FAIL");
++    if (!ok) failures++;
++}
++
++static int64_t now_us(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
++}
++
++static QemuMutex lock;
++static volatile int holding, done;
++static int64_t worst_wait, total_wait, handing_over;
++static int acquired;
++
++/* The frame thread: busy for 20 us at a time, the lock always held. */
++static void *holder(void *arg)
++{
++    (void)arg;
++    qemu_mutex_lock(&lock);
++    holding = 1;
++    while (!done) {
++        int64_t until = now_us() + 20;
++        while (now_us() < until) {}
++        until = now_us();
++        qemu_mutex_let_waiters_in(&lock);
++        handing_over += now_us() - until;
++    }
++    qemu_mutex_unlock(&lock);
++    return NULL;
++}
++
++/* The title: an MMIO access now and then. */
++static void *title(void *arg)
++{
++    (void)arg;
++    struct timespec gap = { 0, 200 * 1000 };
++    for (int i = 0; i < 200; i++) {
++        int64_t asked = now_us(), waited;
++        qemu_mutex_lock(&lock);
++        waited = now_us() - asked;
++        qemu_mutex_unlock(&lock);
++        acquired++;
++        total_wait += waited;
++        if (waited > worst_wait) worst_wait = waited;
++        nanosleep(&gap, NULL);
++    }
++    return NULL;
++}
++
++int main(void)
++{
++    pthread_t frame, mmio;
++    int64_t start, took;
++
++    qemu_mutex_init(&lock);
++
++    qemu_mutex_lock(&lock);
++    start = now_us();
++    for (int i = 0; i < 100000; i++) qemu_mutex_let_waiters_in(&lock);
++    took = now_us() - start;
++    printf("  100000 calls with nobody waiting: %lld us\n", (long long)took);
++    check(took < 100000, "with nobody waiting it keeps the lock and costs no yield");
++    check(lock.cs.RecursionCount == 1, "and the lock is still held once");
++
++    /* A waiter that was counted but is never scheduled. */
++    lock.waiting = 1;
++    start = now_us();
++    qemu_mutex_let_waiters_in(&lock);
++    took = now_us() - start;
++    printf("  a waiter that never comes: %lld us\n", (long long)took);
++    check(took >= 500 && took < 50000, "a waiter that never comes is waited for 500 us at most");
++    check(lock.cs.RecursionCount == 1, "after which the lock is held again");
++
++    qemu_mutex_lock(&lock);
++    start = now_us();
++    qemu_mutex_let_waiters_in(&lock);
++    took = now_us() - start;
++    check(took < 400 && lock.cs.RecursionCount == 2,
++          "held twice, it cannot be let go and is kept at once");
++    lock.waiting = 0;
++    qemu_mutex_unlock(&lock);
++    qemu_mutex_unlock(&lock);
++
++    pthread_create(&frame, NULL, holder, NULL);
++    while (!holding) {}
++    start = now_us();
++    pthread_create(&mmio, NULL, title, NULL);
++    while (acquired < 200 && now_us() - start < 10000000) {
++        struct timespec poll = { 0, 1000000 };
++        nanosleep(&poll, NULL);
++    }
++    done = 1;
++    pthread_join(frame, NULL);
++    if (acquired == 200) {
++        pthread_join(mmio, NULL);
++        printf("  200 accesses past a busy holder: average %lld us, worst %lld us;\n"
++               "  the holder spent %lld us an access letting them in\n",
++               (long long)(total_wait / acquired), (long long)worst_wait,
++               (long long)(handing_over / acquired));
++    } else {
++        printf("  only %d of 200 accesses got the lock in 10 s\n", acquired);
++    }
++    check(acquired == 200, "the title gets the lock from a thread that always holds it");
++    check(acquired == 200 && total_wait / acquired < 1000, "within 1 ms on average");
++    check(acquired == 200 && worst_wait < 20000, "and 20 ms at worst");
++
++    if (failures) {
++        printf("%d check(s) failed\n", failures);
++        return 1;
++    }
++    printf("All checks passed\n");
++    return 0;
++}

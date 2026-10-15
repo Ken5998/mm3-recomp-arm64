@@ -1,7 +1,7 @@
 From 7b67b9bbb5e705e62a692a060be937a1d3dfa51b Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 09:16:47 +0000
-Subject: [PATCH 17/17] feat(apu): say where each DSP's frame time goes when
+Subject: [PATCH 17/18] feat(apu): say where each DSP's frame time goes when
  audio lags
 
 The report the frame thread prints when it falls behind real time now
