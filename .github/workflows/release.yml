@@ -50,6 +50,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v7
         with:
           name: MidtownMadness3-Launcher-linux-arm64
@@ -63,7 +65,10 @@ jobs:
           commit="$(jq -r .commit upstream.json)"
           sysroot="$(jq -r .sysroot.version toolchain.json)"
           sha256="$(sha256sum "$archive" | cut -d' ' -f1)"
-          cat > notes.md <<NOTES
+          scripts/release-notes.sh "v$version" > notes.md
+          cat >> notes.md <<NOTES
+          ## Install
+
           Midtown Madness 3 for ARM64 Linux handhelds, such as the Retroid Pocket 6 on ArmadaOS, built from [mm3-recomp ${commit:0:7}](https://github.com/MattSG/mm3-recomp/commit/$commit).
 
           On the handheld, in Desktop Mode: unpack $(basename "$archive"), start MidtownMadness3/mm3-launcher and choose your own disc image of Midtown Madness 3 (USA or Europe). The launcher checks it, downloads its build tools and the ARM64 sysroot $sysroot, builds the game on the handheld (about 6 GB free on top of the image's size; keep it on the charger) and offers Play and Add to Steam. See the README for details.
@@ -72,6 +77,7 @@ jobs:
           NOTES
           if gh release view "v$version" > /dev/null 2>&1; then
             gh release upload "v$version" "$archive" --clobber
+            gh release edit "v$version" --notes-file notes.md
           else
             gh release create "v$version" "$archive" --title "Midtown Madness 3 $version for ARM64 Linux" \
               --notes-file notes.md
