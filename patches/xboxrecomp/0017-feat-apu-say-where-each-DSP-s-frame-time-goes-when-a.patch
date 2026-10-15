@@ -1,0 +1,139 @@
+From 7b67b9bbb5e705e62a692a060be937a1d3dfa51b Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 09:16:47 +0000
+Subject: [PATCH 17/17] feat(apu): say where each DSP's frame time goes when
+ audio lags
+
+The report the frame thread prints when it falls behind real time now
+ends with each DSP's time and cycles a frame, how many runs of 1000
+cycles a frame took, and the time spent between those runs, where the
+guest is let in. That separates an interpreter that is too slow for the
+program from a thread that waits too long to get its core back.
+---
+ src/apu/apu_core.c  |  8 ++++++--
+ src/apu/apu_dsp.c   | 35 +++++++++++++++++++++++++++++++++++
+ src/apu/apu_state.h |  3 +++
+ 3 files changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index aa7f952..6963370 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -530,9 +530,11 @@ static void report_speed(int64_t vp_us, int64_t dsp_us, int64_t frame_us)
+     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+ 
+     if (!window_start || now - window_start > 60000000) {
++        char unused[8];
+         window_start = now;
+         frames = 0;
+         vp_sum = dsp_sum = busy_sum = 0;
++        mcpx_apu_dsp_usage(unused, sizeof unused);
+         return;
+     }
+     frames++;
+@@ -544,12 +546,14 @@ static void report_speed(int64_t vp_us, int64_t dsp_us, int64_t frame_us)
+     {
+         double window = (double)(now - window_start);
+         double sound = frames * NUM_SAMPLES_PER_FRAME * 1000000.0 / 48000.0;
++        char dsps[256];
++        mcpx_apu_dsp_usage(dsps, sizeof dsps);
+         if (sound < 0.95 * window && busy_sum > 0.8 * window && reports < 60) {
+             reports++;
+             fprintf(stderr, "[APU] behind real time: %.0f s of sound in %.0f s; a frame took "
+-                            "%lld us in voices, %lld us in the DSPs (667 us of sound)\n",
++                            "%lld us in voices, %lld us in the DSPs (667 us of sound); %s\n",
+                     sound / 1e6, window / 1e6, (long long)(vp_sum / frames),
+-                    (long long)(dsp_sum / frames));
++                    (long long)(dsp_sum / frames), dsps);
+             fflush(stderr);
+         }
+     }
+diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
+index 0d0d060..5904c5b 100644
+--- a/src/apu/apu_dsp.c
++++ b/src/apu/apu_dsp.c
+@@ -302,6 +302,15 @@ void mcpx_apu_dsp_init(MCPXAPUState *d)
+     fprintf(stderr, "[APU] GP/EP DSP56300 interpreters initialized\n");
+ }
+ 
++/* Where each DSP's frames go, for the frame thread's report when audio lags
++ * (mcpx_apu_dsp_usage): running the interpreter, and between its runs, where
++ * the guest is let in. */
++static struct {
++    int64_t run_us, between_us;
++    uint64_t cycles;
++    unsigned frames, runs;
++} s_dsp_use[2];
++
+ /* Called with the APU lock held, as are the frame's native mixer operations. */
+ static void run_dsp_frame(MCPXAPUState *d, DSPState *dsp)
+ {
+@@ -311,10 +320,16 @@ static void run_dsp_frame(MCPXAPUState *d, DSPState *dsp)
+     unsigned index = dsp->is_gp ? 0 : 1;
+     uint64_t frame_ticks = 0;
+     dsp_start_frame(dsp);
++    s_dsp_use[index].frames++;
+     do {
+         LARGE_INTEGER begin, end;
++        int64_t ran;
+         if (profile) QueryPerformanceCounter(&begin);
++        int64_t start = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+         dsp_run(dsp, 1000);
++        ran = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++        s_dsp_use[index].run_us += ran - start;
++        s_dsp_use[index].runs++;
+         if (profile) {
+             QueryPerformanceCounter(&end);
+             frame_ticks += (uint64_t)(end.QuadPart - begin.QuadPart);
+@@ -325,10 +340,12 @@ static void run_dsp_frame(MCPXAPUState *d, DSPState *dsp)
+         qemu_mutex_unlock(&d->lock);
+         Sleep(0);
+         qemu_mutex_lock(&d->lock);
++        s_dsp_use[index].between_us += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - ran;
+         uint32_t reset = dsp->is_gp ? d->gp.regs[NV_PAPU_GPRST] : d->ep.regs[NV_PAPU_EPRST];
+         uint32_t enabled = NV_PAPU_GPRST_GPRST | NV_PAPU_GPRST_GPDSPRST;
+         if ((reset & enabled) != enabled) break;
+     } while (dsp_has_work(dsp) && !qatomic_read(&d->exiting));
++    s_dsp_use[index].cycles += dsp->core.cycle_count;
+     if (profile) {
+         LARGE_INTEGER frequency;
+         QueryPerformanceFrequency(&frequency);
+@@ -344,6 +361,24 @@ static void run_dsp_frame(MCPXAPUState *d, DSPState *dsp)
+     }
+ }
+ 
++void mcpx_apu_dsp_usage(char *text, size_t size)
++{
++    size_t used = 0;
++    text[0] = 0;
++    for (unsigned i = 0; i < 2; i++) {
++        unsigned n = s_dsp_use[i].frames;
++        if (n && used < size)
++            used += snprintf(text + used, size - used,
++                             "%s%s %lld us and %llu cycles a frame, in %u runs with %lld us between them",
++                             used ? "; " : "", i ? "EP" : "GP",
++                             (long long)(s_dsp_use[i].run_us / n),
++                             (unsigned long long)(s_dsp_use[i].cycles / n),
++                             (s_dsp_use[i].runs + n / 2) / n,
++                             (long long)(s_dsp_use[i].between_us / n));
++    }
++    memset(s_dsp_use, 0, sizeof s_dsp_use);
++}
++
+ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+ {
+     for (int bin = 0; bin < NUM_MIXBINS; bin++)
+diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
+index 0010229..9d09b25 100644
+--- a/src/apu/apu_state.h
++++ b/src/apu/apu_state.h
+@@ -427,6 +427,9 @@ void mcpx_apu_dsp_init(MCPXAPUState *d);
+ void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
+ void mcpx_apu_dsp_pcm_consumed(MCPXAPUState *d);
+ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
++/* Each DSP's time and cycles a frame since the last call, as text; counting
++ * then starts afresh. */
++void mcpx_apu_dsp_usage(char *text, size_t size);
+ uint64_t mcpx_apu_dsp_read(MCPXAPUState *d, bool gp, uint32_t addr, unsigned size);
+ void mcpx_apu_dsp_write(MCPXAPUState *d, bool gp, uint32_t addr, uint64_t value, unsigned size);
+ 

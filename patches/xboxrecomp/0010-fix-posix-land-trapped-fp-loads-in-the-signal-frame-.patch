@@ -1,7 +1,7 @@
 From 94f11408355ec5bd93fe58db15caee10c7116cce Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 07:52:02 +0000
-Subject: [PATCH 10/15] fix(posix): land trapped fp loads in the signal frame's
+Subject: [PATCH 10/17] fix(posix): land trapped fp loads in the signal frame's
  sve registers
 
 Once a thread has used SVE, its signal frame carries the Z registers and

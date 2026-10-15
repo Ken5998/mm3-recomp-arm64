@@ -1,7 +1,7 @@
 From d2a31f7c91f0aa02429a26af21d3f43ab082c7ae Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 02:49:32 +0000
-Subject: [PATCH 06/15] feat(video): share the window's scancode to virtual key
+Subject: [PATCH 06/17] feat(video): share the window's scancode to virtual key
  table
 
 A settings screen that binds keys before the game window exists can read SDL's keyboard in the same virtual keys RECOMP_KEYMAP uses: the table moves to sdl_keys.c.

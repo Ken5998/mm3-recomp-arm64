@@ -1,7 +1,7 @@
 From 26b621430661e2974610125d6a73dc1046fb79a3 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 18:00:40 +0000
-Subject: [PATCH 13/15] fix(posix): read and write at an offset in one call
+Subject: [PATCH 13/17] fix(posix): read and write at an offset in one call
 
 NtReadFile at an offset was a seek and a read, so a second thread reading the
 same handle between them moved the first one's data. ReadFile with an

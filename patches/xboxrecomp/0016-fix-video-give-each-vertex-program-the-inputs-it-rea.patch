@@ -1,0 +1,374 @@
+From 180220074612cb5e14fd8df8ceed64fc23416edc Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 09:13:18 +0000
+Subject: [PATCH 16/17] fix(video): give each vertex program the inputs it
+ reads under vkd3d
+
+vkd3d's HLSL compiler keeps an array that is only written at constant
+indices in a single register. ub_vs filled its sixteen vertex inputs from
+an unrolled loop, so V[vi] read the last input for every operand: each
+vertex program put all of a batch's vertices on one point, and on Linux
+only pre-transformed 2D was drawn (a black menu with its START prompt, a
+grey race).
+
+On Linux the inputs are now fetched from a loop that is not unrolled,
+which makes V an indexable array; the Windows shader is unchanged.
+
+tests/nv2a_vsh_gpu runs small vertex programs through the renderer on
+DXVK and compares each one's colour with the CPU interpreter's. Before
+this change every case drew nothing.
+---
+ src/video/nv2a_d3d11.c            |  14 +-
+ tests/nv2a_vsh_gpu/CMakeLists.txt |  25 +++
+ tests/nv2a_vsh_gpu/test_main.c    | 268 ++++++++++++++++++++++++++++++
+ 3 files changed, 304 insertions(+), 3 deletions(-)
+ create mode 100644 tests/nv2a_vsh_gpu/CMakeLists.txt
+ create mode 100644 tests/nv2a_vsh_gpu/test_main.c
+
+diff --git a/src/video/nv2a_d3d11.c b/src/video/nv2a_d3d11.c
+index 726c305..8378ae0 100644
+--- a/src/video/nv2a_d3d11.c
++++ b/src/video/nv2a_d3d11.c
+@@ -343,6 +343,13 @@ static const char s_hlsl[] =
+  * outside its triangle, and texcoords extrapolated there read past the tile
+  * edge -- bright seams between ground tiles. */
+ "#ifndef FLATQ\n#define FLATQ centroid\n#endif\n"
++/* INPUT_LOOP: how ub_vs fetches the sixteen vertex inputs. vkd3d's compiler
++ * keeps an array that is only written at constant indices -- as an unrolled
++ * loop writes V -- in a single register, so V[vi] gave every operand the last
++ * input: each vertex program put all of a batch's vertices on one point, and
++ * only pre-transformed 2D was drawn. Written from a loop that is not
++ * unrolled, V becomes an indexable array. compile_def sets it on Linux. */
++"#ifndef INPUT_LOOP\n#define INPUT_LOOP [unroll]\n#endif\n"
+ "struct PSIn { float4 pos:SV_Position; FLATQ float4 d0:COLOR0; FLATQ float4 d1:COLOR1;\n"
+ "  centroid float4 fog:FOG; centroid float4 t0:TEXCOORD0; centroid float4 t1:TEXCOORD1;\n"
+ "  centroid float4 t2:TEXCOORD2; centroid float4 t3:TEXCOORD3; };\n"
+@@ -400,7 +407,7 @@ static const char s_hlsl[] =
+ "  float4 P, d0, d1, t0, t1, t2, t3;\n"
+ "  float fog = 1.0;\n"
+ "  if (ub_info.y) {\n"
+-"    [unroll] for (uint i = 0; i < 16; i++) V[i] = fetch(i, vid);\n"
++"    INPUT_LOOP for (uint i = 0; i < 16; i++) V[i] = fetch(i, vid);\n"
+ "    [unroll] for (uint j = 0; j < 13; j++) { R[j] = float4(0, 0, 0, 0); O[j] = float4(0, 0, 0, 0); }\n"
+ "    O[3].w = 1; O[4].w = 1; O[9].w = 1; O[10].w = 1; O[11].w = 1; O[12].w = 1;\n"
+ "    int a0 = 0;\n"
+@@ -914,11 +921,12 @@ static ID3DBlob *compile_def(const char *entry, const char *target, const D3D_SH
+     size_t len = sizeof s_hlsl - 1;
+     HRESULT hr;
+ #if !defined(_WIN32)
+-    /* vkd3d's HLSL compiler has no isnan(). */
++    /* vkd3d's HLSL compiler has no isnan(), and needs ub_vs's inputs
++     * written from a loop (INPUT_LOOP). */
+     static char *posix_src;
+     static size_t posix_len;
+     if (!posix_src) {
+-        static const char prefix[] = "#define isnan(x) ((x) != (x))\n";
++        static const char prefix[] = "#define isnan(x) ((x) != (x))\n#define INPUT_LOOP [loop]\n";
+         char *b = (char *)malloc(sizeof prefix - 1 + len + 1);
+         if (b) {
+             memcpy(b, prefix, sizeof prefix - 1);
+diff --git a/tests/nv2a_vsh_gpu/CMakeLists.txt b/tests/nv2a_vsh_gpu/CMakeLists.txt
+new file mode 100644
+index 0000000..5aacee0
+--- /dev/null
++++ b/tests/nv2a_vsh_gpu/CMakeLists.txt
+@@ -0,0 +1,25 @@
++cmake_minimum_required(VERSION 3.20)
++project(nv2a_vsh_gpu_test C)
++# The renderer's vertex program interpreter (ub_vs), as vkd3d compiles it and
++# DXVK runs it, against the CPU one (nv2a_vsh_interp.c). Needs a display and a
++# Vulkan driver (Xvfb and lavapipe do); without a display it skips.
++if(WIN32)
++    message(FATAL_ERROR "This regression covers the Linux renderer")
++endif()
++set(CMAKE_C_STANDARD 11)
++add_subdirectory(../../src/platform platform)
++find_package(PkgConfig REQUIRED)
++pkg_check_modules(DXVK REQUIRED IMPORTED_TARGET dxvk-d3d11 dxvk-dxgi)
++pkg_check_modules(VKD3D_UTILS REQUIRED IMPORTED_TARGET libvkd3d-utils)
++find_package(SDL2 REQUIRED)
++# The test includes the renderer's source, to read back its surfaces.
++add_executable(nv2a_vsh_gpu_test test_main.c ../../src/kernel/nv2a_vsh_interp.c)
++target_include_directories(nv2a_vsh_gpu_test PRIVATE ../../src ../../src/video ../../src/kernel)
++target_compile_definitions(nv2a_vsh_gpu_test PRIVATE XBOXRECOMP_DXVK)
++target_link_libraries(nv2a_vsh_gpu_test PRIVATE
++    platform PkgConfig::DXVK PkgConfig::VKD3D_UTILS SDL2::SDL2 m)
++enable_testing()
++foreach(samples 1 4)
++    add_test(NAME nv2a_vsh_gpu_${samples}x COMMAND nv2a_vsh_gpu_test ${samples})
++    set_tests_properties(nv2a_vsh_gpu_${samples}x PROPERTIES SKIP_RETURN_CODE 77)
++endforeach()
+diff --git a/tests/nv2a_vsh_gpu/test_main.c b/tests/nv2a_vsh_gpu/test_main.c
+new file mode 100644
+index 0000000..efea9f9
+--- /dev/null
++++ b/tests/nv2a_vsh_gpu/test_main.c
+@@ -0,0 +1,268 @@
++/*
++ * nv2a_vsh_gpu - the vertex program interpreter the GPU runs (ub_vs) gives
++ * what the CPU interpreter gives.
++ *
++ * Each case is a small program ending in the Xbox D3D screen-space epilogue.
++ * It draws a quad over the whole 64x64 target, and the colour it writes to
++ * oD0 -- the same at every vertex -- is read back from the target's centre
++ * and compared with nv2a_vsh_run's oD0 for the same program and constants.
++ * A pre-transformed quad comes first, so a renderer that draws nothing fails
++ * there rather than in every case.
++ *
++ * Built with vkd3d's D3DCompile, ub_vs once read the last of its sixteen
++ * inputs whatever the program asked for: every case here drew nothing.
++ */
++#include "video/nv2a_d3d11.c"
++#include "kernel/nv2a_vsh_interp.h"
++#include <SDL2/SDL.h>
++#include <SDL2/SDL_vulkan.h>
++
++static uint8_t *ram;
++ptrdiff_t xbox_GetMemoryOffset(void) { return (ptrdiff_t)ram; }
++HWND xbox_FramebufferWindowHandle(void) { return NULL; }
++int xbox_FramebufferScanSource(uint32_t *va, uint32_t *pitch) { (void)va; (void)pitch; return 0; }
++int xbox_FramebufferOverlay(XboxOverlay *ovl) { (void)ovl; return 0; }
++void xbox_FramebufferNoteFlip(uint32_t draws) { (void)draws; }
++int xbox_FramebufferPaused(void) { return 0; }
++int xbox_FramebufferDisplaySize(unsigned *w, unsigned *h) { *w = 640; *h = 480; return 1; }
++int xbox_FramebufferWindowWait(void) { return 1; }
++void recomp_sampler_report(double ms) { (void)ms; }
++
++#define TARGET 0x10000u
++enum { T = 1, V = 2, C = 3 };            /* source mux */
++#define XYZW 0x1B                        /* swizzle x,y,z,w (x highest) */
++#define XXXX 0x00
++#define YYYY 0x55
++#define WWWW 0xFF
++#define WZYX 0xE4
++
++/* Instruction encoding: the field table at the top of nv2a_vsh_interp.c. */
++static uint32_t prog[32][4];
++static int nprog;
++
++static uint32_t *op(int mac, int ilu, int cidx, int vidx)
++{
++    uint32_t *w = prog[nprog++];
++    memset(w, 0, 16);
++    w[1] = ((uint32_t)ilu << 25) | ((uint32_t)mac << 21) | ((uint32_t)cidx << 13) | ((uint32_t)vidx << 9);
++    return w;
++}
++static void src(uint32_t *w, int which, int mux, int reg, int swz, int neg)
++{
++    if (which == 0) {
++        w[1] |= (uint32_t)swz | ((uint32_t)neg << 8);
++        w[2] |= ((uint32_t)mux << 26) | ((uint32_t)reg << 28);
++    } else if (which == 1) {
++        w[2] |= ((uint32_t)swz << 17) | ((uint32_t)mux << 11) | ((uint32_t)reg << 13) | ((uint32_t)neg << 25);
++    } else {
++        w[2] |= ((uint32_t)swz << 2) | ((uint32_t)reg >> 2) | ((uint32_t)neg << 10);
++        w[3] |= ((uint32_t)mux << 28) | ((uint32_t)(reg & 3) << 30);
++    }
++}
++static void temp(uint32_t *w, int reg, int mac_mask, int ilu_mask)
++{
++    w[3] |= ((uint32_t)mac_mask << 24) | ((uint32_t)reg << 20) | ((uint32_t)ilu_mask << 16);
++}
++static void out(uint32_t *w, int addr, int mask)
++{
++    w[3] |= ((uint32_t)mask << 12) | (1u << 11) | ((uint32_t)addr << 3);
++}
++
++/* mov oPos, v0 ; mul oPos.xyz, R12, c58 + rcc R1.x, R12.w ;
++ * mad oPos.xyz, R12, R1.x, c59 -- every Xbox D3D program ends so. */
++static void epilogue(void)
++{
++    uint32_t *w;
++    w = op(1, 0, 0, 0); src(w, 0, V, 0, XYZW, 0); out(w, 0, 0xF);
++    w = op(2, 3, 58, 0); src(w, 0, T, 12, XYZW, 0); src(w, 1, C, 0, XYZW, 0);
++    src(w, 2, T, 12, WWWW, 0); temp(w, 7, 0, 8); out(w, 0, 0xE);
++    w = op(4, 0, 59, 0); src(w, 0, T, 12, XYZW, 0); src(w, 1, T, 1, XXXX, 0);
++    src(w, 2, C, 0, XYZW, 0); out(w, 0, 0xE);
++    w[3] |= 1u;                                     /* final */
++}
++
++static const float quad[4][4] = { {-1, -1, 0.5f, 1}, {1, -1, 0.5f, 1}, {1, 1, 0.5f, 1}, {-1, 1, 0.5f, 1} };
++static const float screen_quad[4][4] = { {0, 64, 0.5f, 1}, {64, 64, 0.5f, 1}, {64, 0, 0.5f, 1}, {0, 0, 0.5f, 1} };
++static const uint32_t diffuse[4] = { 0xFF204060, 0xFF204060, 0xFF204060, 0xFF204060 };
++static const uint32_t quad_idx[6] = { 0, 1, 2, 0, 2, 3 };
++
++/* The centre pixel of the target, as R, G, B, A. */
++static int centre(uint8_t rgba[4])
++{
++    static ID3D11Texture2D *staging;
++    Surface *s = surface_find(phys(TARGET));
++    D3D11_TEXTURE2D_DESC d;
++    D3D11_MAPPED_SUBRESOURCE m;
++    const uint8_t *p;
++    if (!s || !s->tex) return 0;
++    if (s->ms && s->ms_dirty) surface_resolve(s);
++    ID3D11Texture2D_GetDesc(s->tex, &d);
++    if (!staging) {
++        d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++        d.MiscFlags = 0; d.MipLevels = 1; d.ArraySize = 1;
++        d.SampleDesc.Count = 1; d.SampleDesc.Quality = 0;
++        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &staging))) return 0;
++    }
++    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)staging, 0, 0, 0, 0,
++                                              (ID3D11Resource *)s->tex, 0, NULL);
++    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &m)))
++        return 0;
++    p = (const uint8_t *)m.pData + (size_t)(d.Height / 2) * m.RowPitch + (size_t)(d.Width / 2) * 4;
++    rgba[0] = p[2]; rgba[1] = p[1]; rgba[2] = p[0]; rgba[3] = p[3];  /* BGRA */
++    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)staging, 0);
++    return 1;
++}
++
++/* Clear the target to blue, then draw the quad. */
++static void draw(int program)
++{
++    NvD3DState st;
++    NvD3DAttrib attr[16];
++    float def[16][4];
++    memset(&st, 0, sizeof st);
++    st.color_addr = TARGET; st.color_pitch = 64 * 4;
++    st.surface_format = 0x28; st.clip_w = st.clip_h = 64;
++    st.color_mask = 0x01010101;
++    memset(attr, 0, sizeof attr);
++    memset(def, 0, sizeof def);
++    attr[0].enabled = 1; attr[0].type = 2; attr[0].size = 4; attr[0].stride = 16;
++    attr[0].data = (const uint8_t *)(program ? quad : screen_quad);
++    attr[3].enabled = 1; attr[3].type = 0; attr[3].size = 4; attr[3].stride = 4;
++    attr[3].data = (const uint8_t *)diffuse;
++    nv2a_d3d_clear(&st, 0xF0, 0xFF0000FFu, 0, 0, 0, 63, 63);
++    nv2a_d3d_draw_ub(&st, NV_D3D_TRIANGLES, attr, (const float (*)[4])def, program,
++                     quad_idx, 6, 0, 3, NULL);
++}
++
++static int failures;
++
++static void expect(const char *name, const int want[4], int alpha)
++{
++    uint8_t px[4];
++    int i, ok = centre(px);
++    for (i = 0; ok && i < (alpha ? 4 : 3); i++)
++        if (abs(px[i] - want[i]) > 2) ok = 0;
++    printf("%-26s got %3d %3d %3d %3d  want %3d %3d %3d %3d  %s\n", name,
++           px[0], px[1], px[2], px[3], want[0], want[1], want[2], want[3], ok ? "ok" : "FAIL");
++    if (!ok) failures++;
++}
++
++/* Run the program built so far (plus the epilogue) on both interpreters. */
++static void check(const char *name)
++{
++    static const float c58[4] = { 32, -32, 1, 0 }, c59[4] = { 32, 32, 0, 0 };
++    float in[NV2A_VSH_INPUTS][4];
++    Nv2aVshOutput o;
++    int i, want[4];
++    epilogue();
++    for (i = 0; i < nprog; i++) nv2a_vsh_set_instruction((uint32_t)i, prog[i]);
++    nprog = 0;
++    nv2a_vsh_set_start_slot(0);
++    nv2a_vsh_set_constant(58, c58);
++    nv2a_vsh_set_constant(59, c59);
++    draw(1);
++    memset(in, 0, sizeof in);
++    memcpy(in[0], quad[0], sizeof in[0]);
++    in[3][0] = 0x20 / 255.0f; in[3][1] = 0x40 / 255.0f; in[3][2] = 0x60 / 255.0f; in[3][3] = 1.0f;
++    if (!nv2a_vsh_run((const float (*)[4])in, &o)) {
++        printf("%-26s the CPU interpreter did not run it\n", name);
++        failures++;
++        return;
++    }
++    for (i = 0; i < 4; i++) {
++        float f = o.d0[i] != o.d0[i] ? 0.0f : o.d0[i] < 0 ? 0.0f : o.d0[i] > 1 ? 1.0f : o.d0[i];
++        want[i] = (int)(f * 255.0f + 0.5f);
++    }
++    expect(name, want, 1);
++}
++
++int main(int argc, char **argv)
++{
++    static const float c100[4] = { 0.25f, 0.5f, 0.75f, 1.0f }, c101[4] = { 0.5f, 0.5f, 0.5f, 0.5f };
++    static const float c102[4] = { 0.1f, 0.2f, 0.3f, 0.0f }, c103[4] = { 0.9f, 0.1f, 0.4f, 1.0f };
++    static const float c104[4] = { 2.0f, 0.0f, 0.0f, 0.0f }, c105[4] = { 4.0f, 16.0f, 0.5f, 2.0f };
++    static const int blue_quad[4] = { 0x20, 0x40, 0x60, 0xFF };
++    uint32_t *w;
++
++    if (!getenv("DISPLAY") && !getenv("WAYLAND_DISPLAY")) {
++        puts("SKIP: no display");
++        return 77;
++    }
++    /* DXVK-native's SDL2 surface code asks SDL for Vulkan's extensions. */
++    if (SDL_Init(SDL_INIT_VIDEO) != 0 || SDL_Vulkan_LoadLibrary(NULL) != 0) {
++        printf("SKIP: %s\n", SDL_GetError());
++        return 77;
++    }
++    ram = (uint8_t *)calloc(1, 0x100000);
++    setenv("RECOMP_MSAA", argc > 1 ? argv[1] : "1", 1);
++    setenv("RECOMP_RENDER_SCALE", "1", 1);
++    setenv("RECOMP_PS_SPEC", "0", 1);
++    if (!ram || !nv2a_d3d_init()) {
++        puts("FAIL: nv2a_d3d_init");
++        return 1;
++    }
++    nv2a_vsh_set_constant(100, c100); nv2a_vsh_set_constant(101, c101);
++    nv2a_vsh_set_constant(102, c102); nv2a_vsh_set_constant(103, c103);
++    nv2a_vsh_set_constant(104, c104); nv2a_vsh_set_constant(105, c105);
++
++    draw(0);
++    expect("pre-transformed", blue_quad, 1);
++
++    w = op(1, 0, 0, 3); src(w, 0, V, 0, XYZW, 0); out(w, 3, 0xF);
++    check("mov oD0, v3");
++
++    w = op(1, 0, 100, 0); src(w, 0, C, 0, XYZW, 0); out(w, 3, 0xF);
++    check("mov oD0, c100");
++
++    w = op(4, 0, 100, 0); src(w, 0, C, 0, XYZW, 0); src(w, 1, C, 0, XYZW, 0);
++    src(w, 2, C, 0, XYZW, 0); out(w, 3, 0xF);
++    check("mad");
++
++    w = op(1, 0, 100, 0); src(w, 0, C, 0, XYZW, 0); temp(w, 0, 0xF, 0);
++    w = op(2, 0, 101, 0); src(w, 0, T, 0, XYZW, 0); src(w, 1, C, 0, XYZW, 0); temp(w, 2, 0xF, 0);
++    w = op(1, 0, 0, 0); src(w, 0, T, 2, XYZW, 0); out(w, 3, 0xF);
++    check("temps");
++
++    w = op(7, 0, 100, 0); src(w, 0, C, 0, XYZW, 0); src(w, 1, C, 0, XYZW, 0); temp(w, 3, 8, 0);
++    w = op(1, 0, 0, 0); src(w, 0, T, 3, XXXX, 0); out(w, 3, 0xF);
++    check("dp4");
++
++    w = op(1, 0, 103, 0); src(w, 0, C, 0, WZYX ^ 0xFF, 1); temp(w, 4, 0xF, 0);
++    w = op(3, 0, 105, 0); src(w, 0, T, 4, XYZW, 0); src(w, 2, C, 0, XYZW, 0); out(w, 3, 0xF);
++    check("negate and swizzle");
++
++    w = op(0, 2, 105, 0); src(w, 2, C, 0, XXXX, 0); temp(w, 1, 0, 8);
++    w = op(1, 0, 0, 0); src(w, 0, T, 1, XXXX, 0); out(w, 3, 0xF);
++    check("rcp");
++
++    w = op(0, 4, 105, 0); src(w, 2, C, 0, YYYY, 0); temp(w, 5, 0, 4);
++    w = op(1, 0, 0, 0); src(w, 0, T, 5, YYYY, 0); out(w, 3, 0xF);
++    check("rsq");
++
++    w = op(13, 0, 104, 0); src(w, 0, C, 0, XXXX, 0);
++    w = op(1, 0, 101, 0); src(w, 0, C, 0, XYZW, 0); out(w, 3, 0xF);
++    w[3] |= 2u;                                     /* c[a0.x + 101] */
++    check("arl, relative constant");
++
++    w = op(2, 2, 100, 0); src(w, 0, C, 0, XYZW, 0); src(w, 1, C, 0, XYZW, 0);
++    src(w, 2, C, 0, WWWW, 0); temp(w, 6, 0xF, 8);
++    w = op(4, 0, 102, 0); src(w, 0, T, 6, XYZW, 0); src(w, 1, T, 1, XXXX, 0);
++    src(w, 2, C, 0, XYZW, 0); out(w, 3, 0xF);
++    check("paired mul and rcp");
++
++    w = op(11, 0, 100, 0); src(w, 0, C, 0, XYZW, 0); src(w, 1, C, 0, XYZW ^ 0xFF, 0); temp(w, 8, 0xF, 0);
++    w = op(1, 0, 0, 0); src(w, 0, T, 8, XYZW, 0); out(w, 3, 0xF);
++    check("slt");
++
++    w = op(1, 0, 100, 0); src(w, 0, C, 0, XYZW, 0); out(w, 3, 0xC);
++    w = op(1, 0, 103, 0); src(w, 0, C, 0, XYZW, 0); out(w, 3, 0x3);
++    check("masked writes");
++
++    w = op(1, 0, 102, 0); src(w, 0, C, 0, XYZW, 0); temp(w, 11, 0xF, 0);
++    w = op(3, 0, 100, 0); src(w, 0, T, 11, XYZW, 0); src(w, 2, C, 0, XYZW, 0); temp(w, 10, 0xF, 0);
++    w = op(1, 0, 0, 0); src(w, 0, T, 10, XYZW, 0); out(w, 3, 0xF);
++    check("R11 and R10");
++
++    printf("%d failure(s)\n", failures);
++    return failures != 0;
++}
