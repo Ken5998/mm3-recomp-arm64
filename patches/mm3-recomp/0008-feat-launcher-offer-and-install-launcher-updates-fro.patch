@@ -1,0 +1,180 @@
+From 929c6f53783e64624855978d2669048268c44224 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 21:48:08 +0000
+Subject: [PATCH 8/8] feat(launcher): offer and install launcher updates from
+ GitHub releases
+
+The launcher asks its setup script for a newer release when it starts and,
+when one exists, shows Update (B on a controller). The update downloads the
+release, checks its sha256 and replaces the launcher's files, then starts the
+new launcher, which asks for a build of the new version.
+---
+ src/mm3_setup.cpp | 79 ++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 71 insertions(+), 8 deletions(-)
+
+diff --git a/src/mm3_setup.cpp b/src/mm3_setup.cpp
+index 2842c48..0736691 100644
+--- a/src/mm3_setup.cpp
++++ b/src/mm3_setup.cpp
+@@ -54,9 +54,12 @@ Rml::String g_step, g_title, g_detail, g_error, g_hint, g_width = "0%";
+ bool g_busy;          /* the bar sweeps: the step cannot tell how far it is */
+ Rml::String g_note;   /* below the settings: Add to Steam and build results */
+ bool g_steaming;
++Rml::String g_latest; /* a newer launcher release, empty when none */
++bool g_updating;
++bool g_updated;       /* the update said @done: restart once it exits */
+ Rml::String g_iso;    /* what the current build reads */
+ 
+-Child g_build, g_scan, g_steam, g_chooser;
++Child g_build, g_scan, g_steam, g_chooser, g_check, g_update;
+ Rml::Vector<pid_t> g_openers; /* xdg-open, reaped as they finish */
+ 
+ Rml::String home_short(const Rml::String &path)
+@@ -293,7 +296,7 @@ void open_logs()
+ 
+ bool can_go()
+ {
+-    if (g_state == 1 || g_script.empty())
++    if (g_state == 1 || g_updating || g_script.empty())
+         return false;
+     if (g_state == 2 || g_have_files)
+         return true;
+@@ -344,9 +347,21 @@ void add_to_steam()
+     dirty("s_steaming");
+ }
+ 
++/* Replaces the launcher's files with the newest release, then starts it again. */
++void update_launcher()
++{
++    if (g_latest.empty() || g_updating || g_steaming || g_state == 1 || g_script.empty())
++        return;
++    g_updated = false;
++    g_updating = spawn(g_update, {"python3", g_script, "update"});
++    g_note = g_updating ? "Downloading launcher " + g_latest + "..." : "Could not start Python 3.";
++    dirty("s_note");
++    dirty("s_updating");
++}
++
+ void rebuild()
+ {
+-    if (g_active || g_steaming)
++    if (g_active || g_steaming || g_updating)
+         return;
+     g_active = true;
+     g_state = 0;
+@@ -472,10 +487,13 @@ const char kBody[] = R"RML(
+       <div class="ghost" data-if="!pad" data-event-click="quit()">Quit</div>
+       <div class="ghost" data-if="!pad" data-event-click="s_logs()">Logs</div>
+       <div class="ghost" data-if="!pad && s_state == 1" data-event-click="s_cancel()">Cancel</div>
++      <div class="ghost" data-if="!pad && s_latest != '' && s_state != 1 && !s_updating"
++        data-event-click="s_update()">Update to {{ s_latest }}</div>
+       <div id="hints" data-if="pad"><span data-if="s_state == 0 && !s_have_files"><span class="glyph">A</span>Select</span><span
+         class="glyph">Y</span>Logs<span class="glyph">Back</span>Quit<span data-if="s_state == 1"><span
+-        class="glyph">B</span>Cancel</span></div>
+-      <div id="s-status"></div>
++        class="glyph">B</span>Cancel</span><span data-if="s_latest != '' && s_state != 1 && !s_updating"><span
++        class="glyph">B</span>Update to {{ s_latest }}</span></div>
++      <div id="s-status">{{ s_note }}</div>
+       <div id="s-go" data-class-off="!s_can_go" data-event-click="s_go()"><span class="glyph start"
+         data-if="pad && s_can_go">Start</span>{{ s_go_label }}</div>
+     </div>
+@@ -484,8 +502,11 @@ const char kBody[] = R"RML(
+ 
+ /* The launcher's footer once the game is built. */
+ const char kFoot[] = R"RML(<div class="ghost" data-if="!pad && !s_steaming" data-event-click="s_steam()">Add to Steam</div>
+-    <div class="ghost" data-if="!pad && !s_steaming" data-event-click="s_rebuild()">Rebuild</div>)RML";
+-const char kPadHint[] = R"RML(<span class="glyph">X</span>Add to Steam)RML";
++    <div class="ghost" data-if="!pad && !s_steaming" data-event-click="s_rebuild()">Rebuild</div>
++    <div class="ghost" data-if="!pad && s_latest != '' && !s_updating && !s_steaming"
++      data-event-click="s_update()">Update to {{ s_latest }}</div>)RML";
++const char kPadHint[] = R"RML(<span class="glyph">X</span>Add to Steam<span
++  data-if="s_latest != '' && !s_updating"><span class="glyph">B</span>Update to {{ s_latest }}</span>)RML";
+ const char kNote[] = R"RML(<span data-if="s_note != '' && !missing">{{ s_note }}</span>)RML";
+ 
+ void insert(Rml::String &doc, const char *marker, const char *text, bool after)
+@@ -560,6 +581,8 @@ void init()
+         g_title = "This launcher is incomplete";
+         g_error = "setup/mm3_setup.py is missing next to the launcher. Extract the whole download again.";
+     }
++    else /* quietly: no network just means no update offer */
++        spawn(g_check, {"python3", g_script, "check"});
+     update_hint();
+ }
+ 
+@@ -568,7 +591,8 @@ void shutdown()
+     stop(g_build);
+     stop(g_scan);
+     stop(g_chooser);
+-    /* Adding to Steam restarts Steam: let it finish on its own. */
++    stop(g_check);
++    /* Adding to Steam restarts Steam and an update replaces files: let them finish on their own. */
+ }
+ 
+ bool active() { return g_active; }
+@@ -611,6 +635,8 @@ void bind(Rml::DataModelConstructor &m)
+     m.Bind("s_busy", &g_busy);
+     m.Bind("s_note", &g_note);
+     m.Bind("s_steaming", &g_steaming);
++    m.Bind("s_latest", &g_latest);
++    m.Bind("s_updating", &g_updating);
+     m.BindFunc("s_can_go", [](Rml::Variant &v) { v = can_go(); });
+     m.BindFunc("s_go_label", [](Rml::Variant &v) {
+         v = Rml::String(g_state == 1 ? "Building..." : g_state == 2 ? "Try again"
+@@ -638,6 +664,9 @@ void bind(Rml::DataModelConstructor &m)
+     m.BindEventCallback("s_rebuild", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &) {
+         rebuild();
+     });
++    m.BindEventCallback("s_update", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &) {
++        update_launcher();
++    });
+ }
+ 
+ void attach(Rml::DataModelHandle model)
+@@ -695,6 +724,36 @@ bool tick(double)
+         g_steaming = false;
+         dirty("s_steaming");
+     }
++    poll(g_check, [](const Rml::String &line) {
++        const Rml::Vector<Rml::String> f = fields(line);
++        if (f[0] == "@update" && f.size() >= 2) {
++            g_latest = f[1];
++            dirty("s_latest");
++        }
++    });
++    if (g_updating) {
++        if (!poll(g_update, [](const Rml::String &line) {
++                const Rml::Vector<Rml::String> f = fields(line);
++                if ((f[0] == "@done" || f[0] == "@error" || f[0] == "@progress") && f.size() >= 2)
++                    g_note = f[0] == "@progress" && f.size() >= 3 ? f[2] : f[1];
++                g_updated |= f[0] == "@done";
++                dirty("s_note");
++            })) {
++            g_updating = false;
++            dirty("s_updating");
++            if (g_updated && WIFEXITED(g_update.status) && WEXITSTATUS(g_update.status) == 0) {
++                /* The new launcher takes over; it asks for a build of the new version. */
++                const Rml::String launcher = g_app + "/mm3-launcher";
++                fprintf(stderr, "[setup] updated, starting %s\n", launcher.c_str());
++                fflush(nullptr);
++                execl(launcher.c_str(), launcher.c_str(), (char *)nullptr);
++                g_latest.clear();
++                g_note = "Updated. Start the launcher again.";
++                dirty("s_note");
++                dirty("s_latest");
++            }
++        }
++    }
+     return finished;
+ }
+ 
+@@ -722,6 +781,10 @@ bool on_key(Rml::Input::KeyIdentifier key)
+ 
+ bool on_pad(unsigned pressed)
+ {
++    if ((pressed & XINPUT_GAMEPAD_B) && !g_latest.empty() && g_state != 1 && !g_updating) {
++        update_launcher();
++        return true;
++    }
+     if (!g_active) {
+         if (pressed & XINPUT_GAMEPAD_X) {
+             add_to_steam();

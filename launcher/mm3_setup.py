@@ -5,6 +5,7 @@ The launcher runs this with the system's Python (standard library only) and
 reads its standard output, one event per line, tab separated:
 
   @disc      PATH  BYTES          a disc image `scan` found
+  @update    VERSION              `check` found a newer launcher release
   @step      N  TOTAL  TITLE      a build step starts
   @progress  FRACTION  DETAIL     -1 when the step cannot tell how far it is
   @done      MESSAGE
@@ -17,6 +18,8 @@ Everything the tools print goes to logs/build.log in the data folder.
                                 ISO, rebuild from the game files already copied
   mm3_setup.py steam            add the game to Steam with its artwork
   mm3_setup.py status           @done if the game is built for this launcher
+  mm3_setup.py check            @update if a newer launcher is released
+  mm3_setup.py update           replace this launcher with the newest release
   mm3_setup.py toolchain        fetch the build tools; @done with the CMake
                                 toolchain file (for CI and packaging)
   mm3_setup.py artwork DIR      (internal) draw the Steam artwork into DIR
@@ -905,6 +908,90 @@ def artwork(out: Path) -> int:
     return 0
 
 
+# --- Launcher updates ----------------------------------------------------------
+
+RELEASES = "https://api.github.com/repos/Ken5998/mm3-recomp-arm64/releases?per_page=20"
+ASSET = "MidtownMadness3-Launcher-linux-arm64.tar.gz"
+
+
+def version_key(text: str) -> tuple[int, ...] | None:
+    """(0, 1, 7) for "v0.1.7" or "0.1.7", None for anything else (sysroot-*)."""
+    parts = text.removeprefix("v").split(".")
+    return tuple(int(p) for p in parts) if all(p.isdigit() for p in parts) else None
+
+
+def newest_release() -> tuple[str, dict] | None:
+    """The newest launcher release newer than this one: (version, its asset)."""
+    request = urllib.request.Request(RELEASES, headers={"User-Agent": "mm3-recomp-arm64",
+                                                       "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(request, timeout=15) as response:
+        releases = json.load(response)
+    best = None
+    for release in releases:
+        key = version_key(release.get("tag_name", ""))
+        if not key or release.get("draft") or release.get("prerelease"):
+            continue
+        asset = next((a for a in release.get("assets", []) if a.get("name") == ASSET), None)
+        if asset and (best is None or key > best[0]):
+            best = (key, release["tag_name"].removeprefix("v"), asset)
+    current = version_key(version())
+    if best and current and best[0] > current:
+        return best[1], best[2]
+    return None
+
+
+def check() -> int:
+    """Quiet on failure: no network just means no update button."""
+    try:
+        found = newest_release()
+    except (OSError, ValueError) as error:
+        log(f"update check failed: {error}")
+        return 0
+    if found:
+        emit("update", found[0])
+    return 0
+
+
+def update() -> int:
+    """Replaces the files of this launcher's folder with the newest release's.
+    Each file is written beside its old copy and renamed over it, so the
+    running launcher keeps its own (now unlinked) binary until it restarts."""
+    try:
+        found = newest_release()
+    except (OSError, ValueError) as error:
+        raise Failure(f"Could not reach GitHub: {error}")
+    if not found:
+        emit("done", f"Version {version()} is the newest")
+        return 0
+    new_version, asset = found
+    digest = asset.get("digest") or ""
+    if not digest.startswith("sha256:"):
+        raise Failure(f"Release {new_version} has no checksum to verify it")
+    emit("step", 1, 2, f"Downloading launcher {new_version}")
+    archive = DATA / "downloads" / f"launcher-{new_version}.tar.gz"
+    size = int(asset.get("size") or 1)
+    download(asset["browser_download_url"], digest.removeprefix("sha256:"), archive,
+             "Launcher", 0, size)
+    emit("step", 2, 2, f"Installing launcher {new_version}")
+    emit("progress", -1, "Unpacking")
+    staged = DATA / "launcher-update"
+    unpack(archive, staged, 1, None)
+    if not (staged / "mm3-launcher").is_file() or not (staged / "setup/mm3_setup.py").is_file():
+        raise Failure("The downloaded launcher is incomplete")
+    target = APP.parent
+    for source in sorted(p for p in staged.rglob("*") if p.is_file()):
+        dest = target / source.relative_to(staged)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        temporary = dest.with_name(dest.name + ".update")
+        shutil.copy2(source, temporary)
+        os.replace(temporary, dest)
+    shutil.rmtree(staged, ignore_errors=True)
+    archive.unlink(missing_ok=True)
+    log(f"launcher updated to {new_version} in {target}")
+    emit("done", f"Updated to {new_version}")
+    return 0
+
+
 # --- Main ----------------------------------------------------------------------
 
 def main(argv: list[str]) -> int:
@@ -920,6 +1007,10 @@ def main(argv: list[str]) -> int:
             return steam()
         if command == "status":
             return status()
+        if command == "check":
+            return check()
+        if command == "update":
+            return update()
         if command == "toolchain":
             return toolchain()
         if command == "artwork":

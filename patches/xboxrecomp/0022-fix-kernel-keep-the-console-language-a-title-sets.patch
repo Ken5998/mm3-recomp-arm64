@@ -1,0 +1,156 @@
+From fec3b3cd9ec0ecf341b6c38b9e8f90daca9b7dc2 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 21:39:16 +0000
+Subject: [PATCH 22/22] fix(kernel): keep the console language a title sets
+
+ExSaveNonVolatileSetting dropped every write, so MM3's language choice was gone at the next start. On POSIX the XC_LANGUAGE value now lives in the save dir's TitleData/language; with nothing saved, $LANG picks it (it_IT gives Italian), and RECOMP_LANGUAGE still overrides both. tests/kernel_files_posix checks both paths.
+---
+ src/kernel/kernel_xbox.c             | 78 +++++++++++++++++++++++++---
+ tests/kernel_files_posix/test_main.c | 21 +++++++-
+ 2 files changed, 90 insertions(+), 9 deletions(-)
+
+diff --git a/src/kernel/kernel_xbox.c b/src/kernel/kernel_xbox.c
+index d80d24b..010de76 100644
+--- a/src/kernel/kernel_xbox.c
++++ b/src/kernel/kernel_xbox.c
+@@ -127,6 +127,57 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
+  *   - DVD Region: Region 1 (North America)
+  * ============================================================================ */
+ 
++/* The dashboard language (XC_LANGUAGE codes: 1 English, 2 Japanese, 3 German,
++ * 4 French, 5 Spanish, 6 Italian, 7 Korean, 8 Chinese, 9 Portuguese). A title's
++ * own language menu writes it with ExSaveNonVolatileSetting, so on POSIX it is
++ * kept in the save dir; without that MM3 was back in English every start.
++ * RECOMP_LANGUAGE overrides it; with nothing saved, $LANG picks it. */
++#ifndef _WIN32
++static BOOL language_file(char* path, DWORD size)
++{
++    return xbox_translate_path("\\Device\\Harddisk0\\Partition1\\TDATA\\language", path, size);
++}
++#endif
++
++static ULONG s_language;
++
++static ULONG xbox_language(void)
++{
++    static const struct { const char* prefix; ULONG code; } locales[] = {
++        { "ja", 2 }, { "de", 3 }, { "fr", 4 }, { "es", 5 }, { "it", 6 },
++        { "ko", 7 }, { "zh", 8 }, { "pt", 9 },
++    };
++    const char* e = getenv("RECOMP_LANGUAGE");
++    if (e && *e)
++        return (ULONG)strtoul(e, NULL, 0);
++    if (s_language)
++        return s_language;
++    s_language = 1;
++#ifndef _WIN32
++    {
++        char path[MAX_PATH];
++        FILE* f = language_file(path, sizeof(path)) ? fopen(path, "r") : NULL;
++        unsigned saved = 0;
++        if (f) {
++            if (fscanf(f, "%u", &saved) == 1 && saved >= 1 && saved <= 9)
++                s_language = saved;
++            fclose(f);
++            if (s_language == saved)
++                return s_language;
++        }
++    }
++#endif
++    {
++        const char* lang = getenv("LC_ALL");
++        if (!lang || !*lang) lang = getenv("LC_MESSAGES");
++        if (!lang || !*lang) lang = getenv("LANG");
++        for (size_t i = 0; lang && i < sizeof(locales) / sizeof(locales[0]); i++)
++            if (!strncmp(lang, locales[i].prefix, 2))
++                s_language = locales[i].code;
++    }
++    return s_language;
++}
++
+ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
+     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
+ {
+@@ -138,9 +189,8 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
+ 
+     switch (ValueIndex) {
+     case XC_LANGUAGE:
+-        /* English = 1 */
+         if (ValueLength >= sizeof(ULONG)) {
+-            *(PULONG)Value = 1;
++            *(PULONG)Value = xbox_language();
+             if (Type) *Type = 4; /* REG_DWORD */
+             if (ResultLength) *ResultLength = sizeof(ULONG);
+         }
+@@ -254,14 +304,26 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(
+     ULONG ValueIndex, ULONG Type, PVOID Value, ULONG ValueLength)
+ {
+     (void)Type;
+-    (void)Value;
+-    (void)ValueLength;
+ 
+     xbox_log(XBOX_LOG_INFO, XBOX_LOG_XBOX,
+-        "ExSaveNonVolatileSetting: index=0x%02X len=%u (ignored - read-only on PC)",
+-        ValueIndex, ValueLength);
+-
+-    /* Accept writes silently but don't persist them */
++        "ExSaveNonVolatileSetting: index=0x%02X len=%u", ValueIndex, ValueLength);
++
++    /* The language is kept (see xbox_language); other writes are accepted
++     * and dropped. */
++    if (ValueIndex == XC_LANGUAGE && Value && ValueLength >= sizeof(ULONG)) {
++        ULONG code = *(PULONG)Value;
++        if (code >= 1 && code <= 9) {
++            s_language = code;
++#ifndef _WIN32
++            char path[MAX_PATH];
++            FILE* f = language_file(path, sizeof(path)) ? fopen(path, "w") : NULL;
++            if (f) {
++                fprintf(f, "%u\n", (unsigned)code);
++                fclose(f);
++            }
++#endif
++        }
++    }
+     return STATUS_SUCCESS;
+ }
+ 
+diff --git a/tests/kernel_files_posix/test_main.c b/tests/kernel_files_posix/test_main.c
+index e8b5884..dfdc7f9 100644
+--- a/tests/kernel_files_posix/test_main.c
++++ b/tests/kernel_files_posix/test_main.c
+@@ -2,7 +2,7 @@
+  * Saves on the POSIX file backend, the way XAPI handles them: save folders
+  * under U:, a save file rewritten in place, a "*.*" search for the folders
+  * that stops at the first one, files opened relative to their folder, and a
+- * folder deleted on close. Each of these failed on Linux while Windows kept
++ * folder deleted on close, and the console language a title sets. Each of these failed on Linux while Windows kept
+  * the title's profile, so a restarted game found no profile at all.
+  */
+ #include "kernel.h"
+@@ -123,6 +123,25 @@ int main(void)
+         CHECK(stat(path, &st) != 0);
+     }
+ 
++    /* The language: $LANG until the title sets one, then what it set. */
++    {
++        ULONG value = 0, type = 0, len = 0;
++        char path[400];
++        FILE *f;
++        unsigned saved = 0;
++        setenv("LANG", "it_IT.UTF-8", 1);
++        CHECK(xbox_ExQueryNonVolatileSetting(XC_LANGUAGE, &type, &value, sizeof value, &len) == STATUS_SUCCESS);
++        CHECK(value == 6);
++        value = 4;
++        CHECK(xbox_ExSaveNonVolatileSetting(XC_LANGUAGE, 4, &value, sizeof value) == STATUS_SUCCESS);
++        value = 0;
++        CHECK(xbox_ExQueryNonVolatileSetting(XC_LANGUAGE, &type, &value, sizeof value, &len) == STATUS_SUCCESS);
++        CHECK(value == 4);
++        snprintf(path, sizeof path, "%s/TitleData/language", root);
++        CHECK((f = fopen(path, "r")) && fscanf(f, "%u", &saved) == 1 && saved == 4);
++        fclose(f);
++    }
++
+     printf("kernel files posix: ok\n");
+     return 0;
+ }

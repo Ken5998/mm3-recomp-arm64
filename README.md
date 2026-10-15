@@ -37,6 +37,11 @@ its saves, the build tools and logs) and installs nothing on the system. If
 [Pinyon Shift's ARM64 launcher](https://github.com/Ken5998/pinyon-shift-arm64)
 is installed, the build reuses its LLVM instead of downloading it again.
 
+When a new release is out, the launcher shows **Update to X** (**B** on the
+controller): it downloads the release, checks it and replaces itself, then
+asks you to **Build again** for the new version, reusing the game files it
+already copied.
+
 ## Playing
 
 - On ArmadaOS the handheld's controls reach the game when Steam starts it:
@@ -47,7 +52,8 @@ is installed, the build reuses its LLVM instead of downloading it again.
   controller and keyboard bindings. On a handheld the game starts full screen
   at the screen's resolution.
 - In the launcher: D-pad to move, **A** to change, **LB**/**RB** for tabs,
-  **Start** to play, **X** to add to Steam, **Back** to quit.
+  **Start** to play, **X** to add to Steam, **B** to update the launcher
+  when a new release is out, **Back** to quit.
 - **F11** or **Alt+Enter** switches full screen in game.
 
 ## Status

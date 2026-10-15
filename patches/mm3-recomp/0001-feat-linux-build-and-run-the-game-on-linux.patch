@@ -1,7 +1,7 @@
-From 9472786c05bfeee2b98be82ab488227ffe1229c2 Mon Sep 17 00:00:00 2001
+From fac608ab3028b81042f0599d26ba400211c8e0b9 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 03:31:15 +0000
-Subject: [PATCH 1/7] feat(linux): build and run the game on linux
+Subject: [PATCH 1/8] feat(linux): build and run the game on linux
 
 The game builds with GCC or Clang against the xboxrecomp runtime's
 Linux port: SDL2 for the window, input and audio, and the D3D11
