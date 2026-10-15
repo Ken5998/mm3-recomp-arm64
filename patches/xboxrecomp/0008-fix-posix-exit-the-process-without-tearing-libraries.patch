@@ -1,7 +1,7 @@
 From a909f80f0a7f00d5d1c7e0d63f14fd19cb3226ac Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 03:08:52 +0000
-Subject: [PATCH 08/19] fix(posix): exit the process without tearing libraries
+Subject: [PATCH 08/21] fix(posix): exit the process without tearing libraries
  down
 
 ExitProcess called exit(), which runs atexit handlers and C++ static

@@ -1,0 +1,404 @@
+From 136c59c5d2ebe301cdc4cab0c8016e912c23d5fd Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 15:58:44 +0000
+Subject: [PATCH 21/21] fix(kernel): keep a title's saves findable on POSIX
+
+On Linux MM3 made a new profile at every start: the save it wrote was never
+found again. The POSIX file backend differed from the Win32 one where a
+title's save code looks:
+
+- a "*.*" search matched only dotted names, so save folders never showed;
+  DOS wildcards are now translated too
+- closing a directory did not drop its listing, so a search stopped early
+  carried on under the next directory opened at the same handle
+- write access that includes FILE_APPEND_DATA (FILE_GENERIC_WRITE does)
+  opened the file O_APPEND, so a save rewritten in place grew at the end
+- names relative to a directory handle resolved against the working
+  directory, and deleting a save folder on close silently did nothing
+
+Partition1\TDATA and \UDATA, where XAPI mounts T: and U:, now go to the save
+dir rather than under the extracted disc. Opens and listings under the save
+folders are logged as [SAVE] lines. tests/kernel_files_posix covers each case.
+---
+ src/kernel/kernel_file.c                | 120 +++++++++++++++++++---
+ src/kernel/kernel_path.c                |   5 +
+ tests/kernel_files_posix/CMakeLists.txt |  13 +++
+ tests/kernel_files_posix/test_main.c    | 128 ++++++++++++++++++++++++
+ 4 files changed, 252 insertions(+), 14 deletions(-)
+ create mode 100644 tests/kernel_files_posix/CMakeLists.txt
+ create mode 100644 tests/kernel_files_posix/test_main.c
+
+diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
+index 7e4822d..5e3de43 100644
+--- a/src/kernel/kernel_file.c
++++ b/src/kernel/kernel_file.c
+@@ -786,7 +786,10 @@ static int posix_open_flags(ACCESS_MASK access, ULONG disposition)
+     /* O_TRUNC / O_CREAT imply write intent */
+     if ((extra & (O_TRUNC | O_CREAT)) && rw == O_RDONLY)
+         rw = O_RDWR;
+-    if (access & XBOX_FILE_APPEND_DATA)
++    /* Append-only access. With FILE_WRITE_DATA too (FILE_GENERIC_WRITE has
++     * both) writes go where the title asks: pwrite on an O_APPEND file
++     * ignores its offset, so a save rewritten in place grew at the end. */
++    if ((access & XBOX_FILE_APPEND_DATA) && !(access & XBOX_FILE_WRITE_DATA))
+         extra |= O_APPEND;
+     return rw | extra;
+ }
+@@ -823,6 +826,42 @@ static NTSTATUS errno_to_status(int e)
+     }
+ }
+ 
++/* An Xbox OBJECT_ATTRIBUTES path to a host path, as the Win32 backend's
++ * translate_obj_path: XDeleteSaveGame opens each child relative to its save
++ * directory, which resolved against the working directory here. */
++/* Opens and listings of the save folders go to the log (a few hundred lines
++ * at most): saves that do not survive a restart are otherwise invisible. */
++static void save_trace(const char* what, const char* path, const char* detail, int err)
++{
++    static int lines;
++    if (!strstr(path, "/UserData") && !strstr(path, "/TitleData")) return;
++    if (lines++ >= 300) return;
++    fprintf(stderr, "  [SAVE] %s %s %s%s%s\n", what, path, detail,
++            err ? ": " : "", err ? strerror(err) : "");
++}
++
++static BOOL posix_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
++                           char* host_path, DWORD buf_size)
++{
++    const char* xbox_path = get_xbox_path(ObjectAttributes);
++    if (!xbox_path)
++        return FALSE;
++    if (ObjectAttributes->RootDirectory && xbox_path[0] != '\\' &&
++        !(xbox_path[0] && xbox_path[1] == ':')) {
++        const char* root = w32_handle_path(ObjectAttributes->RootDirectory);
++        int n;
++        if (!root)
++            return FALSE;
++        n = snprintf(host_path, buf_size, "%s/%s", root, xbox_path);
++        if (n < 0 || (DWORD)n >= buf_size)
++            return FALSE;
++        for (char* p = host_path + strlen(root); *p; p++)
++            if (*p == '\\') *p = '/';
++        return TRUE;
++    }
++    return xbox_translate_path(xbox_path, host_path, buf_size);
++}
++
+ NTSTATUS __stdcall xbox_NtCreateFile(
+     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
+     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+@@ -835,8 +874,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+     if (!FileHandle || !ObjectAttributes)
+         return STATUS_INVALID_PARAMETER;
+ 
+-    const char* xbox_path = get_xbox_path(ObjectAttributes);
+-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH)) {
++    if (!posix_obj_path(ObjectAttributes, host_path, MAX_PATH)) {
+         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
+         return STATUS_OBJECT_PATH_NOT_FOUND;
+     }
+@@ -855,13 +893,27 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+ 
+     int fd;
+     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
+-        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
+-            mkdir(host_path, 0755);   /* EEXIST is fine */
++        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF) {
++            /* EEXIST is fine. Parents too: the title-ID folder under the
++             * save dir's UserData or TitleData that T: and U: point at may
++             * not exist yet when XAPI first opens it. */
++            if (mkdir(host_path, 0755) != 0 && errno == ENOENT) {
++                for (char* p = host_path + 1; *p; p++)
++                    if (*p == '/') { *p = 0; mkdir(host_path, 0755); *p = '/'; }
++                mkdir(host_path, 0755);
++            }
++        }
+         fd = open(host_path, O_RDONLY | O_DIRECTORY);
+     } else {
+         fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
+     }
+ 
++    {
++        char detail[48];
++        snprintf(detail, sizeof detail, "access=%08X disp=%u opts=%08X",
++                 (unsigned)DesiredAccess, (unsigned)CreateDisposition, (unsigned)CreateOptions);
++        save_trace("open", host_path, detail, fd < 0 ? errno : 0);
++    }
+     if (fd < 0) {
+         int e = errno;
+         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
+@@ -966,6 +1018,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
+ {
+     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
+     if (Handle && Handle != INVALID_HANDLE_VALUE) {
++        xbox_dir_context_drop(Handle);
+         CloseHandle(Handle);
+         return STATUS_SUCCESS;
+     }
+@@ -975,8 +1028,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
+ NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
+ {
+     char host_path[MAX_PATH];
+-    const char* xbox_path = get_xbox_path(ObjectAttributes);
+-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
++    if (!posix_obj_path(ObjectAttributes, host_path, MAX_PATH))
+         return STATUS_OBJECT_PATH_NOT_FOUND;
+     XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %s", host_path);
+     if (unlink(host_path) == 0) return STATUS_SUCCESS;
+@@ -1087,7 +1139,7 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
+              * matches NT "delete on close" semantics exactly. */
+             if (info->DeleteFile) {
+                 const char* p = w32_handle_path(FileHandle);
+-                if (p) unlink(p);
++                if (p && unlink(p) != 0) rmdir(p);  /* a save's folder */
+             }
+             IoStatusBlock->Status = STATUS_SUCCESS;
+             return STATUS_SUCCESS;
+@@ -1167,8 +1219,7 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
+ 
+     if (!FileInformation)
+         return STATUS_INVALID_PARAMETER;
+-    const char* xbox_path = get_xbox_path(ObjectAttributes);
+-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
++    if (!posix_obj_path(ObjectAttributes, host_path, MAX_PATH))
+         return STATUS_OBJECT_PATH_NOT_FOUND;
+     if (stat(host_path, &st) != 0)
+         return STATUS_OBJECT_NAME_NOT_FOUND;
+@@ -1195,6 +1246,42 @@ static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
+ static CRITICAL_SECTION s_dir_cs;
+ static BOOL s_dir_cs_init = FALSE;
+ 
++/* A closed directory handle takes its listing with it, as on Win32: handle
++ * objects are reused, and a search the title stopped early (at the first
++ * save it was after) otherwise went on under the next directory opened at
++ * the same address, answering with the old directory's next name. */
++void xbox_dir_context_drop(HANDLE FileHandle)
++{
++    if (!s_dir_cs_init)
++        return;
++    EnterCriticalSection(&s_dir_cs);
++    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
++        if (s_dir_contexts[i].handle == FileHandle) {
++            if (s_dir_contexts[i].dir)
++                closedir(s_dir_contexts[i].dir);
++            s_dir_contexts[i].dir = NULL;
++            s_dir_contexts[i].handle = NULL;
++        }
++    }
++    LeaveCriticalSection(&s_dir_cs);
++}
++
++/* An NT search pattern in fnmatch form. "*.*" matches every name, dotted or
++ * not, and the DOS wildcards '<', '>' and '"' mean "*", "?" and ".". */
++static void dos_pattern(const char* in, size_t n, char* out, size_t size)
++{
++    size_t o = 0;
++    if (n == 3 && !memcmp(in, "*.*", 3)) {
++        snprintf(out, size, "*");
++        return;
++    }
++    for (size_t i = 0; i < n && in[i] && o + 1 < size; i++) {
++        char c = in[i];
++        out[o++] = c == '<' ? '*' : c == '>' ? '?' : c == '"' ? '.' : c;
++    }
++    out[o] = 0;
++}
++
+ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+@@ -1230,16 +1317,21 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+         const char* dpath = w32_handle_path(FileHandle);
+         if (!dpath) { LeaveCriticalSection(&s_dir_cs); return STATUS_UNSUCCESSFUL; }
+         ctx->dir = opendir(dpath);
++        if (FileName && FileName->Buffer && FileName->Length > 0) {
++            char pattern[64];
++            dos_pattern(FileName->Buffer, FileName->Length, pattern, sizeof(pattern));
++            save_trace("list", dpath, pattern, ctx->dir ? 0 : errno);
++        } else {
++            save_trace("list", dpath, "*", ctx->dir ? 0 : errno);
++        }
+         if (!ctx->dir) {
+             LeaveCriticalSection(&s_dir_cs);
+             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+             return STATUS_NO_MORE_FILES;
+         }
+         if (FileName && FileName->Buffer && FileName->Length > 0) {
+-            USHORT n = FileName->Length;
+-            if (n >= sizeof(ctx->pattern)) n = sizeof(ctx->pattern) - 1;
+-            memcpy(ctx->pattern, FileName->Buffer, n);
+-            ctx->pattern[n] = '\0';
++            dos_pattern(FileName->Buffer, FileName->Length, ctx->pattern,
++                        sizeof(ctx->pattern));
+         } else {
+             strcpy(ctx->pattern, "*");
+         }
+diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
+index 3a2218f..465644c 100644
+--- a/src/kernel/kernel_path.c
++++ b/src/kernel/kernel_path.c
+@@ -47,6 +47,11 @@ typedef struct {
+ 
+ static const path_rule s_rules[] = {
+     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
++    /* XAPI mounts T: and U: on these. They hold the title's saves, so they
++     * belong with the save dir, not under the extracted disc that a rebuild
++     * from another image replaces. */
++    { "\\Device\\Harddisk0\\Partition1\\TDATA\\", 1, "\\TitleData", "/TitleData" },
++    { "\\Device\\Harddisk0\\Partition1\\UDATA\\", 1, "\\UserData", "/UserData"  },
+     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
+     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
+      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
+diff --git a/tests/kernel_files_posix/CMakeLists.txt b/tests/kernel_files_posix/CMakeLists.txt
+new file mode 100644
+index 0000000..afff82e
+--- /dev/null
++++ b/tests/kernel_files_posix/CMakeLists.txt
+@@ -0,0 +1,13 @@
++cmake_minimum_required(VERSION 3.20)
++project(kernel_files_posix_test C)
++# The POSIX file backend doing what a title's save code needs between runs.
++if(WIN32)
++    message(FATAL_ERROR "This regression covers the POSIX file backend")
++endif()
++set(CMAKE_C_STANDARD 11)
++add_subdirectory(../.. runtime)
++add_executable(kernel_files_posix_test test_main.c)
++target_include_directories(kernel_files_posix_test PRIVATE ../../src/kernel)
++target_link_libraries(kernel_files_posix_test PRIVATE xboxrecomp)
++enable_testing()
++add_test(NAME kernel_files_posix_test COMMAND kernel_files_posix_test)
+diff --git a/tests/kernel_files_posix/test_main.c b/tests/kernel_files_posix/test_main.c
+new file mode 100644
+index 0000000..e8b5884
+--- /dev/null
++++ b/tests/kernel_files_posix/test_main.c
+@@ -0,0 +1,128 @@
++/*
++ * Saves on the POSIX file backend, the way XAPI handles them: save folders
++ * under U:, a save file rewritten in place, a "*.*" search for the folders
++ * that stops at the first one, files opened relative to their folder, and a
++ * folder deleted on close. Each of these failed on Linux while Windows kept
++ * the title's profile, so a restarted game found no profile at all.
++ */
++#include "kernel.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++typedef void (*recomp_func_t)(void);
++recomp_func_t recomp_lookup(uint32_t xbox_va);
++recomp_func_t recomp_lookup(uint32_t xbox_va) { (void)xbox_va; return NULL; }
++recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
++recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NULL; }
++
++#define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); exit(1); } } while (0)
++
++#define GENERIC_WRITE_ACCESS 0x00120116u /* FILE_GENERIC_WRITE: WRITE_DATA | APPEND_DATA | ... */
++#define LIST_ACCESS          0x00100001u /* SYNCHRONIZE | FILE_LIST_DIRECTORY */
++
++static HANDLE open_at(HANDLE root, const char *name, ULONG access, ULONG disposition, ULONG options)
++{
++    XBOX_ANSI_STRING s = { (USHORT)strlen(name), (USHORT)strlen(name) + 1, (PCHAR)name };
++    XBOX_OBJECT_ATTRIBUTES oa = { root, &s, 0 };
++    XBOX_IO_STATUS_BLOCK io;
++    HANDLE h = NULL;
++    NTSTATUS st = xbox_NtCreateFile(&h, access, &oa, &io, NULL, 0, 0, disposition, options);
++    return st == STATUS_SUCCESS ? h : NULL;
++}
++
++/* Next name of a search, or NULL at its end; attributes in *attrs. */
++static const char *next_name(HANDLE dir, const char *pattern, ULONG *attrs)
++{
++    static union { XBOX_FILE_DIRECTORY_INFORMATION info; char raw[512]; } buf;
++    static char name[256];
++    XBOX_ANSI_STRING s = { 0, 0, (PCHAR)pattern };
++    XBOX_IO_STATUS_BLOCK io;
++    if (pattern) s.Length = (USHORT)strlen(pattern), s.MaximumLength = s.Length + 1;
++    NTSTATUS st = xbox_NtQueryDirectoryFile(dir, NULL, NULL, NULL, &io, &buf, sizeof buf,
++                                            XboxFileDirectoryInformation, pattern ? &s : NULL, FALSE);
++    if (st != STATUS_SUCCESS) return NULL;
++    memcpy(name, buf.info.FileName, buf.info.FileNameLength);
++    name[buf.info.FileNameLength] = 0;
++    *attrs = buf.info.FileAttributes;
++    return name;
++}
++
++int main(void)
++{
++    char root[] = "/tmp/kernel_files_posix_XXXXXX", game[300];
++    XBOX_IO_STATUS_BLOCK io;
++    LARGE_INTEGER zero = { 0 };
++    char data[32] = { 0 };
++    ULONG attrs = 0;
++    const char *name;
++    struct stat st;
++    HANDLE h, dir;
++
++    CHECK(mkdtemp(root));
++    snprintf(game, sizeof game, "%s/game", root);
++    mkdir(game, 0755);
++    xbox_path_init(game, root);
++
++    /* Two save folders and a save file, written and then rewritten in place. */
++    CHECK((h = open_at(NULL, "U:\\A_save", LIST_ACCESS, XBOX_FILE_OPEN_IF, XBOX_FILE_DIRECTORY_FILE)));
++    xbox_NtClose(h);
++    CHECK((h = open_at(NULL, "U:\\B_save", LIST_ACCESS, XBOX_FILE_OPEN_IF, XBOX_FILE_DIRECTORY_FILE)));
++    xbox_NtClose(h);
++    /* XAPI's own folder for the title, parents and all. */
++    CHECK((h = open_at(NULL, "\\Device\\Harddisk0\\Partition1\\UDATA\\4d530011\\Profile",
++                       LIST_ACCESS, XBOX_FILE_OPEN_IF, XBOX_FILE_DIRECTORY_FILE)));
++    xbox_NtClose(h);
++    {
++        char path[400];
++        snprintf(path, sizeof path, "%s/UserData/4d530011/Profile", root);
++        CHECK(stat(path, &st) == 0 && S_ISDIR(st.st_mode));
++    }
++    CHECK((h = open_at(NULL, "U:\\A_save\\data.bin", GENERIC_WRITE_ACCESS, XBOX_FILE_OVERWRITE_IF, 0)));
++    CHECK(xbox_NtWriteFile(h, NULL, NULL, NULL, &io, "hello world", 11, &zero) == STATUS_SUCCESS);
++    CHECK(xbox_NtWriteFile(h, NULL, NULL, NULL, &io, "HELLO", 5, &zero) == STATUS_SUCCESS);
++    xbox_NtClose(h);
++
++    /* The folder search sees folders through "*.*" and stops at the first. */
++    CHECK((dir = open_at(NULL, "U:\\", LIST_ACCESS, XBOX_FILE_OPEN, XBOX_FILE_DIRECTORY_FILE)));
++    CHECK((name = next_name(dir, "*.*", &attrs)));
++    CHECK(!strcmp(name, "A_save") || !strcmp(name, "B_save"));
++    CHECK(attrs & 0x10);
++    xbox_NtClose(dir);
++
++    /* A new listing starts afresh, whichever handle it gets. */
++    for (int i = 0; i < 8; i++) {
++        CHECK((dir = open_at(NULL, "U:\\A_save", LIST_ACCESS, XBOX_FILE_OPEN, XBOX_FILE_DIRECTORY_FILE)));
++        CHECK((name = next_name(dir, "*", &attrs)) && !strcmp(name, "data.bin"));
++        CHECK(!(attrs & 0x10));
++        xbox_NtClose(dir);
++        CHECK((dir = open_at(NULL, "U:\\", LIST_ACCESS, XBOX_FILE_OPEN, XBOX_FILE_DIRECTORY_FILE)));
++        CHECK(next_name(dir, "<", &attrs));
++        xbox_NtClose(dir);
++    }
++
++    /* The file reads back rewritten, opened relative to its folder. */
++    CHECK((dir = open_at(NULL, "U:\\A_save", LIST_ACCESS, XBOX_FILE_OPEN, XBOX_FILE_DIRECTORY_FILE)));
++    CHECK((h = open_at(dir, "data.bin", 0x80000000u, XBOX_FILE_OPEN, 0)));
++    CHECK(xbox_NtReadFile(h, NULL, NULL, NULL, &io, data, sizeof data - 1, &zero) == STATUS_SUCCESS);
++    CHECK(io.Information == 11 && !strcmp(data, "HELLO world"));
++    xbox_NtClose(h);
++    xbox_NtClose(dir);
++
++    /* A folder marked for deletion goes. */
++    {
++        XBOX_FILE_DISPOSITION_INFORMATION del = { TRUE };
++        char path[400];
++        CHECK((h = open_at(NULL, "U:\\B_save", XBOX_DELETE | LIST_ACCESS, XBOX_FILE_OPEN, XBOX_FILE_DIRECTORY_FILE)));
++        CHECK(xbox_NtSetInformationFile(h, &io, &del, sizeof del, XboxFileDispositionInformation) == STATUS_SUCCESS);
++        xbox_NtClose(h);
++        snprintf(path, sizeof path, "%s/UserData/B_save", root);
++        CHECK(stat(path, &st) != 0);
++    }
++
++    printf("kernel files posix: ok\n");
++    return 0;
++}

@@ -24,7 +24,7 @@ work="$(mktemp -d)"
 export LD_LIBRARY_PATH="$data/lib"
 
 tests=(
-    mmio_decode_posix win32_handles_posix thread_dump_posix clock_posix apu_lock_posix d3d11_dxvk_posix d3d8_smoke adpcm_decode
+    mmio_decode_posix win32_handles_posix thread_dump_posix kernel_files_posix clock_posix apu_lock_posix d3d11_dxvk_posix d3d8_smoke adpcm_decode
     wma_decoder apu_mixdown dsp cpu_helpers fist fp_precision mmx_rounding nv2a_combiner nv2a_vsh nv2a_vsh_gpu
 )
 failed=()
