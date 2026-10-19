@@ -1,7 +1,7 @@
 From b7d81ceb33bff0d243761eef699937cb4f31fb8c Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 23:00:07 +0000
-Subject: [PATCH 03/23] feat(input): xinput over sdl2 game controllers on linux
+Subject: [PATCH 03/24] feat(input): xinput over sdl2 game controllers on linux
 
 The POSIX input backend was a separate SDL2 path without the keyboard
 pad, RECOMP_KEYMAP, RECOMP_PADMAP, the menu pointer or hotplug. Linux now

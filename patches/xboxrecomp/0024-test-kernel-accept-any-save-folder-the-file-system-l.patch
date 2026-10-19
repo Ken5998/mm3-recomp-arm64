@@ -1,0 +1,31 @@
+From a729b3a053f7a1ea3b7b12024970a4c0f8433088 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 19:58:34 +0000
+Subject: [PATCH 24/24] test(kernel): accept any save folder the file system
+ lists first
+
+The folder search check expected A_save or B_save, but the title's own
+4d530011 folder sits beside them and some file systems list it first, as the
+ARM64 CI's did.
+---
+ tests/kernel_files_posix/test_main.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/tests/kernel_files_posix/test_main.c b/tests/kernel_files_posix/test_main.c
+index dfdc7f9..c14e988 100644
+--- a/tests/kernel_files_posix/test_main.c
++++ b/tests/kernel_files_posix/test_main.c
+@@ -86,10 +86,11 @@ int main(void)
+     CHECK(xbox_NtWriteFile(h, NULL, NULL, NULL, &io, "HELLO", 5, &zero) == STATUS_SUCCESS);
+     xbox_NtClose(h);
+ 
+-    /* The folder search sees folders through "*.*" and stops at the first. */
++    /* The folder search sees folders through "*.*" and stops at the first,
++     * whichever the file system lists first. */
+     CHECK((dir = open_at(NULL, "U:\\", LIST_ACCESS, XBOX_FILE_OPEN, XBOX_FILE_DIRECTORY_FILE)));
+     CHECK((name = next_name(dir, "*.*", &attrs)));
+-    CHECK(!strcmp(name, "A_save") || !strcmp(name, "B_save"));
++    CHECK(!strcmp(name, "A_save") || !strcmp(name, "B_save") || !strcmp(name, "4d530011"));
+     CHECK(attrs & 0x10);
+     xbox_NtClose(dir);
+ 

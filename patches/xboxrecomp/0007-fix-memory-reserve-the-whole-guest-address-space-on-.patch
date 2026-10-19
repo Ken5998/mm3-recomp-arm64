@@ -1,7 +1,7 @@
 From f00270de407d12e26883dcc0011c0297af9bcd05 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 03:04:07 +0000
-Subject: [PATCH 07/23] fix(memory): reserve the whole guest address space on
+Subject: [PATCH 07/24] fix(memory): reserve the whole guest address space on
  linux
 
 The span covered RAM, its mirrors and the contiguous window only, so
