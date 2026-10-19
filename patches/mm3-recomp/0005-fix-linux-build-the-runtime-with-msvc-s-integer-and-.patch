@@ -1,7 +1,7 @@
 From 9cc1ffcf96729006057935476c7f74146896f9a0 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 18:00:52 +0000
-Subject: [PATCH 5/8] fix(linux): build the runtime with msvc's integer and
+Subject: [PATCH 5/9] fix(linux): build the runtime with msvc's integer and
  char semantics
 
 Only the translated code was built with -fno-strict-aliasing, -fwrapv and

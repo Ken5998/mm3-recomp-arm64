@@ -49,7 +49,8 @@ already copied.
   Desktop Mode.
 - The launcher's **Settings**, **Controls** and **Mods** are mm3-recomp's:
   display mode, frame limit, tick rate, widescreen, draw distance and the
-  controller and keyboard bindings. On a handheld the game starts full screen
+  controller and keyboard bindings. **Language** picks the game's language
+  (the Xbox took it from the console's settings); Auto follows the system. On a handheld the game starts full screen
   at the screen's resolution.
 - In the launcher: D-pad to move, **A** to change, **LB**/**RB** for tabs,
   **Start** to play, **X** to add to Steam, **B** to update the launcher
@@ -82,6 +83,10 @@ If the game stops somewhere without closing, start it from a terminal with
 `RECOMP_THREAD_DUMP_SECS=20 ~/.local/share/MidtownMadness3/midtown-madness-3.sh`,
 leave it stopped for a minute and close it: `game.log` then says where each of
 the game's threads is.
+
+If the sound breaks up in a way it did not before 0.1.8, add
+`RECOMP_APU_PIPELINE=0 %command%` to the game's launch options in Steam: the
+audio's voices and DSPs then run one after the other again, as before.
 
 ## Developers
 

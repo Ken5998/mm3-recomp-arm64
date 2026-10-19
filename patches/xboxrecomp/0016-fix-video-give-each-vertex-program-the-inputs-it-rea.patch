@@ -1,7 +1,7 @@
 From 5345ecf5ed07dfd82eec56437476d51c626ae1a7 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 09:13:18 +0000
-Subject: [PATCH 16/22] fix(video): give each vertex program the inputs it
+Subject: [PATCH 16/23] fix(video): give each vertex program the inputs it
  reads under vkd3d
 
 vkd3d's HLSL compiler keeps an array that is only written at constant

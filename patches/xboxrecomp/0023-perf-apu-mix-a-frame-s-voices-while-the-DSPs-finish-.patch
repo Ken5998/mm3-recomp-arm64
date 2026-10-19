@@ -1,0 +1,328 @@
+From cd8eb3287adabc5d6da0895f4e4d1a11c5d0b006 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 19:50:16 +0000
+Subject: [PATCH 23/23] perf(apu): mix a frame's voices while the DSPs finish
+ the last one
+
+In series a frame cost the voice processor plus the GP and EP DSPs. On a
+Retroid Pocket 6 with all of Midtown Madness 3's sounds on that was 210-470 us
+plus about 470 us for 667 us of sound, so the output fell behind and played
+gaps. The DSPs only take the mixbins the voices made, so on POSIX a worker now
+runs frame N-1 through the DSPs while the frame thread mixes frame N's voices,
+and a frame costs the larger of the two, one frame (667 us) later.
+
+The frame thread holds the APU lock until the worker is done, so the guest
+still sees one step; the worker does not drop the lock between DSP batches and
+stops a DSP that never goes idle after twice the hardware's cycles a frame.
+RECOMP_APU_PIPELINE=0 runs them in series again. dsp_apu_test now builds on
+Linux too and checks the worker's frame.
+---
+ src/apu/apu_core.c       | 163 ++++++++++++++++++++++++++++++++++++---
+ src/apu/apu_dsp.c        |   9 ++-
+ src/apu/apu_state.h      |  12 +++
+ tests/dsp/CMakeLists.txt |   7 +-
+ tests/dsp/dsp_apu_test.c |  31 ++++++++
+ 5 files changed, 210 insertions(+), 12 deletions(-)
+
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index 793fadb..d43b6e2 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -566,6 +566,144 @@ static void report_speed(int64_t vp_us, int64_t dsp_us, int64_t frame_us)
+  * se_frame - Process one audio frame (VP -> GP -> EP pipeline)
+  * ============================================================ */
+ 
++#ifndef _WIN32
++#include <pthread.h>
++
++/* The voice processor and the DSPs one frame apart on two cores.
++ *
++ * In series a frame cost the voices plus the DSPs: on a Retroid Pocket 6
++ * with all of MM3's sounds on, 210-470 us plus about 470 us for 667 us of
++ * sound, so the output fell behind and played gaps. The DSPs only take the
++ * mixbins the voices made, so while the frame thread mixes frame N's voices
++ * a worker runs frame N-1 through the GP and EP, and a frame costs the
++ * larger of the two. The sound comes out one frame (667 us) later.
++ *
++ * The frame thread keeps the APU lock until the worker is done, so to the
++ * guest the two halves are one step, as in series; the worker's DSP frame
++ * just does not drop the lock between batches (dsp_in_worker).
++ * RECOMP_APU_PIPELINE=0 runs them in series again. */
++#if defined(__linux__)
++static void apu_thread_to_fast_cores(void);
++#endif
++
++enum { PIPE_IDLE, PIPE_POSTED, PIPE_DONE };
++
++static struct {
++    pthread_mutex_t lock;
++    pthread_cond_t cond;
++    int state;                  /* PIPE_*, read without the lock to spin */
++    int enabled;                /* -1 not decided yet */
++    bool have_frame;            /* mixbins[current ^ 1] holds a frame to finish */
++    int current;
++    int64_t dsp_us;             /* what the last DSP frame took */
++    MCPXAPUState *d;
++    float mixbins[2][NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
++} s_pipe = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PIPE_IDLE, -1 };
++
++static inline void pipe_relax(void)
++{
++#if defined(__aarch64__)
++    __asm__ __volatile__("yield");
++#elif defined(__x86_64__) || defined(__i386__)
++    __builtin_ia32_pause();
++#endif
++}
++
++static void *pipe_worker(void *arg)
++{
++    (void)arg;
++#if defined(__linux__)
++    apu_thread_to_fast_cores();
++#endif
++    pthread_mutex_lock(&s_pipe.lock);
++    for (;;) {
++        while (__atomic_load_n(&s_pipe.state, __ATOMIC_ACQUIRE) != PIPE_POSTED)
++            pthread_cond_wait(&s_pipe.cond, &s_pipe.lock);
++        pthread_mutex_unlock(&s_pipe.lock);
++
++        int64_t start = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++        mcpx_apu_dsp_frame(s_pipe.d, s_pipe.mixbins[s_pipe.current ^ 1]);
++        s_pipe.dsp_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start;
++
++        pthread_mutex_lock(&s_pipe.lock);
++        __atomic_store_n(&s_pipe.state, PIPE_DONE, __ATOMIC_RELEASE);
++        pthread_cond_broadcast(&s_pipe.cond);
++    }
++    return NULL;
++}
++
++static bool pipe_start(MCPXAPUState *d)
++{
++    const char *env = getenv("RECOMP_APU_PIPELINE");
++    pthread_t thread;
++    s_pipe.enabled = 0;
++    if (env && *env == '0')
++        return false;
++    s_pipe.d = d;
++    if (pthread_create(&thread, NULL, pipe_worker, NULL) != 0) {
++        fprintf(stderr, "[APU] no worker thread: voices and DSPs run in series\n");
++        return false;
++    }
++    pthread_detach(thread);
++    s_pipe.enabled = 1;
++    fprintf(stderr, "[APU] voices and DSPs run one frame apart on two threads\n");
++    return true;
++}
++
++/* Waits for the worker's frame: spins briefly, as it is usually about done
++ * when the voices are, then sleeps. */
++static void pipe_wait(void)
++{
++    int64_t start = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++    while (__atomic_load_n(&s_pipe.state, __ATOMIC_ACQUIRE) == PIPE_POSTED) {
++        if (qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start > 200) {
++            pthread_mutex_lock(&s_pipe.lock);
++            while (__atomic_load_n(&s_pipe.state, __ATOMIC_ACQUIRE) == PIPE_POSTED)
++                pthread_cond_wait(&s_pipe.cond, &s_pipe.lock);
++            pthread_mutex_unlock(&s_pipe.lock);
++            break;
++        }
++        pipe_relax();
++    }
++}
++
++/* One frame with the voices and the DSPs overlapped; false when the
++ * pipeline is off and se_frame should run them in series. */
++static bool se_frame_pipelined(MCPXAPUState *d)
++{
++    if (s_pipe.enabled < 0 && !pipe_start(d))
++        return false;
++    if (!s_pipe.enabled)
++        return false;
++
++    int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++    bool posted = s_pipe.have_frame;
++    if (posted) {
++        d->dsp_in_worker = true;
++        pthread_mutex_lock(&s_pipe.lock);
++        __atomic_store_n(&s_pipe.state, PIPE_POSTED, __ATOMIC_RELEASE);
++        pthread_cond_broadcast(&s_pipe.cond);
++        pthread_mutex_unlock(&s_pipe.lock);
++    }
++
++    float (*mixbins)[NUM_SAMPLES_PER_FRAME] = s_pipe.mixbins[s_pipe.current];
++    memset(mixbins, 0, sizeof(s_pipe.mixbins[0]));
++    mcpx_apu_vp_frame(d, mixbins);
++    int64_t t1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++
++    if (posted) {
++        pipe_wait();
++        __atomic_store_n(&s_pipe.state, PIPE_IDLE, __ATOMIC_RELAXED);
++        d->dsp_in_worker = false;
++    }
++    s_pipe.current ^= 1;
++    s_pipe.have_frame = true;
++    report_speed(t1 - t0, posted ? s_pipe.dsp_us : 0,
++                 qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0);
++    return true;
++}
++#endif
++
+ static void se_frame(MCPXAPUState *d)
+ {
+     mcpx_apu_update_dsp_preference(d);
+@@ -584,16 +722,21 @@ static void se_frame(MCPXAPUState *d)
+     }
+     d->frame_count++;
+ 
+-    /* Buffer for all mixbins for this frame */
+-    float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+-    memset(mixbins, 0, sizeof(mixbins));
+-
+-    int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+-    mcpx_apu_vp_frame(d, mixbins);
+-    int64_t t1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+-    mcpx_apu_dsp_frame(d, mixbins);
+-    int64_t t2 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+-    report_speed(t1 - t0, t2 - t1, t2 - t0);
++#ifndef _WIN32
++    if (!se_frame_pipelined(d))
++#endif
++    {
++        /* Buffer for all mixbins for this frame */
++        float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
++        memset(mixbins, 0, sizeof(mixbins));
++
++        int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++        mcpx_apu_vp_frame(d, mixbins);
++        int64_t t1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++        mcpx_apu_dsp_frame(d, mixbins);
++        int64_t t2 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++        report_speed(t1 - t0, t2 - t1, t2 - t0);
++    }
+     mcpx_apu_monitor_frame(d);
+ 
+     d->ep_frame_div++;
+diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
+index 1dffc5e..286d0fc 100644
+--- a/src/apu/apu_dsp.c
++++ b/src/apu/apu_dsp.c
+@@ -336,7 +336,14 @@ static void run_dsp_frame(MCPXAPUState *d, DSPState *dsp)
+             batches[index]++;
+         }
+         if (!dsp_has_work(dsp) || qatomic_read(&d->exiting)) break;
+-        /* Guest MMIO must be able to reset or command a continuously running DSP. */
++        /* Guest MMIO must be able to reset or command a continuously running DSP.
++         * On the pipeline's worker the frame thread holds the lock and lets
++         * the guest in once both halves of the frame are done. */
++        if (d->dsp_in_worker) {
++            if (dsp->core.cycle_count >= DSP_WORKER_FRAME_CYCLES)
++                break;
++            continue;
++        }
+ #ifdef _WIN32
+         qemu_mutex_unlock(&d->lock);
+         Sleep(0);
+diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
+index 9d09b25..eaa5ffd 100644
+--- a/src/apu/apu_state.h
++++ b/src/apu/apu_state.h
+@@ -358,6 +358,11 @@ struct MCPXAPUState {
+     /*< public >*/
+ 
+     bool exiting;
++    /* The DSP frame runs on the pipeline's worker while the frame thread,
++     * holding the lock for it, runs the next frame's voices: it must not
++     * drop a lock it does not hold (apu_core.c, se_frame), and it stops a
++     * frame at DSP_WORKER_FRAME_CYCLES. */
++    bool dsp_in_worker;
+     bool set_irq;
+ 
+     QemuThread apu_thread;
+@@ -426,6 +431,13 @@ void mcpx_apu_vp_reset(MCPXAPUState *d);
+ void mcpx_apu_dsp_init(MCPXAPUState *d);
+ void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
+ void mcpx_apu_dsp_pcm_consumed(MCPXAPUState *d);
++/* What a DSP may run in one frame on the pipeline's worker: the MCPX's DSPs
++ * run at 160 MHz, about 107000 cycles a 667 us frame, so twice that. There
++ * the guest cannot reset a DSP mid frame, so one that never goes idle (a
++ * program in a loop, or one the title has yet to stop) carries on from where
++ * it was in the next frame instead of holding the frame thread for good. */
++#define DSP_WORKER_FRAME_CYCLES 213333
++
+ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+ /* Each DSP's time and cycles a frame since the last call, as text; counting
+  * then starts afresh. */
+diff --git a/tests/dsp/CMakeLists.txt b/tests/dsp/CMakeLists.txt
+index 79710ec..c07503f 100644
+--- a/tests/dsp/CMakeLists.txt
++++ b/tests/dsp/CMakeLists.txt
+@@ -53,11 +53,16 @@ if(DSP_XEMU_REFERENCE_DIR)
+     "-Dport=$<TARGET_FILE:dsp_dma_compare>" "-Dreference=$<TARGET_FILE:dsp_xemu_dma_compare>"
+     "-Doutput=${CMAKE_CURRENT_BINARY_DIR}/dma-results" -P "${CMAKE_CURRENT_SOURCE_DIR}/compare_dma.cmake")
+ endif()
+-if(WIN32)
++if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+   add_executable(dsp_apu_test dsp_apu_test.c apu_dsp_under_test.c)
+   target_include_directories(dsp_apu_test PRIVATE ../../src ../../src/apu)
+   target_compile_definitions(dsp_apu_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+   target_link_libraries(dsp_apu_test PRIVATE dsp_runtime)
++  if(NOT WIN32)
++    # Threads, waits and the APU lock come from the POSIX Win32 layer.
++    add_subdirectory(../../src/platform platform)
++    target_link_libraries(dsp_apu_test PRIVATE platform)
++  endif()
+   add_test(NAME dsp_apu COMMAND dsp_apu_test)
+   add_test(NAME dsp_frame_capture COMMAND "${CMAKE_COMMAND}" -E env
+     "RECOMP_DSP_FRAME_DUMP=${CMAKE_CURRENT_BINARY_DIR}/test-frame" "$<TARGET_FILE:dsp_apu_test>")
+diff --git a/tests/dsp/dsp_apu_test.c b/tests/dsp/dsp_apu_test.c
+index 73c9834..983ebea 100644
+--- a/tests/dsp/dsp_apu_test.c
++++ b/tests/dsp/dsp_apu_test.c
+@@ -56,6 +56,15 @@ static void run_locked_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAM
+     qemu_mutex_unlock(&d->lock);
+ }
+ 
++/* The audio pipeline's worker: the frame thread holds the lock for it. */
++static DWORD WINAPI worker_frame(void *opaque)
++{
++    MCPXAPUState *d = opaque;
++    float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME] = {0};
++    mcpx_apu_dsp_frame(d, mixbins);
++    return 0;
++}
++
+ static DWORD WINAPI looping_frame(void *opaque)
+ {
+     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME] = {0};
+@@ -570,6 +579,28 @@ int main(void)
+     }
+     CloseHandle(thread);
+     }
++    /* On the pipeline's worker a DSP that never goes idle ends its frame by
++     * itself, without the lock, which the frame thread holds meanwhile, and
++     * goes on from there in the next one. */
++    mcpx_apu_dsp_write(d, false, NV_PAPU_EPRST, 0, 4);
++    mcpx_apu_dsp_write(d, true, NV_PAPU_GPRST, 0, 4);
++    mcpx_apu_dsp_write(d, true, NV_PAPU_GPRST, 3, 4);
++    mcpx_apu_dsp_write(d, true, NV_PAPU_GPPMEM, 0x0c0000, 4); /* JMP 0 */
++    qatomic_set(&d->exiting, false);
++    for (unsigned frame = 0; frame < 2; frame++) {
++        qemu_mutex_lock(&d->lock);
++        d->dsp_in_worker = true;
++        HANDLE thread = CreateThread(NULL, 0, worker_frame, d, 0, NULL);
++        CHECK(thread);
++        CHECK(WaitForSingleObject(thread, 2000) == WAIT_OBJECT_0);
++        CloseHandle(thread);
++        d->dsp_in_worker = false;
++        CHECK(d->gp.dsp->core.cycle_count >= DSP_WORKER_FRAME_CYCLES);
++        CHECK(d->gp.dsp->core.cycle_count < DSP_WORKER_FRAME_CYCLES + 2000);
++        CHECK(!d->gp.dsp->core.is_idle && dsp_has_work(d->gp.dsp));
++        qemu_mutex_unlock(&d->lock);
++    }
++    mcpx_apu_dsp_write(d, true, NV_PAPU_GPRST, 0, 4);
+     free(d->gp.dsp);
+     free(d->ep.dsp);
+     free(d->monitor.ep_pcm_queue);

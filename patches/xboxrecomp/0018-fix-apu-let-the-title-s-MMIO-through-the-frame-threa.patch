@@ -1,7 +1,7 @@
 From bb432f182da8680deecd8bc045f0170bbf67438a Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 09:46:47 +0000
-Subject: [PATCH 18/22] fix(apu): let the title's MMIO through the frame
+Subject: [PATCH 18/23] fix(apu): let the title's MMIO through the frame
  thread's lock on POSIX
 
 The frame thread holds d->lock while it runs behind real time and drops it

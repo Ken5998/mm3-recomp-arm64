@@ -1,0 +1,28 @@
+From 3234afa1b2d09ac78b90409734b4113935614423 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 19:45:21 +0000
+Subject: [PATCH 9/9] feat(launcher): choose the game's language
+
+MM3 reads the console language (XC_LANGUAGE) when it starts and has no
+language menu of its own, so the launcher's Settings gain a Language row that
+sets RECOMP_LANGUAGE. Auto keeps the system's language.
+---
+ src/mm3_launcher.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/mm3_launcher.cpp b/src/mm3_launcher.cpp
+index f9aaabe..f04d50c 100644
+--- a/src/mm3_launcher.cpp
++++ b/src/mm3_launcher.cpp
+@@ -70,6 +70,11 @@ Rml::Vector<Option> g_options = {
+      {{"0", "Off"}, {"1", "On"}}},
+     {"", "In the background", "When another window is in front.", "RECOMP_PAUSE_UNFOCUSED", "1", "",
+      {{"1", "Pause"}, {"0", "Keep running"}}},
++    /* The console language the title reads at start (XC_LANGUAGE); MM3 has no
++     * menu of its own for it. Auto: the system's language, else English. */
++    {"", "Language", "Menus and speech. Auto follows the system language.", "RECOMP_LANGUAGE", "", "",
++     {{"", "Auto"}, {"1", "English"}, {"4", "Fran\xc3\xa7" "ais"}, {"3", "Deutsch"}, {"6", "Italiano"},
++      {"5", "Espa\xc3\xb1ol"}, {"2", "Japanese"}}},
+     {"Graphics", "Internal resolution", "Fixed multiple of 480 lines; overrides supersampling.",
+      "RECOMP_RENDER_SCALE", "", "", {{"", "Auto"}, {"1", "480p"}, {"2", "960p"}, {"3", "1440p"}, {"4", "1920p"}}},
+     {"", "Supersampling", "Pixels rendered per window pixel.", "RECOMP_SUPERSAMPLE", "2", "",
