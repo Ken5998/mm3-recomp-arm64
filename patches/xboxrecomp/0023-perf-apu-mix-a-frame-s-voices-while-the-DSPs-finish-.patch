@@ -1,7 +1,7 @@
 From cd8eb3287adabc5d6da0895f4e4d1a11c5d0b006 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 19:50:16 +0000
-Subject: [PATCH 23/24] perf(apu): mix a frame's voices while the DSPs finish
+Subject: [PATCH 23/26] perf(apu): mix a frame's voices while the DSPs finish
  the last one
 
 In series a frame cost the voice processor plus the GP and EP DSPs. On a

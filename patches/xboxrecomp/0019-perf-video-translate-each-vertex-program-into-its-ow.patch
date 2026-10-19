@@ -1,7 +1,7 @@
 From 412ea79b81c60b8c83f4405fcdb76b442f647a97 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 14:42:35 +0000
-Subject: [PATCH 19/24] perf(video): translate each vertex program into its own
+Subject: [PATCH 19/26] perf(video): translate each vertex program into its own
  shader
 
 ub_vs interprets the vertex program per vertex, keeping the temporaries,

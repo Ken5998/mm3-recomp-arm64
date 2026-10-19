@@ -1,0 +1,38 @@
+From 9b53eeaa16e7495fc5a28d188ca49b845d6bef82 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 20:54:55 +0000
+Subject: [PATCH 26/26] fix(apu): run voices and DSPs in series unless asked
+
+On a Retroid Pocket 6 the GP DSP took a quarter longer on the pipeline's
+worker than on the frame thread, so frames ended up no shorter and the sound
+broke up more. RECOMP_APU_PIPELINE=1 still turns the pipeline on.
+---
+ src/apu/apu_core.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index d43b6e2..9d59b7e 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -581,7 +581,11 @@ static void report_speed(int64_t vp_us, int64_t dsp_us, int64_t frame_us)
+  * The frame thread keeps the APU lock until the worker is done, so to the
+  * guest the two halves are one step, as in series; the worker's DSP frame
+  * just does not drop the lock between batches (dsp_in_worker).
+- * RECOMP_APU_PIPELINE=0 runs them in series again. */
++ *
++ * Off unless RECOMP_APU_PIPELINE=1: on a Retroid Pocket 6 the GP took a
++ * quarter longer on the worker than on the frame thread (another core, with
++ * the game's own threads), so the frames ended up no shorter and the sound
++ * broke up more. */
+ #if defined(__linux__)
+ static void apu_thread_to_fast_cores(void);
+ #endif
+@@ -637,7 +641,7 @@ static bool pipe_start(MCPXAPUState *d)
+     const char *env = getenv("RECOMP_APU_PIPELINE");
+     pthread_t thread;
+     s_pipe.enabled = 0;
+-    if (env && *env == '0')
++    if (!env || *env != '1')
+         return false;
+     s_pipe.d = d;
+     if (pthread_create(&thread, NULL, pipe_worker, NULL) != 0) {

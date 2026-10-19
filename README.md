@@ -68,9 +68,9 @@ The first seconds stutter while shaders compile; later runs load them from
 `~/.local/share/MidtownMadness3/cache/shaders`. Version 0.1.6 makes the audio
 DSP emulation 1.4x lighter and keeps profiles and progress between runs, in
 `~/.local/share/MidtownMadness3/saves`. Version 0.1.7 updates the launcher
-from its own **Update** button. Version 0.1.8 adds a **Language** setting
-and runs the audio's voices and DSPs side by side, which they need to keep up
-with all of the game's sounds on.
+from its own **Update** button. Version 0.1.8 adds a **Language** setting,
+and 0.1.9 makes the 3D sound filter 3.5x lighter so the audio can keep up with
+all of the game's sounds on.
 mm3-recomp itself is a work in
 progress, so expect rough edges, and back up your saves.
 
@@ -85,9 +85,6 @@ If the game stops somewhere without closing, start it from a terminal with
 leave it stopped for a minute and close it: `game.log` then says where each of
 the game's threads is.
 
-If the sound breaks up in a way it did not before 0.1.8, add
-`RECOMP_APU_PIPELINE=0 %command%` to the game's launch options in Steam: the
-audio's voices and DSPs then run one after the other again, as before.
 
 ## Developers
 

@@ -1,7 +1,7 @@
 From e24aedd841f772672e99da22f7c74f763ef675bb Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 15:54:04 +0000
-Subject: [PATCH 20/24] perf(apu): run the DSP interpreter's hot paths inline
+Subject: [PATCH 20/26] perf(apu): run the DSP interpreter's hot paths inline
 
 The GP DSP runs a fixed effect chain of about 24,000 instructions a frame and
 took 610-720 us of the 667 us audio frame on the RP6, so sound fell behind.

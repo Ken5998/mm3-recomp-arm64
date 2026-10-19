@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds xboxrecomp's runtime tests with the toolchain the launcher installs on
 # a handheld (package-launcher.sh sets it up) and runs them: the device
-# register traps, the Win32 handle layer, the thread dump, the clocks, the audio lock, the
+# register traps, the Win32 handle layer, the thread dump, the clocks, the audio lock and HRTF, the
 # D3D11 renderer on DXVK and its vertex programs, audio decoding and DSP, and the x87 and
 # MMX helpers;
 # d3d8_smoke, whose checks are Windows only, builds the whole runtime. The renderer tests
@@ -24,7 +24,7 @@ work="$(mktemp -d)"
 export LD_LIBRARY_PATH="$data/lib"
 
 tests=(
-    mmio_decode_posix win32_handles_posix thread_dump_posix kernel_files_posix clock_posix apu_lock_posix d3d11_dxvk_posix d3d8_smoke adpcm_decode
+    mmio_decode_posix win32_handles_posix thread_dump_posix kernel_files_posix clock_posix apu_lock_posix apu_hrtf d3d11_dxvk_posix d3d8_smoke adpcm_decode
     wma_decoder apu_mixdown dsp cpu_helpers fist fp_precision mmx_rounding nv2a_combiner nv2a_vsh nv2a_vsh_gpu
 )
 failed=()

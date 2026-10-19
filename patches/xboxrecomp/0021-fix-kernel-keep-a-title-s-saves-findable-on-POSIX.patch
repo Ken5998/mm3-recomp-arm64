@@ -1,7 +1,7 @@
 From 52b7efd99a3c52d604231d549076f863355dcaab Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 15:58:44 +0000
-Subject: [PATCH 21/24] fix(kernel): keep a title's saves findable on POSIX
+Subject: [PATCH 21/26] fix(kernel): keep a title's saves findable on POSIX
 
 On Linux MM3 made a new profile at every start: the save it wrote was never
 found again. The POSIX file backend differed from the Win32 one where a
