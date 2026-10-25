@@ -1,7 +1,7 @@
 From ece1c8266ad97d4f5c180e4d02227eab2996350d Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 02:49:32 +0000
-Subject: [PATCH 05/26] fix(kernel): find game files whatever the case of their
+Subject: [PATCH 05/27] fix(kernel): find game files whatever the case of their
  path on linux
 
 Titles spell paths the way they like; NTFS ignores case, Linux file systems do not. Re-case each component of a translated path to the directory entry that exists.

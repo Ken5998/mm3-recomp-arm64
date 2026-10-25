@@ -1,0 +1,378 @@
+From fb9d038868fadf3276d95fa893e3775a02dad171 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 16:21:12 +0000
+Subject: [PATCH 27/27] perf(dsp): decode parallel moves once and use native
+ 56-bit arithmetic
+
+The GP spends most of a frame in the interpreter. Parallel instructions now go through the per-address decode cache too: a bare ALU operation calls its handler directly and a plain X/Y move through (Rn), (Rn)+ or (Rn)- skips the general move decode. Add, subtract and multiply work on one 64-bit value instead of 24-bit pieces and partial products, the common flag update and full-width add/subtract are inlined, and the per-instruction loop checks fewer flags. A captured GP frame replays byte for byte with about 30% less time.
+---
+ src/apu/dsp/interp/dsp_cpu.c     | 237 +++++++++++++++----------------
+ src/apu/dsp/interp/dsp_emu.c.inc |  36 ++++-
+ 2 files changed, 152 insertions(+), 121 deletions(-)
+
+diff --git a/src/apu/dsp/interp/dsp_cpu.c b/src/apu/dsp/interp/dsp_cpu.c
+index 5f209ce..4ce7f3a 100644
+--- a/src/apu/dsp/interp/dsp_cpu.c
++++ b/src/apu/dsp/interp/dsp_cpu.c
+@@ -453,6 +453,77 @@ static const OpcodeEntry nonparallel_opcodes[] = {
+ static bool matches_initialised;
+ static uint32_t nonparallel_matches[ARRAY_SIZE(nonparallel_opcodes)][2];
+ 
++/* Parallel instructions are decoded once per P address too. A bare ALU
++ * operation calls its handler straight away, and a move between an X or Y
++ * address in Rn and a register, without ALU work, skips the general parallel
++ * move decode; everything else takes the parallel move dispatch. */
++static void emu_parallel_move(dsp_core_t* dsp)
++{
++    opcodes_parmove[(dsp->cur_inst>>20) & BITMASK(4)](dsp);
++}
++
++static DSP_HOT void emu_pm_move_rn(dsp_core_t* dsp, int32_t modifier)
++{
++    uint32_t inst = dsp->cur_inst;
++    uint32_t numreg = ((inst>>16) & BITMASK(3)) | ((inst>>17) & (BITMASK(2)<<3));
++    uint32_t memspace = (inst>>19) & 1;
++    uint32_t rn = (inst>>8) & BITMASK(3);
++    uint32_t xy_addr = dsp->registers[DSP_REG_R0+rn], value;
++
++    /* The same order as emu_pm_5: Rn first, then the register side. */
++    if (modifier) emu_update_rn(dsp, rn, modifier);
++    if (inst & (1<<15)) {
++        value = read_memory(dsp, memspace, xy_addr);
++        dsp_write_reg(dsp, numreg, value);
++    } else {
++        if (numreg == DSP_REG_A || numreg == DSP_REG_B)
++            emu_pm_read_accu24(dsp, numreg, &value);
++        else
++            value = dsp_move_source(dsp, numreg);
++        write_memory(dsp, memspace, xy_addr, value);
++    }
++}
++
++static void emu_pm_move_rn_dec(dsp_core_t* dsp) { emu_pm_move_rn(dsp, -1); }
++static void emu_pm_move_rn_inc(dsp_core_t* dsp) { emu_pm_move_rn(dsp, +1); }
++static void emu_pm_move_rn_keep(dsp_core_t* dsp) { emu_pm_move_rn(dsp, 0); }
++
++static OpcodeEntry parallel_alu_only[256];
++static OpcodeEntry parallel_move_rn[3] = {
++    { .name = "move (Rn)-", .emu_func = emu_pm_move_rn_dec },
++    { .name = "move (Rn)+", .emu_func = emu_pm_move_rn_inc },
++    { .name = "move (Rn)", .emu_func = emu_pm_move_rn_keep },
++};
++static const OpcodeEntry parallel_other = { .name = "parallel", .emu_func = emu_parallel_move };
++
++static const OpcodeEntry *lookup_parallel(uint32_t op)
++{
++    uint32_t mode = (op>>11) & BITMASK(3);
++    if ((op & 0xffff00) == 0x200000)
++        return &parallel_alu_only[op & BITMASK(8)];
++    /* 01dd Sddd w1mm mrrr with no ALU part; 0100 l0ll is the L: move. */
++    if ((op & 0xc040ff) == 0x404000 && (op & 0xf40000) != 0x400000 &&
++        mode >= 2 && mode <= 4)
++        return &parallel_move_rn[mode - 2];
++    return &parallel_other;
++}
++
++static void emu_undefined_opcode(dsp_core_t* dsp)
++{
++    DPRINTF("%x - undefined\n", dsp->cur_inst);
++    emu_undefined(dsp);
++}
++
++static const OpcodeEntry undefined_opcode = { .name = "undefined", .emu_func = emu_undefined_opcode };
++static const OpcodeEntry *lookup_opcode(uint32_t op);
++
++/* What the decode cache holds for an instruction word: always a handler. */
++static const OpcodeEntry *lookup_instruction(uint32_t op)
++{
++    const OpcodeEntry *entry = op < 0x100000 ? lookup_opcode(op) : lookup_parallel(op);
++    return entry->emu_func ? entry : &undefined_opcode;
++}
++
+ /**********************************
+  *  Emulator kernel
+  **********************************/
+@@ -479,6 +550,10 @@ void dsp56k_reset_cpu(dsp_core_t* dsp)
+             nonparallel_matches[i][0] = mask;
+             nonparallel_matches[i][1] = match;
+         }
++        for (i = 0; i < 256; i++) {
++            parallel_alu_only[i].name = "parallel alu";
++            parallel_alu_only[i].emu_func = i ? opcodes_alu[i] : emu_move;
++        }
+     }
+ 
+     /* Memory */
+@@ -714,17 +789,20 @@ static DSP_HOT void execute_instruction(dsp_core_t* dsp)
+     trace_dsp56k_execute_instruction(dsp->is_gp, dsp->pc);
+ 
+     uint32_t disasm_return = 0;
+-    dsp->disasm_memory_ptr = 0;
++    bool tracing = TRACE_DSP_DISASM || trace_event_get_state(TRACE_DSP56K_EXECUTE_INSTRUCTION_DISASM);
++    if (tracing) dsp->disasm_memory_ptr = 0;
+ 
+-    /* Decode and execute current instruction */
+-    if (dsp->loop_rep != 2) dsp->cur_inst = read_memory_p(dsp, dsp->pc);
++    /* Decode and execute current instruction. Every path that writes P
++     * memory keeps it to 24-bit words, so the fetch only checks the PC. */
++    if (dsp->loop_rep != 2) {
++        assert(dsp->pc < DSP_PRAM_SIZE);
++        dsp->cur_inst = ldl_le_p(&dsp->pram[dsp->pc]);
++    }
+ 
+     /* Initialize instruction size and cycle counter */
+     dsp->cur_inst_len = 1;
+     dsp->instr_cycle = 2;
+ 
+-    bool tracing = TRACE_DSP_DISASM || trace_event_get_state(TRACE_DSP56K_EXECUTE_INSTRUCTION_DISASM);
+-
+     /* Disasm current instruction ? (trace mode only) */
+     if (tracing) {
+         disasm_return = disasm_instruction(dsp, DSP_TRACE_MODE);
+@@ -740,24 +818,16 @@ static DSP_HOT void execute_instruction(dsp_core_t* dsp)
+         }
+     }
+ 
+-    if (dsp->cur_inst < 0x100000) {
++    {
+         const OpcodeEntry *op = dsp->pram_opcache[dsp->pc];
+         if (dsp->loop_rep == 2 && read_memory_p(dsp, dsp->pc) != dsp->cur_inst) {
+             /* A REP keeps the word it fetched even if P memory changed. */
+-            op = lookup_opcode(dsp->cur_inst);
++            op = lookup_instruction(dsp->cur_inst);
+         } else if (op == NULL) {
+-            op = lookup_opcode(dsp->cur_inst);
++            op = lookup_instruction(dsp->cur_inst);
+             dsp->pram_opcache[dsp->pc] = op;
+         }
+-        if (op->emu_func) {
+-            op->emu_func(dsp);
+-        } else {
+-            DPRINTF("%x - %s\n", dsp->cur_inst, op->name);
+-            emu_undefined(dsp);
+-        }
+-    } else {
+-        /* Do parallel move read */
+-        opcodes_parmove[(dsp->cur_inst>>20) & BITMASK(4)](dsp);
++        op->emu_func(dsp);
+     }
+ 
+     /* Disasm current instruction ? (trace mode only) */
+@@ -821,8 +891,11 @@ void dsp56k_execute_batch(dsp_core_t* dsp, int *budget,
+                           const volatile uint32_t *dma_control, uint32_t dma_running)
+ {
+     int left = *budget;
+-    while (left > 0 && !(dsp->is_idle | dsp->is_waiting | dsp->is_stopped |
+-                         dsp->is_debugging | ((*dma_control & dma_running) != 0))) {
++    if (dsp->is_waiting | dsp->is_stopped | dsp->is_debugging)
++        return;
++    /* WAIT, STOP and DEBUG set is_idle along with their own flag, so after
++     * the check above is_idle alone says the core has halted. */
++    while (left > 0 && !(dsp->is_idle | ((*dma_control & dma_running) != 0))) {
+         execute_instruction(dsp);
+         left -= dsp->instr_cycle;
+         dsp->cycle_count += dsp->instr_cycle;
+@@ -1458,119 +1531,45 @@ static uint16_t dsp_asr56(uint32_t *dest, int n)
+     return (carry<<DSP_SR_C);
+ }
+ 
+-static uint16_t dsp_add56(uint32_t *source, uint32_t *dest)
++/* The accumulator as one 56-bit value; each part is masked to its width. */
++static inline uint64_t dsp_pack56(const uint32_t *v)
+ {
+-    uint16_t overflow, carry, flg_s, flg_d, flg_r;
+-
+-    flg_s = (source[0]>>7) & 1;
+-    flg_d = (dest[0]>>7) & 1;
+-
+-    /* Add source to dest: D = D+S */
+-    dest[2] += source[2];
+-    dest[1] += source[1]+((dest[2]>>24) & 1);
+-    dest[0] += source[0]+((dest[1]>>24) & 1);
+-
+-    carry = (dest[0]>>8) & 1;
+-
+-    dest[2] &= BITMASK(24);
+-    dest[1] &= BITMASK(24);
+-    dest[0] &= BITMASK(8);
+-
+-    flg_r = (dest[0]>>7) & 1;
++    return ((uint64_t)(v[0] & BITMASK(8)) << 48) | ((uint64_t)(v[1] & BITMASK(24)) << 24) |
++           (v[2] & BITMASK(24));
++}
+ 
+-    /*set overflow*/
+-    overflow = (flg_s ^ flg_r) & (flg_d ^ flg_r);
++static inline void dsp_unpack56(uint64_t value, uint32_t *v)
++{
++    v[0] = (value >> 48) & BITMASK(8);
++    v[1] = (value >> 24) & BITMASK(24);
++    v[2] = value & BITMASK(24);
++}
+ 
++static uint16_t dsp_add56(uint32_t *source, uint32_t *dest)
++{
++    uint64_t s = dsp_pack56(source), d = dsp_pack56(dest), r = d + s;
++    uint16_t carry = (r >> 56) & 1;
++    uint16_t overflow = (((s ^ r) & (d ^ r)) >> 55) & 1;
++    dsp_unpack56(r, dest);
+     return (overflow<<DSP_SR_L)|(overflow<<DSP_SR_V)|(carry<<DSP_SR_C);
+ }
+ 
+ static uint16_t dsp_sub56(uint32_t *source, uint32_t *dest)
+ {
+-    uint16_t overflow, carry, flg_s, flg_d, flg_r, dest_save;
+-
+-    dest_save = dest[0];
+-
+-    /* Subtract source from dest: D = D-S */
+-    dest[2] -= source[2];
+-    dest[1] -= source[1]+((dest[2]>>24) & 1);
+-    dest[0] -= source[0]+((dest[1]>>24) & 1);
+-
+-    carry = (dest[0]>>8) & 1;
+-
+-    dest[2] &= BITMASK(24);
+-    dest[1] &= BITMASK(24);
+-    dest[0] &= BITMASK(8);
+-
+-    flg_s = (source[0]>>7) & 1;
+-    flg_d = (dest_save>>7) & 1;
+-    flg_r = (dest[0]>>7) & 1;
+-
+-    /* set overflow */
+-    overflow = (flg_s ^ flg_d) & (flg_r ^ flg_d);
+-
++    uint64_t s = dsp_pack56(source), d = dsp_pack56(dest), r = d - s;
++    uint16_t carry = (r >> 56) & 1;
++    uint16_t overflow = (((s ^ d) & (r ^ d)) >> 55) & 1;
++    dsp_unpack56(r, dest);
+     return (overflow<<DSP_SR_L)|(overflow<<DSP_SR_V)|(carry<<DSP_SR_C);
+ }
+ 
++/* Fractional multiply: the 48-bit product, doubled, negated for -S1*S2. */
+ static void dsp_mul56(uint32_t source1, uint32_t source2, uint32_t *dest, uint8_t signe)
+ {
+-    uint32_t part[4], zerodest[3], value;
+-
+-    /* Multiply: D = S1*S2 */
+-    if (source1 & (1<<23)) {
+-        signe ^= 1;
+-        source1 = (1<<24) - source1;
+-    }
+-    if (source2 & (1<<23)) {
+-        signe ^= 1;
+-        source2 = (1<<24) - source2;
+-    }
+-
+-    /* bits 0-11 * bits 0-11 */
+-    part[0]=(source1 & BITMASK(12))*(source2 & BITMASK(12));
+-    /* bits 12-23 * bits 0-11 */
+-    part[1]=((source1>>12) & BITMASK(12))*(source2 & BITMASK(12));
+-    /* bits 0-11 * bits 12-23 */
+-    part[2]=(source1 & BITMASK(12))*((source2>>12)  & BITMASK(12));
+-    /* bits 12-23 * bits 12-23 */
+-    part[3]=((source1>>12) & BITMASK(12))*((source2>>12) & BITMASK(12));
+-
+-    /* Calc dest 2 */
+-    dest[2] = part[0];
+-    dest[2] += (part[1] & BITMASK(12)) << 12;
+-    dest[2] += (part[2] & BITMASK(12)) << 12;
+-
+-    /* Calc dest 1 */
+-    dest[1] = (part[1]>>12) & BITMASK(12);
+-    dest[1] += (part[2]>>12) & BITMASK(12);
+-    dest[1] += part[3];
+-
+-    /* Calc dest 0 */
+-    dest[0] = 0;
+-
+-    /* Add carries */
+-    value = (dest[2]>>24) & BITMASK(8);
+-    if (value) {
+-        dest[1] += value;
+-        dest[2] &= BITMASK(24);
+-    }
+-    value = (dest[1]>>24) & BITMASK(8);
+-    if (value) {
+-        dest[0] += value;
+-        dest[1] &= BITMASK(24);
+-    }
+-
+-    /* Get rid of extra sign bit */
+-    dsp_asl56(dest, 1);
+-
+-    if (signe) {
+-        zerodest[0] = zerodest[1] = zerodest[2] = 0;
+-
+-        dsp_sub56(dest, zerodest);
+-
+-        dest[0] = zerodest[0];
+-        dest[1] = zerodest[1];
+-        dest[2] = zerodest[2];
+-    }
++    int64_t lhs = (int32_t)(source1 << 8) >> 8;
++    int64_t rhs = (int32_t)(source2 << 8) >> 8;
++    int64_t product = lhs * rhs * 2;
++    dsp_unpack56((uint64_t)(signe ? -product : product), dest);
+ }
+ 
+ static void dsp_rnd56(dsp_core_t* dsp, uint32_t *dest)
+diff --git a/src/apu/dsp/interp/dsp_emu.c.inc b/src/apu/dsp/interp/dsp_emu.c.inc
+index c0750bd..3181fe3 100644
+--- a/src/apu/dsp/interp/dsp_emu.c.inc
++++ b/src/apu/dsp/interp/dsp_emu.c.inc
+@@ -269,7 +269,29 @@ static int emu_calc_cc(dsp_core_t* dsp, uint32_t cc_code)
+ /* reg1 has bits 47..24 */
+ /* reg2 has bits 23..0 */
+ 
+-static void emu_ccr_update_e_u_n_z(dsp_core_t* dsp, uint32_t reg0, uint32_t reg1, uint32_t reg2)
++static void emu_ccr_update_scaled(dsp_core_t* dsp, uint32_t reg0, uint32_t reg1, uint32_t reg2);
++
++/* No scaling and no sixteen-bit arithmetic, nearly every update, inline and
++ * without branches: the same flags as case 0 of emu_ccr_update_scaled. */
++static DSP_HOT void emu_ccr_update_e_u_n_z(dsp_core_t* dsp, uint32_t reg0, uint32_t reg1, uint32_t reg2)
++{
++    uint32_t sr = dsp->registers[DSP_REG_SR], value_e, value_u;
++
++    if (sr & ((1u << DSP_SR_SA) | (BITMASK(2) << DSP_SR_S0))) {
++        emu_ccr_update_scaled(dsp, reg0, reg1, reg2);
++        return;
++    }
++    value_e = (reg0<<1) + (reg1>>23);
++    value_u = (reg1>>22) & 3;
++    sr &= ~(((1<<DSP_SR_E) | (1<<DSP_SR_U) | (1<<DSP_SR_N) | (1<<DSP_SR_Z)));
++    sr |= (uint32_t)(value_e != 0 && value_e != BITMASK(9)) << DSP_SR_E;
++    sr |= (uint32_t)(value_u == 0 || value_u == 3) << DSP_SR_U;
++    sr |= (uint32_t)((reg0 | reg1 | reg2) == 0) << DSP_SR_Z;
++    sr |= (reg0>>4) & 0x8;
++    dsp->registers[DSP_REG_SR] = sr;
++}
++
++static void emu_ccr_update_scaled(dsp_core_t* dsp, uint32_t reg0, uint32_t reg1, uint32_t reg2)
+ {
+     uint32_t scaling, value_e, value_u;
+ 
+@@ -331,11 +353,21 @@ static void emu_ccr_update_e_u_n_z(dsp_core_t* dsp, uint32_t reg0, uint32_t reg1
+  *  ALU instructions
+  **********************************/
+ 
+-static uint16_t emu_add_sub_arithmetic(dsp_core_t* dsp, uint32_t *source,
++static uint16_t emu_add_sub_sixteen(uint32_t *source, uint32_t *dest, bool subtract,
++                                    unsigned incoming);
++
++/* Full-width arithmetic inline; sixteen-bit mode out of line. */
++static DSP_HOT uint16_t emu_add_sub_arithmetic(dsp_core_t* dsp, uint32_t *source,
+                                      uint32_t *dest, bool subtract, unsigned incoming)
+ {
+     if (!(dsp->registers[DSP_REG_SR] & (1u << DSP_SR_SA)))
+         return subtract ? dsp_sub56(source, dest) : dsp_add56(source, dest);
++    return emu_add_sub_sixteen(source, dest, subtract, incoming);
++}
++
++static uint16_t emu_add_sub_sixteen(uint32_t *source, uint32_t *dest, bool subtract,
++                                    unsigned incoming)
++{
+     uint64_t src = ((uint64_t)(source[0] & 0xff) << 32) |
+                    ((uint64_t)((source[1] >> 8) & 0xffff) << 16) | ((source[2] >> 8) & 0xffff);
+     uint64_t dst = ((uint64_t)(dest[0] & 0xff) << 32) |

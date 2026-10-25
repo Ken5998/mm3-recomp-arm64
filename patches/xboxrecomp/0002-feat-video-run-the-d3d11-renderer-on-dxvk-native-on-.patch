@@ -1,7 +1,7 @@
 From 0373e4171994d01a254187faa1400014338095dd Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 23:00:07 +0000
-Subject: [PATCH 02/26] feat(video): run the d3d11 renderer on dxvk-native on
+Subject: [PATCH 02/27] feat(video): run the d3d11 renderer on dxvk-native on
  linux
 
 The NV2A renderer (nv2a_d3d11.c) and the framebuffer window were Windows
