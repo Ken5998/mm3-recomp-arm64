@@ -69,8 +69,8 @@ The first seconds stutter while shaders compile; later runs load them from
 DSP emulation 1.4x lighter and keeps profiles and progress between runs, in
 `~/.local/share/MidtownMadness3/saves`. Version 0.1.7 updates the launcher
 from its own **Update** button. Version 0.1.8 adds a **Language** setting,
-and 0.1.9 makes the 3D sound filter 3.5x lighter so the audio can keep up with
-all of the game's sounds on.
+0.1.9 makes the 3D sound filter 3.5x lighter and 0.1.10 runs the audio DSP
+about 30% faster, so the audio can keep up with all of the game's sounds on.
 mm3-recomp itself is a work in
 progress, so expect rough edges, and back up your saves.
 
