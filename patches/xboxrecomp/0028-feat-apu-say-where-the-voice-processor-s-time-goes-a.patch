@@ -1,0 +1,219 @@
+From 015a2854a5088eee24000cd4f92c569e152db8b1 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 17:23:44 +0000
+Subject: [PATCH 28/28] feat(apu): say where the voice processor's time goes,
+ and let HRTF be switched off
+
+When the APU falls behind, a second line now gives the voices a frame and the time spent reading samples, low-passing, in the 3D filter and mixing. RECOMP_APU_HRTF=0 leaves 3D voices unfiltered for comparing by ear. Volume-to-gain is tabulated once instead of eight powf calls per voice a frame.
+---
+ src/apu/apu_core.c  |   5 ++-
+ src/apu/apu_state.h |   2 +
+ src/apu/apu_vp.c    | 100 ++++++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 103 insertions(+), 4 deletions(-)
+
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index 9d59b7e..e0d0153 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -535,6 +535,7 @@ static void report_speed(int64_t vp_us, int64_t dsp_us, int64_t frame_us)
+         frames = 0;
+         vp_sum = dsp_sum = busy_sum = 0;
+         mcpx_apu_dsp_usage(unused, sizeof unused);
++        mcpx_apu_vp_usage(unused, sizeof unused);
+         return;
+     }
+     frames++;
+@@ -546,14 +547,16 @@ static void report_speed(int64_t vp_us, int64_t dsp_us, int64_t frame_us)
+     {
+         double window = (double)(now - window_start);
+         double sound = frames * NUM_SAMPLES_PER_FRAME * 1000000.0 / 48000.0;
+-        char dsps[256];
++        char dsps[256], voices[256];
+         mcpx_apu_dsp_usage(dsps, sizeof dsps);
++        mcpx_apu_vp_usage(voices, sizeof voices);
+         if (sound < 0.95 * window && busy_sum > 0.8 * window && reports < 60) {
+             reports++;
+             fprintf(stderr, "[APU] behind real time: %.0f s of sound in %.0f s; a frame took "
+                             "%lld us in voices, %lld us in the DSPs (667 us of sound); %s\n",
+                     sound / 1e6, window / 1e6, (long long)(vp_sum / frames),
+                     (long long)(dsp_sum / frames), dsps);
++            fprintf(stderr, "[APU] voices: %s\n", voices);
+             fflush(stderr);
+         }
+     }
+diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
+index 125fb0a..428a03c 100644
+--- a/src/apu/apu_state.h
++++ b/src/apu/apu_state.h
+@@ -466,6 +466,8 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
+ /* Each DSP's time and cycles a frame since the last call, as text; counting
+  * then starts afresh. */
+ void mcpx_apu_dsp_usage(char *text, size_t size);
++/* The same for the voice processor: voices a frame and time per stage. */
++void mcpx_apu_vp_usage(char *text, size_t size);
+ uint64_t mcpx_apu_dsp_read(MCPXAPUState *d, bool gp, uint32_t addr, unsigned size);
+ void mcpx_apu_dsp_write(MCPXAPUState *d, bool gp, uint32_t addr, uint64_t value, unsigned size);
+ 
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index 898314a..234cc5b 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -103,10 +103,88 @@ static float clampf(float v, float mn, float mx)
+     return v;
+ }
+ 
++/* Volume register to gain; eight lookups per voice a frame, so tabulated
++ * once (mcpx_apu_vp_init) with the same powf. */
++static float s_attenuation[0x1000];
++
+ static float attenuate(uint16_t vol)
+ {
+-    vol &= 0xFFF;
+-    return (vol == 0xFFF) ? 0.0f : powf(10.0f, vol / (64.0f * -20.0f));
++    return s_attenuation[vol & 0xFFF];
++}
++
++/* RECOMP_APU_HRTF=0 leaves 3D voices unfiltered, for comparing by ear. */
++static bool hrtf_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char *env = getenv("RECOMP_APU_HRTF");
++        enabled = !(env && *env == '0');
++        if (!enabled)
++            fprintf(stderr, "[APU] 3D voices skip the HRTF filter (RECOMP_APU_HRTF=0)\n");
++    }
++    return enabled && g_config.audio.hrtf;
++}
++
++/* Where the voice processor's time goes, for the lag report: each stage
++ * summed over the voices that reach the mix since the last report. */
++static struct {
++    uint64_t frames, voices, filtered, spatial;
++    uint64_t samples, filters, hrtf, mix;
++} s_vp_use;
++
++#if defined(__aarch64__) && !defined(_MSC_VER)
++static inline uint64_t vp_ticks(void)
++{
++    uint64_t ticks;
++    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(ticks));
++    return ticks;
++}
++
++static uint64_t vp_ticks_per_second(void)
++{
++    uint64_t frequency;
++    __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(frequency));
++    return frequency ? frequency : 1;
++}
++#elif defined(_WIN32)
++static inline uint64_t vp_ticks(void)
++{
++    LARGE_INTEGER now;
++    QueryPerformanceCounter(&now);
++    return (uint64_t)now.QuadPart;
++}
++
++static uint64_t vp_ticks_per_second(void)
++{
++    LARGE_INTEGER frequency;
++    QueryPerformanceFrequency(&frequency);
++    return (uint64_t)frequency.QuadPart;
++}
++#else
++static inline uint64_t vp_ticks(void)
++{
++    struct timespec now;
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
++}
++
++static uint64_t vp_ticks_per_second(void)
++{
++    return 1000000000ull;
++}
++#endif
++
++void mcpx_apu_vp_usage(char *text, size_t size)
++{
++    uint64_t n = s_vp_use.frames ? s_vp_use.frames : 1;
++    double us = 1e6 / (double)vp_ticks_per_second() / (double)n;
++    snprintf(text, size,
++             "%.0f voices a frame (%.0f low-passed, %.0f 3D) took %.0f us reading samples, "
++             "%.0f us low-passing, %.0f us in 3D and %.0f us mixing",
++             (double)s_vp_use.voices / n, (double)s_vp_use.filtered / n,
++             (double)s_vp_use.spatial / n, s_vp_use.samples * us, s_vp_use.filters * us,
++             s_vp_use.hrtf * us, s_vp_use.mix * us);
++    memset(&s_vp_use, 0, sizeof s_vp_use);
+ }
+ 
+ /* ============================================================
+@@ -1081,6 +1159,7 @@ static void voice_process(MCPXAPUState *d,
+     dbg->paused = paused;
+ 
+     if (paused) return;
++    uint64_t t_start = vp_ticks();
+ 
+     /* Step filter envelope */
+     float ef_value = voice_step_envelope(
+@@ -1188,6 +1267,7 @@ static void voice_process(MCPXAPUState *d,
+     }
+ 
+     if (voice_should_mute(v)) return;
++    uint64_t t_samples = vp_ticks();
+ 
+     /* Low-pass filter */
+     int fmode = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_MISC,
+@@ -1217,15 +1297,19 @@ static void voice_process(MCPXAPUState *d,
+         }
+     }
+ 
++    uint64_t t_filters = vp_ticks();
++
+     /* HRTF processing for 3D voices */
+-    if (v < MCPX_HW_MAX_3D_VOICES && g_config.audio.hrtf) {
++    if (v < MCPX_HW_MAX_3D_VOICES && hrtf_enabled()) {
+         uint16_t hrtf_handle =
+             (uint16_t)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
+                                      NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
+         if (hrtf_handle != HRTF_NULL_HANDLE) {
+             hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
++            s_vp_use.spatial++;
+         }
+     }
++    uint64_t t_hrtf = vp_ticks();
+ 
+     /* Mix into bins. The volumes are TAR(get) registers: hardware moves the
+      * current level toward them, it does not jump. Applying each frame's
+@@ -1254,6 +1338,13 @@ static void voice_process(MCPXAPUState *d,
+         }
+     }
+     s_gain_valid[v] = 1;
++    uint64_t t_mix = vp_ticks();
++    s_vp_use.voices++;
++    s_vp_use.filtered += lpf;
++    s_vp_use.samples += t_samples - t_start;
++    s_vp_use.filters += t_filters - t_samples;
++    s_vp_use.hrtf += t_hrtf - t_filters;
++    s_vp_use.mix += t_mix - t_hrtf;
+ 
+     /* VP monitor mix */
+     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
+@@ -1283,6 +1374,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+ {
+     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
++    s_vp_use.frames++;
+ 
+     for (int list = 0; list < 3; list++) {
+         hwaddr top, current, next;
+@@ -1338,6 +1430,8 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
+ {
+     /* Single-threaded - no worker dispatch needed */
+     (void)d;
++    for (int vol = 0; vol < 0x1000; vol++)
++        s_attenuation[vol] = vol == 0xFFF ? 0.0f : powf(10.0f, vol / (64.0f * -20.0f));
+ }
+ 
+ void mcpx_apu_vp_finalize(MCPXAPUState *d)

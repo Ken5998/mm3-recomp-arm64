@@ -1,7 +1,7 @@
 From 8f1ab6f8e0c2629a3c73e091ecf583b4c144683d Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 02:31:41 +0000
-Subject: [PATCH 04/27] feat(apu): audio output over sdl2 on linux
+Subject: [PATCH 04/28] feat(apu): audio output over sdl2 on linux
 
 The xa2_* backend was a stub off Windows, so the APU mixed in silence.
 It now queues the mixed frames on an SDL2 audio device with XAudio2's
