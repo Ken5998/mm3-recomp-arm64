@@ -1,7 +1,7 @@
 From 816fb8131ca91c727598203ccee32d9fc4f1d88e Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Mon, 26 Oct 2026 16:59:29 +0000
-Subject: [PATCH 29/29] fix(memory): keep the heap out of reservations and
+Subject: [PATCH 29/30] fix(memory): keep the heap out of reservations and
  reuse freed space at any alignment
 
 A heap that grew past the top of RAM took addresses xbox_ReserveAlloc had

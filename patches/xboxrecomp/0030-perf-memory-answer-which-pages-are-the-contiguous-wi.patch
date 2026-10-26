@@ -1,0 +1,126 @@
+From 2e73bb8087fbd785f1336ea964dafd3767728ee6 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:06:41 +0000
+Subject: [PATCH 30/30] perf(memory): answer which pages are the contiguous
+ window's without a lock
+
+The voice processor resolves every sample and voice register through
+xbox_ContiguousRangeAllocated, which took the allocator lock and searched the
+span table each time: about 30 ns a call, thousands a frame, and longer while
+the title was allocating. A byte per page, set when a span first covers it,
+answers the same question in about 2 ns. Spans are never dropped, so the bytes
+are never cleared.
+---
+ src/kernel/xbox_memory_layout.c      | 50 ++++++++++++----------------
+ tests/memory_regressions/test_main.c |  6 ++++
+ 2 files changed, 28 insertions(+), 28 deletions(-)
+
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 147c0f3..2bd8bb0 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -3353,8 +3353,16 @@ void xbox_FreeThreadStack(uint32_t stack_top)
+  * port reset, walking a device whose parent pointer had been overwritten. */
+ static uint32_t g_contig_next = XBOX_CONTIG_BASE + 0x1000u;
+ 
++/* One byte per page of the window, set once a span covers the page. Spans are
++ * split and merged but never dropped, so a page stays covered for good and the
++ * bytes are never cleared. xbox_ContiguousRangeAllocated reads them without
++ * the allocator lock: the voice processor asks for every sample and voice
++ * register it touches, and taking the lock and searching the table each time
++ * was most of its frame, more so while the title was allocating. */
++static volatile uint8_t g_contig_page_covered[XBOX_CONTIG_SIZE / 4096u];
++
+ /* The table is sorted by offset and covers every span ever handed out, in
+- * use or free; xbox_ContiguousRangeAllocated binary-searches it. Callers hold
++ * use or free; g_contig_page_covered mirrors its coverage. Callers hold
+  * g_allocator_lock. */
+ static void contig_insert(LONG at, uint32_t offset, uint32_t size, LONG in_use)
+ {
+@@ -3466,6 +3474,9 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+ 
+     g_contig_next = result + size;
+     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
++    for (uint32_t page = (result - XBOX_CONTIG_BASE) / 4096u;
++         page < (result - XBOX_CONTIG_BASE + size) / 4096u; page++)
++        g_contig_page_covered[page] = 1;
+     g_contig_allocs[g_contig_alloc_count].offset = result - XBOX_CONTIG_BASE;
+     g_contig_allocs[g_contig_alloc_count].size = size;
+     InterlockedExchange(&g_contig_allocs[g_contig_alloc_count].in_use, 1);
+@@ -3549,42 +3560,25 @@ int xbox_HeapReclaimEnabled(void)
+ 
+ int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
+ {
+-    LONG lo = 0, hi, i;
+-    uint64_t end, covered;
+-    int result = 0;
++    uint64_t page, last;
+ 
+     if (!size)
+         size = 1;
+-    /* The table is split and coalesced in place; read it under the lock. */
+-    EnterCriticalSection(&g_allocator_lock);
+-    hi = g_contig_alloc_count;
+-    while (lo < hi) {
+-        LONG mid = lo + (hi - lo) / 2;
+-        if (g_contig_allocs[mid].offset <= physical_offset)
+-            lo = mid + 1;
+-        else
+-            hi = mid;
+-    }
++    page = physical_offset / 4096u;
++    last = ((uint64_t)physical_offset + size - 1) / 4096u;
++    if (last >= XBOX_CONTIG_SIZE / 4096u)
++        return 0;
+     /* Freed spans count. Freeing does not move a page; it still holds
+      * what the title last wrote there, and the span is only ever reused in
+      * place. A title can draw a loading screen from a back buffer that D3D has
+      * just released: with freed spans excluded the GPU read that physical
+      * address from low RAM instead -- the title's own image -- and showed
+      * the code bytes as colour static. A range may run on through adjacent
+-     * spans. */
+-    if (lo) {
+-        end = (uint64_t)physical_offset + size;
+-        i = lo - 1;
+-        covered = (uint64_t)g_contig_allocs[i].offset + g_contig_allocs[i].size;
+-        while (covered < end && i + 1 < g_contig_alloc_count &&
+-               g_contig_allocs[i + 1].offset == covered) {
+-            ++i;
+-            covered += g_contig_allocs[i].size;
+-        }
+-        result = physical_offset >= g_contig_allocs[lo - 1].offset && end <= covered;
+-    }
+-    LeaveCriticalSection(&g_allocator_lock);
+-    return result;
++     * spans; spans are whole pages, so that is every page in it covered. */
++    for (; page <= last; page++)
++        if (!g_contig_page_covered[page])
++            return 0;
++    return 1;
+ }
+ 
+ 
+diff --git a/tests/memory_regressions/test_main.c b/tests/memory_regressions/test_main.c
+index 339d2ce..4ccc42a 100644
+--- a/tests/memory_regressions/test_main.c
++++ b/tests/memory_regressions/test_main.c
+@@ -24,6 +24,7 @@
+  *      the console. Both were no-ops, so the old contents came back.
+  *   6. MmFreeContiguousMemory gives a contiguous block back and the next
+  *      request of that size reuses it; contiguous pages are reused in both modes.
++ *      A freed block still reads as the window's to the bus masters.
+  *   7. A page-aligned request fits in a freed block that does not start on a
+  *      page. Only blocks starting aligned were considered, so once a small
+  *      request had split a freed block, page-aligned requests grew the heap.
+@@ -325,6 +326,11 @@ int main(int argc, char **argv)
+         snprintf(d, sizeof d, "free said %d", xbox_ContiguousFree(c1));
+         c2 = xbox_ContiguousAlloc(0x20000, 4096);
+         check(c1 && c2 == c1, "a freed contiguous block is reused in both modes", d);
++        xbox_ContiguousFree(c2);
++        check(xbox_ContiguousRangeAllocated(c1 & 0x0FFFFFFFu, 0x20000) &&
++              !xbox_ContiguousRangeAllocated((c1 & 0x0FFFFFFFu) + 0x1F000, 0x2000) &&
++              !xbox_ContiguousRangeAllocated(0x04000000u, 1),
++              "a freed block still reads as the window's, and nothing past it does", NULL);
+     }
+ 
+     /* 7. A page-aligned request in a freed block that starts off a page. */

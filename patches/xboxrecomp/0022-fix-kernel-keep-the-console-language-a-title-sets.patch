@@ -1,7 +1,7 @@
 From fec3b3cd9ec0ecf341b6c38b9e8f90daca9b7dc2 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 21:39:16 +0000
-Subject: [PATCH 22/29] fix(kernel): keep the console language a title sets
+Subject: [PATCH 22/30] fix(kernel): keep the console language a title sets
 
 ExSaveNonVolatileSetting dropped every write, so MM3's language choice was gone at the next start. On POSIX the XC_LANGUAGE value now lives in the save dir's TitleData/language; with nothing saved, $LANG picks it (it_IT gives Italian), and RECOMP_LANGUAGE still overrides both. tests/kernel_files_posix checks both paths.
 ---

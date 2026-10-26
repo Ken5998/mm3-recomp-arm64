@@ -1,7 +1,7 @@
 From fb9d038868fadf3276d95fa893e3775a02dad171 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 16:21:12 +0000
-Subject: [PATCH 27/29] perf(dsp): decode parallel moves once and use native
+Subject: [PATCH 27/30] perf(dsp): decode parallel moves once and use native
  56-bit arithmetic
 
 The GP spends most of a frame in the interpreter. Parallel instructions now go through the per-address decode cache too: a bare ALU operation calls its handler directly and a plain X/Y move through (Rn), (Rn)+ or (Rn)- skips the general move decode. Add, subtract and multiply work on one 64-bit value instead of 24-bit pieces and partial products, the common flag update and full-width add/subtract are inlined, and the per-instruction loop checks fewer flags. A captured GP frame replays byte for byte with about 30% less time.

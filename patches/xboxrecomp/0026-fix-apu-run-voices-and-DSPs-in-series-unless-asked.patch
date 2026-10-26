@@ -1,7 +1,7 @@
 From 9b53eeaa16e7495fc5a28d188ca49b845d6bef82 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 20:54:55 +0000
-Subject: [PATCH 26/29] fix(apu): run voices and DSPs in series unless asked
+Subject: [PATCH 26/30] fix(apu): run voices and DSPs in series unless asked
 
 On a Retroid Pocket 6 the GP DSP took a quarter longer on the pipeline's
 worker than on the frame thread, so frames ended up no shorter and the sound
