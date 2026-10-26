@@ -71,7 +71,9 @@ DSP emulation 1.4x lighter and keeps profiles and progress between runs, in
 from its own **Update** button. Version 0.1.8 adds a **Language** setting,
 0.1.9 makes the 3D sound filter 3.5x lighter, 0.1.10 runs the audio DSP
 about 30% faster and 0.1.11 logs where the audio time goes, with
-`RECOMP_APU_HRTF=0` to turn the 3D sound filter off.
+`RECOMP_APU_HRTF=0` to turn the 3D sound filter off. 0.1.12 gives freed memory
+back between races, so a second race no longer runs out of video memory, and
+reads the sound samples without waiting on the game's memory allocator.
 mm3-recomp itself is a work in
 progress, so expect rough edges, and back up your saves.
 
