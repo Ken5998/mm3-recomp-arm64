@@ -1,7 +1,7 @@
 From a729b3a053f7a1ea3b7b12024970a4c0f8433088 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 19:58:34 +0000
-Subject: [PATCH 24/28] test(kernel): accept any save folder the file system
+Subject: [PATCH 24/29] test(kernel): accept any save folder the file system
  lists first
 
 The folder search check expected A_save or B_save, but the title's own

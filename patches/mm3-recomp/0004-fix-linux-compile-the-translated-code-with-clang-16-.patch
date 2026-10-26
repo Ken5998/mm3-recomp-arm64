@@ -1,8 +1,8 @@
 From 3bfe1dafeaba97f4b4b0fcb90c57fc97e031f4a1 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 03:36:53 +0000
-Subject: [PATCH 4/9] fix(linux): compile the translated code with clang 16 and
- gcc 14
+Subject: [PATCH 04/10] fix(linux): compile the translated code with clang 16
+ and gcc 14
 
 The translated runtime entries jump to a few functions the translator
 never declares, on paths that are never taken. MSVC and GCC 13 warn about

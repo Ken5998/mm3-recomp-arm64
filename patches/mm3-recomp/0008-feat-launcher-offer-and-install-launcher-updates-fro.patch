@@ -1,7 +1,7 @@
 From 929c6f53783e64624855978d2669048268c44224 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 21:48:08 +0000
-Subject: [PATCH 8/9] feat(launcher): offer and install launcher updates from
+Subject: [PATCH 08/10] feat(launcher): offer and install launcher updates from
  GitHub releases
 
 The launcher asks its setup script for a newer release when it starts and,

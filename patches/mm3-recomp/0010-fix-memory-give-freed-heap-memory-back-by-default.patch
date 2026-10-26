@@ -1,0 +1,31 @@
+From b6225700b70f0314ab9fb3ef9bac0ddd5cd9b177 Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 16:59:29 +0000
+Subject: [PATCH 10/10] fix(memory): give freed heap memory back by default
+
+MM3 frees with NtFreeVirtualMemory what it allocates for each race. Without
+RECOMP_HEAP_RECLAIM none of it returned, the heap spread over the physical
+pages the contiguous window needs, and the second race ran out of room for
+its vertex buffers and textures. RECOMP_HEAP_RECLAIM=0 turns it off.
+---
+ src/main.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/main.c b/src/main.c
+index 5cd11f8..3d17a49 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -210,6 +210,13 @@ int main(void)
+         return 1;
+     }
+ 
++    /* MM3 releases with NtFreeVirtualMemory what it took for each race. Without
++     * heap reclaim none of it came back, the heap spread over the physical pages
++     * the contiguous window needs, and the second race found no room for its
++     * vertex buffers and textures. RECOMP_HEAP_RECLAIM=0 turns it off. */
++    if (!getenv("RECOMP_HEAP_RECLAIM"))
++        _putenv_s("RECOMP_HEAP_RECLAIM", "1");
++
+     /* Keep the emulated RAM at 64 MB, but leave virtual address space above
+      * it for MM3's large MEM_RESERVE requests. */
+     xbox_SetMapSize(MM3_MEMORY_MAP_SIZE);

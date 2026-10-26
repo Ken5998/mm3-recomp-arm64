@@ -1,7 +1,7 @@
 From 015a2854a5088eee24000cd4f92c569e152db8b1 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 17:23:44 +0000
-Subject: [PATCH 28/28] feat(apu): say where the voice processor's time goes,
+Subject: [PATCH 28/29] feat(apu): say where the voice processor's time goes,
  and let HRTF be switched off
 
 When the APU falls behind, a second line now gives the voices a frame and the time spent reading samples, low-passing, in the 3D filter and mixing. RECOMP_APU_HRTF=0 leaves 3D voices unfiltered for comparing by ear. Volume-to-gain is tabulated once instead of eight powf calls per voice a frame.

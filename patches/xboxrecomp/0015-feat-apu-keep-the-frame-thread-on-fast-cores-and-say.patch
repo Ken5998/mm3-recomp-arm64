@@ -1,7 +1,7 @@
 From 34f2d49476df612fe119b97cf08a2a271782175d Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 19:21:27 +0000
-Subject: [PATCH 15/28] feat(apu): keep the frame thread on fast cores and say
+Subject: [PATCH 15/29] feat(apu): keep the frame thread on fast cores and say
  when audio lags
 
 On a CPU that mixes fast and slow cores, such as a handheld's SoC, the

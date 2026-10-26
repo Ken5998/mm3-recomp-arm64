@@ -1,0 +1,313 @@
+From 816fb8131ca91c727598203ccee32d9fc4f1d88e Mon Sep 17 00:00:00 2001
+From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 16:59:29 +0000
+Subject: [PATCH 29/29] fix(memory): keep the heap out of reservations and
+ reuse freed space at any alignment
+
+A heap that grew past the top of RAM took addresses xbox_ReserveAlloc had
+already given the title, so its CRT heap and kernel blocks shared memory;
+the heap now steps over reservations and later reservations start above it.
+With RECOMP_HEAP_RECLAIM an aligned request is carved out of any free block
+big enough, not only one that starts aligned, so page-sized requests stop
+growing the heap after small ones split a freed block. RECOMP_HEAP_RECLAIM=0
+now means off. Each worker start prints a [MEM] line with heap and
+contiguous usage.
+---
+ src/kernel/kernel_bridge.c              |   2 +
+ src/kernel/xbox_memory_layout.c         | 100 ++++++++++++++++++++----
+ src/kernel/xbox_memory_layout.h         |   9 ++-
+ tests/memory_regressions/CMakeLists.txt |   1 +
+ tests/memory_regressions/test_main.c    |  49 +++++++++++-
+ 5 files changed, 141 insertions(+), 20 deletions(-)
+
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index e9dc43d..3e90ac8 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -578,6 +578,8 @@ static void bridge_PsCreateSystemThreadEx(void)
+     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx #%d: routine=0x%08X ctx1=0x%08X ctx2=0x%08X\n",
+             g_thread_call_count, start_routine, start_context1, start_context2);
+     fflush(stderr);
++    /* Titles start a worker per load; memory running out shows up there. */
++    xbox_MemoryReport("thread start");
+ 
+     /* Write a fake handle to the output pointer */
+     if (xbox_handle_ptr) {
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 165599b..147c0f3 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -3131,6 +3131,9 @@ void xbox_MemoryLayoutShutdown(void)
+  * a real allocator; none has yet.
+  */
+ static uint32_t g_reserve_next;
++/* The heap's bump pointer; xbox_HeapAlloc below explains it. Declared here
++ * because reservations and the heap both use the space above RAM. */
++static uint32_t g_heap_next = XBOX_HEAP_BASE;
+ 
+ uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align)
+ {
+@@ -3142,6 +3145,10 @@ uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align)
+         align = 4096;
+     if (!g_reserve_next)
+         g_reserve_next = (uint32_t)g_xbox_total_ram;
++    /* The heap runs to the top of the map too. Once it has grown past RAM,
++     * a reservation starts above it rather than over it. */
++    if (g_heap_next > g_reserve_next)
++        g_reserve_next = g_heap_next;
+ 
+     base = (g_reserve_next + align - 1) & ~(align - 1);
+     if ((size_t)base + size > g_memory_size)
+@@ -3177,7 +3184,6 @@ ptrdiff_t xbox_GetMemoryOffset(void)
+  * Returns Xbox VAs within the mapped region so MEM32() works correctly.
+  * No free support (bump-only for now).
+  */
+-static uint32_t g_heap_next = XBOX_HEAP_BASE;
+ 
+ static int g_heap_alloc_count = 0;
+ 
+@@ -3529,11 +3535,15 @@ uint32_t xbox_ContiguousBlockSize(uint32_t xbox_va)
+ }
+ 
+ /* Heap splitting and NT release/decommit remain opt-in. Contiguous pages
+- * are always reused, independently of this switch. */
++ * are always reused, independently of this switch. RECOMP_HEAP_RECLAIM=0
++ * counts as unset, so a title that turns it on by default can be overruled. */
+ int xbox_HeapReclaimEnabled(void)
+ {
+     static int enabled = -1;
+-    if (enabled < 0) enabled = getenv("RECOMP_HEAP_RECLAIM") != NULL;
++    if (enabled < 0) {
++        const char *e = getenv("RECOMP_HEAP_RECLAIM");
++        enabled = e && *e && strcmp(e, "0") != 0;
++    }
+     return enabled;
+ }
+ 
+@@ -3591,6 +3601,17 @@ static void heap_watch(const char *how, uint32_t addr, uint32_t size)
+                 addr + size, g_esp, *(const uint32_t *)((uintptr_t)g_esp + g_memory_offset));
+ }
+ 
++/* Insert a block at index `at`, keeping the table in address order. */
++static void heap_insert(int at, uint32_t addr, uint32_t size, uint8_t is_free)
++{
++    memmove(&g_heap_blocks[at + 1], &g_heap_blocks[at],
++            (size_t)(g_heap_block_count - at) * sizeof g_heap_blocks[0]);
++    g_heap_blocks[at].addr = addr;
++    g_heap_blocks[at].size = size;
++    g_heap_blocks[at].free = is_free;
++    g_heap_block_count++;
++}
++
+ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+ {
+     uint32_t result;
+@@ -3631,21 +3652,37 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+         if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size) {
+             continue;
+         }
+-        if (g_heap_blocks[i].addr & (alignment - 1)) {
+-            continue;   /* wrong alignment for this request */
+-        }
+-        if (xbox_HeapReclaimEnabled() && g_heap_blocks[i].size > size) {
+-            if (g_heap_block_count == XBOX_HEAP_MAX_BLOCKS)
++        if (xbox_HeapReclaimEnabled()) {
++            /* Carve an aligned piece out of the block, leaving what is in
++             * front of it and behind it free. Taking only blocks that start
++             * aligned meant that once a small request had split a freed
++             * page-aligned block, no page-aligned request could use the rest,
++             * and every one of them grew the heap instead. */
++            uint32_t addr = g_heap_blocks[i].addr;
++            uint32_t span = g_heap_blocks[i].size;
++            uint32_t start = (addr + alignment - 1) & ~(alignment - 1);
++            uint32_t head = start - addr, tail;
++
++            if (start < addr || (uint64_t)head + size > span)
+                 continue;
+-            memmove(&g_heap_blocks[i + 2], &g_heap_blocks[i + 1],
+-                    (g_heap_block_count - i - 1) * sizeof g_heap_blocks[0]);
+-            g_heap_blocks[i + 1].addr = g_heap_blocks[i].addr + size;
+-            g_heap_blocks[i + 1].size = g_heap_blocks[i].size - size;
+-            g_heap_blocks[i + 1].free = 1;
+-            g_heap_blocks[i].size = size;
+-            g_heap_block_count++;
++            tail = span - head - size;
++            if (g_heap_block_count + (head ? 1 : 0) + (tail ? 1 : 0) > XBOX_HEAP_MAX_BLOCKS)
++                continue;
++            if (head) {
++                g_heap_blocks[i].size = head;            /* stays free */
++                heap_insert(++i, start, size, 0);
++            } else {
++                g_heap_blocks[i].size = size;
++                g_heap_blocks[i].free = 0;
++            }
++            if (tail)
++                heap_insert(i + 1, start + size, tail, 1);
++        } else {
++            if (g_heap_blocks[i].addr & (alignment - 1)) {
++                continue;   /* wrong alignment for this request */
++            }
++            g_heap_blocks[i].free = 0;
+         }
+-        g_heap_blocks[i].free = 0;
+         result = g_heap_blocks[i].addr;
+         memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+         heap_watch("reuse", result, size);
+@@ -3667,6 +3704,13 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+             result = (end + alignment - 1) & ~(alignment - 1);
+     }
+ 
++    /* Above RAM, xbox_ReserveAlloc hands the title's large reservations out
++     * of the same addresses. A heap that grew into them gave the title's own
++     * CRT heap and kernel blocks the same memory. */
++    if (g_reserve_next && (uint64_t)result + size > g_xbox_total_ram &&
++        result < g_reserve_next)
++        result = (g_reserve_next + alignment - 1) & ~(alignment - 1);
++
+     if (result + size > XBOX_HEAP_TOP) {
+         fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
+                 size, g_heap_next - XBOX_HEAP_BASE,
+@@ -3815,6 +3859,30 @@ void xbox_HeapFree(uint32_t xbox_va)
+     LeaveCriticalSection(&g_allocator_lock);
+ }
+ 
++/* One line on where the guest's memory is: what the heap holds and how far it
++ * reaches, and what the contiguous window holds and how far it has been handed
++ * out. Heap and window share physical page numbers below the top of RAM, so the
++ * heap's reach is room the window cannot use. */
++void xbox_MemoryReport(const char *why)
++{
++    uint64_t heap_live = 0, contig_live = 0;
++
++    EnterCriticalSection(&g_allocator_lock);
++    for (int i = 0; i < g_heap_block_count; i++)
++        if (!g_heap_blocks[i].free)
++            heap_live += g_heap_blocks[i].size;
++    for (LONG i = 0; i < g_contig_alloc_count; i++)
++        if (g_contig_allocs[i].in_use)
++            contig_live += g_contig_allocs[i].size;
++    fprintf(stderr, "  [MEM] %s: heap %u KB live, reaching 0x%08X; contiguous %u KB live,"
++                    " handed out to %u of %u KB; reservations to 0x%08X\n",
++            why, (unsigned)(heap_live / 1024), g_heap_next, (unsigned)(contig_live / 1024),
++            (g_contig_next - XBOX_CONTIG_BASE) / 1024, (unsigned)(XBOX_CONTIG_SIZE / 1024),
++            g_reserve_next);
++    fflush(stderr);
++    LeaveCriticalSection(&g_allocator_lock);
++}
++
+ HANDLE xbox_GetMappingHandle(void)
+ {
+     return g_mapping_handle;
+diff --git a/src/kernel/xbox_memory_layout.h b/src/kernel/xbox_memory_layout.h
+index ec6f90d..99ca244 100644
+--- a/src/kernel/xbox_memory_layout.h
++++ b/src/kernel/xbox_memory_layout.h
+@@ -471,12 +471,15 @@ void xbox_HeapFree(uint32_t xbox_va);
+ uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
+ 
+ /**
+- * True when RECOMP_HEAP_RECLAIM is set: freed heap blocks are split rather than
+- * handed over whole, and NtFreeVirtualMemory returns heap memory to the heap.
+- * Off by default; it changes which address later allocations get.
++ * True when RECOMP_HEAP_RECLAIM is set and not 0: freed heap blocks are split
++ * rather than handed over whole, and NtFreeVirtualMemory returns heap memory to
++ * the heap. Off by default; it changes which address later allocations get.
+  */
+ int xbox_HeapReclaimEnabled(void);
+ 
++/** Print one [MEM] line with heap and contiguous-window usage, labelled `why`. */
++void xbox_MemoryReport(const char *why);
++
+ /**
+  * Get the file mapping handle for the Xbox memory region.
+  * Used by the VEH handler to map additional mirror views on demand.
+diff --git a/tests/memory_regressions/CMakeLists.txt b/tests/memory_regressions/CMakeLists.txt
+index 204bc4e..3c6ef69 100644
+--- a/tests/memory_regressions/CMakeLists.txt
++++ b/tests/memory_regressions/CMakeLists.txt
+@@ -16,3 +16,4 @@ add_test(NAME memory_regressions_default COMMAND memory_regressions_test default
+ add_test(NAME memory_regressions_heap_reclaim COMMAND memory_regressions_test heap-reclaim ${XBE})
+ add_test(NAME memory_regressions_ext_vma COMMAND memory_regressions_test ext-vma ${XBE})
+ add_test(NAME memory_regressions_ext_vma_128 COMMAND memory_regressions_test ext-vma-128 ${XBE})
++add_test(NAME memory_regressions_map_128 COMMAND memory_regressions_test map-128 ${XBE})
+diff --git a/tests/memory_regressions/test_main.c b/tests/memory_regressions/test_main.c
+index 84629a8..339d2ce 100644
+--- a/tests/memory_regressions/test_main.c
++++ b/tests/memory_regressions/test_main.c
+@@ -24,6 +24,15 @@
+  *      the console. Both were no-ops, so the old contents came back.
+  *   6. MmFreeContiguousMemory gives a contiguous block back and the next
+  *      request of that size reuses it; contiguous pages are reused in both modes.
++ *   7. A page-aligned request fits in a freed block that does not start on a
++ *      page. Only blocks starting aligned were considered, so once a small
++ *      request had split a freed block, page-aligned requests grew the heap.
++ *
++ *   map-128       RECOMP_HEAP_RECLAIM=1 on 64 MB of RAM in a 128 MB map, as
++ *                 Midtown Madness 3 runs. Reservations come from above RAM,
++ *                 and a heap that grows past RAM must step over them, as a
++ *                 reservation made later must start above the heap. The heap
++ *                 used to grow straight into the title's reserved CRT heap.
+  *
+  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
+  *                 above the RAM mirrors gets it, can commit inside it and use
+@@ -177,7 +186,8 @@ int main(int argc, char **argv)
+ {
+     const char *mode = argc > 1 ? argv[1] : "default";
+     const char *path = argc > 2 ? argv[2] : "tools/conformance/test.xbe";
+-    int reclaim = !strcmp(mode, "heap-reclaim");
++    int map128 = !strcmp(mode, "map-128");
++    int reclaim = map128 || !strcmp(mode, "heap-reclaim");
+     int ext128 = !strcmp(mode, "ext-vma-128");
+     int ext = ext128 || !strcmp(mode, "ext-vma");
+     size_t xbe_len = 0;
+@@ -196,6 +206,8 @@ int main(int argc, char **argv)
+         set_env("RECOMP_EXT_VMA", "1");
+     if (ext128)
+         xbox_SetTotalRam(XBOX_DEVKIT_RAM);
++    if (map128)
++        xbox_SetMapSize(128u * 1024 * 1024);
+ 
+     xbe = load_file(path, &xbe_len);
+     if (!xbe) {
+@@ -315,6 +327,41 @@ int main(int argc, char **argv)
+         check(c1 && c2 == c1, "a freed contiguous block is reused in both modes", d);
+     }
+ 
++    /* 7. A page-aligned request in a freed block that starts off a page. */
++    if (reclaim) {
++        uint32_t b1 = xbox_HeapAlloc(16, 4096);
++        uint32_t b2 = xbox_HeapAlloc(0x2FF0, 16);
++        /* Larger than any freed block, so it comes from the top of the heap. */
++        uint32_t top = xbox_HeapAlloc(0x400000, 16);
++        uint32_t p;
++
++        (void)b1;
++        xbox_HeapFree(b2);
++        p = xbox_HeapAlloc(0x1000, 4096);
++        snprintf(d, sizeof d, "got 0x%08X, heap had reached 0x%08X", p, top);
++        check(p && p < top && !(p & 0xFFF) && xbox_HeapBlockSize(p) == 0x1000,
++              "a page-aligned request reuses freed space instead of growing the heap", d);
++    }
++
++    /* 8. The heap and the reservations above RAM stay apart. */
++    if (map128) {
++        const uint32_t big_size = 0x03800000u;
++        uint32_t r = xbox_ReserveAlloc(0x400000, 4096);
++        uint32_t big, r2;
++
++        snprintf(d, sizeof d, "got 0x%08X", r);
++        check(r == 0x04000000u, "a reservation starts at the top of RAM", d);
++        big = xbox_HeapAlloc(big_size, 4096);
++        snprintf(d, sizeof d, "heap block 0x%08X..0x%08X, reservation 0x%08X..0x%08X",
++                 big, big + big_size, r, r + 0x400000);
++        check(big && (big >= r + 0x400000 || big + big_size <= r),
++              "a heap block that grows past RAM steps over the reservation", d);
++        r2 = xbox_ReserveAlloc(0x100000, 4096);
++        snprintf(d, sizeof d, "got 0x%08X, heap reaches 0x%08X", r2, big + big_size);
++        check(r2 >= big + big_size, "a later reservation starts above the heap", d);
++        xbox_MemoryReport("map-128");
++    }
++
+     /* 4. Above the RAM mirrors: [0x74000000, 0x7FFE0000) at 64 MB. */
+     {
+         const uint32_t hi = 0x76000000u;

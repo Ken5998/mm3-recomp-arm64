@@ -1,7 +1,7 @@
 From 3c32131f9a433a22532341e6daf6608d5e43bc70 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 20:54:55 +0000
-Subject: [PATCH 25/28] perf(apu): run the HRTF filter over straight memory
+Subject: [PATCH 25/29] perf(apu): run the HRTF filter over straight memory
 
 Each 3D voice runs a 31-tap filter per ear and sample. With a modulo per tap
 and one serial sum that cost several us a voice frame, which with a race's

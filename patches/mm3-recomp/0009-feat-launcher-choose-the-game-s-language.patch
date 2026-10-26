@@ -1,7 +1,7 @@
 From 3234afa1b2d09ac78b90409734b4113935614423 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 19:45:21 +0000
-Subject: [PATCH 9/9] feat(launcher): choose the game's language
+Subject: [PATCH 09/10] feat(launcher): choose the game's language
 
 MM3 reads the console language (XC_LANGUAGE) when it starts and has no
 language menu of its own, so the launcher's Settings gain a Language row that

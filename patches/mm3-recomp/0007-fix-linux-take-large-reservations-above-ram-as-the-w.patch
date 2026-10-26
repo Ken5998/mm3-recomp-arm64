@@ -1,7 +1,7 @@
 From b20ccf340667a5ea1484f663e225ae710cfbcbd6 Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 19:21:32 +0000
-Subject: [PATCH 7/9] fix(linux): take large reservations above ram as the
+Subject: [PATCH 07/10] fix(linux): take large reservations above ram as the
  windows build does
 
 The ELF build linked xbox_ReserveAlloc to the heap. MM3's CRT heap grows

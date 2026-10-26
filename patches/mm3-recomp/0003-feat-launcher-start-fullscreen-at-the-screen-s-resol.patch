@@ -1,7 +1,7 @@
 From bca8fd27732e9e5e6e554d0b95b1b3c2ca4bc2be Mon Sep 17 00:00:00 2001
 From: Ken5998 <46025606+Ken5998@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 03:31:40 +0000
-Subject: [PATCH 3/9] feat(launcher): start fullscreen at the screen's
+Subject: [PATCH 03/10] feat(launcher): start fullscreen at the screen's
  resolution on arm64 linux
 
 ARM64 Linux is a handheld: the game fills the screen by default and
