@@ -67,13 +67,15 @@ jobs:
           sha256="$(sha256sum "$archive" | cut -d' ' -f1)"
           scripts/release-notes.sh "v$version" > notes.md
           cat >> notes.md <<NOTES
-          ## Install
+          ## Racing on ARM64
 
-          Midtown Madness 3 for ARM64 Linux handhelds, such as the Retroid Pocket 6 on ArmadaOS, built from [mm3-recomp ${commit:0:7}](https://github.com/MattSG/mm3-recomp/commit/$commit).
+          Built from [mm3-recomp ${commit:0:7}](https://github.com/MattSG/mm3-recomp/commit/$commit): the original Xbox code translated and compiled natively for ARM64, drawn through DXVK on Turnip.
 
-          On the handheld, in Desktop Mode: unpack $(basename "$archive"), start MidtownMadness3/mm3-launcher and choose your own disc image of Midtown Madness 3 (USA or Europe). The launcher checks it, downloads its build tools and the ARM64 sysroot $sysroot, builds the game on the handheld (about 6 GB free on top of the image's size; keep it on the charger) and offers Play and Add to Steam. See the README for details.
+          The only thing to bring is your own disc: the USA redump ISO or the Europe/Australia XISO. Extract $(basename "$archive") in Desktop Mode, start MidtownMadness3/mm3-launcher, pick the image and press **Verify and build**: 20 to 40 minutes on the charger, about 6 GB free besides the image. Then **Add to Steam** and race from there, so the controls work.
 
-          No game files are included. SHA-256: \`$sha256\`
+          Coming from an older version? **Update** in the launcher (B on the controller), then **Build again**: the game files already copied are reused, and saves stay in ~/.local/share/MidtownMadness3/saves.
+
+          mm3-recomp is still early work, so back up your saves. Launcher SHA-256: \`$sha256\` (ARM64 sysroot $sysroot)
           NOTES
           if gh release view "v$version" > /dev/null 2>&1; then
             gh release upload "v$version" "$archive" --clobber
