@@ -4,7 +4,7 @@ Play [mm3-recomp](https://github.com/MattSG/mm3-recomp), the static
 recompilation of the original Xbox *Midtown Madness 3*, natively on Snapdragon
 handhelds running [ArmadaOS](https://armadaos.dev/), such as the Retroid
 Pocket 6. No emulator: the game's code is translated to C and compiled for
-ARM64, and its Direct3D renderer runs on Vulkan through DXVK.
+ARM64, and the Xbox GPU is drawn with SDL3's GPU API on Vulkan.
 
 <p align="center">
   <img src="docs/launcher-setup.png" alt="The launcher before the first build: choose your Midtown Madness 3 disc image, confirm you own it, then Verify and build" width="49%">
@@ -27,8 +27,9 @@ image's size.
    Downloads, ROMs folders and SD card; **Choose another file...** for others),
    confirm that you own it and press **Verify and build**. Keep the handheld
    on its charger: the launcher checks the disc, copies the game's files,
-   downloads its build tools, translates the game and compiles it, which takes
-   20 to 40 minutes.
+   downloads its build tools, translates the game and compiles it, then
+   starts the game once without a window to capture its audio programs and
+   compiles again with them built in. This takes 30 to 60 minutes.
 3. Press **Play**, or **Add to Steam** to start the game from Gaming Mode like
    any other game, with its artwork drawn from your disc.
 
@@ -49,9 +50,9 @@ already copied.
   Desktop Mode.
 - The launcher's **Settings**, **Controls** and **Mods** are mm3-recomp's:
   display mode, frame limit, tick rate, widescreen, draw distance and the
-  controller and keyboard bindings. **Language** picks the game's language
-  (the Xbox took it from the console's settings); Auto follows the system. On a handheld the game starts full screen
-  at the screen's resolution.
+  controller and keyboard bindings. The game remembers the language you pick
+  in its own menu. On a handheld the game starts full screen at the screen's
+  resolution.
 - In the launcher: D-pad to move, **A** to change, **LB**/**RB** for tabs,
   **Start** to play, **X** to add to Steam, **B** to update the launcher
   when a new release is out, **Back** to quit.
@@ -59,35 +60,19 @@ already copied.
 
 ## Status
 
-This is an early release of the port. On a Retroid Pocket 6 the launcher
-builds the game in about 20 minutes, and the game starts on the handheld's
-GPU (Turnip). Menus and races are drawn in 3D and the first mission can be
-completed. Since 0.1.5 each vertex program has its own shader, and races run
-at 40-60 fps with the GPU around half busy (0.1.4 managed 10-12 fps at 100%).
-The first seconds stutter while shaders compile; later runs load them from
-`~/.local/share/MidtownMadness3/cache/shaders`. Version 0.1.6 makes the audio
-DSP emulation 1.4x lighter and keeps profiles and progress between runs, in
-`~/.local/share/MidtownMadness3/saves`. Version 0.1.7 updates the launcher
-from its own **Update** button. Version 0.1.8 adds a **Language** setting,
-0.1.9 makes the 3D sound filter 3.5x lighter, 0.1.10 runs the audio DSP
-about 30% faster and 0.1.11 logs where the audio time goes, with
-`RECOMP_APU_HRTF=0` to turn the 3D sound filter off. 0.1.12 gives freed memory
-back between races, so a second race no longer runs out of video memory, and
-reads the sound samples without waiting on the game's memory allocator.
-mm3-recomp itself is a work in
-progress, so expect rough edges, and back up your saves.
+Version 0.2.0 is rebuilt on mm3-recomp v2026.11.01.5.1, which draws with SDL3
+on Vulkan instead of Direct3D 11 through DXVK, and compiles the game's audio
+DSP programs ahead of time instead of interpreting them. The 0.1.x releases
+ran races at 40-60 fps on a Retroid Pocket 6; 0.2.0 is new on the handheld,
+so frame rate, audio and the hang some players saw when a second race loads
+still need checking there. mm3-recomp itself is a work in progress, so expect
+rough edges, and back up your saves (`~/.local/share/MidtownMadness3/saves`).
 
 ## If something goes wrong
 
 The launcher shows which step failed. Its **Logs** link opens the build log,
 and the game writes `~/.local/share/MidtownMadness3/logs/game.log`; attach
 them to an [issue](https://github.com/Ken5998/mm3-recomp-arm64/issues).
-
-If the game stops somewhere without closing, start it from a terminal with
-`RECOMP_THREAD_DUMP_SECS=20 ~/.local/share/MidtownMadness3/midtown-madness-3.sh`,
-leave it stopped for a minute and close it: `game.log` then says where each of
-the game's threads is.
-
 
 ## Developers
 

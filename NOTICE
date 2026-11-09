@@ -20,13 +20,18 @@ The launcher's source payload also carries, unmodified:
 
 - RmlUi 6.3, https://github.com/mikke89/RmlUi (MIT)
 - FreeType 2.13.3, https://freetype.org (FreeType License)
+- Dear ImGui 1.91.9b, https://github.com/ocornut/imgui (MIT)
+- SDL3_image 3.4.6, https://github.com/libsdl-org/SDL_image (zlib licence)
 
 The ARM64 sysroot the launcher downloads (releases named sysroot-*) holds
 Ubuntu 24.04 arm64 packages, each with its licence in usr/share/doc, and
 builds of:
 
-- DXVK 2.7.1, https://github.com/doitsujin/dxvk (zlib licence)
-- vkd3d 2.0, https://gitlab.winehq.org/wine/vkd3d (LGPL-2.1-or-later)
+- SDL3 3.4.18, https://libsdl.org (zlib licence)
+- SDL_shadercross, https://github.com/libsdl-org/SDL_shadercross (zlib licence),
+  with DirectXShaderCompiler (University of Illinois/NCSA and Apache-2.0 WITH
+  LLVM-exception), SPIRV-Cross (Apache-2.0) and SPIRV-Tools (Apache-2.0)
+- FFmpeg 7.1.2, https://ffmpeg.org (LGPL-2.1-or-later, shared libraries)
 
 On the handheld the launcher also downloads, from their own publishers, LLVM
 (Apache-2.0 WITH LLVM-exception), CMake (BSD-3-Clause), Ninja (Apache-2.0),

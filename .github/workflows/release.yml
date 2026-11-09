@@ -69,9 +69,9 @@ jobs:
           cat >> notes.md <<NOTES
           ## Racing on ARM64
 
-          Built from [mm3-recomp ${commit:0:7}](https://github.com/MattSG/mm3-recomp/commit/$commit): the original Xbox code translated and compiled natively for ARM64, drawn through DXVK on Turnip.
+          Built from [mm3-recomp ${commit:0:7}](https://github.com/MattSG/mm3-recomp/commit/$commit): the original Xbox code translated and compiled natively for ARM64, drawn with SDL3 on Vulkan (Turnip).
 
-          The only thing to bring is your own disc: the USA redump ISO or the Europe/Australia XISO. Extract $(basename "$archive") in Desktop Mode, start MidtownMadness3/mm3-launcher, pick the image and press **Verify and build**: 20 to 40 minutes on the charger, about 6 GB free besides the image. Then **Add to Steam** and race from there, so the controls work.
+          The only thing to bring is your own disc: the USA redump ISO or the Europe/Australia XISO. Extract $(basename "$archive") in Desktop Mode, start MidtownMadness3/mm3-launcher, pick the image and press **Verify and build**: 30 to 60 minutes on the charger, about 6 GB free besides the image. Then **Add to Steam** and race from there, so the controls work.
 
           Coming from an older version? **Update** in the launcher (B on the controller), then **Build again**: the game files already copied are reused, and saves stay in ~/.local/share/MidtownMadness3/saves.
 
