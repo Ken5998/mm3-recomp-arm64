@@ -15,7 +15,7 @@ jobs:
   build:
     runs-on: ubuntu-24.04-arm
     container: ubuntu:24.04
-    timeout-minutes: 45
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v5
       - name: Build the ARM64 sysroot
@@ -45,9 +45,9 @@ jobs:
           version="${name#mm3-arm64-sysroot-}"
           sha256="$(sha256sum "$archive" | cut -d' ' -f1)"
           cat > notes.md <<NOTES
-          The ARM64 sysroot the launcher downloads to build Midtown Madness 3 on a handheld: Ubuntu 24.04 arm64 packages (glibc 2.39, GCC 14's libstdc++, SDL2, epoxy, OpenSSL and Vulkan development files, pkgconf) with DXVK-native 2.7.1 and vkd3d 2.0 built from source. It holds no game files.
+          The ARM64 sysroot the launcher downloads to build Midtown Madness 3 on a handheld: Ubuntu 24.04 arm64 packages (glibc 2.39, GCC 14's libstdc++, OpenSSL and Vulkan development files, pkgconf) with SDL3, SDL_shadercross (with its DirectX Shader Compiler, SPIRV-Cross and SPIRV-Tools) and a shared LGPL FFmpeg built from source. It holds no game files.
 
-          The packages and versions inside are in $name.packages.txt, and each one's licence in usr/share/doc. The Ubuntu packages' sources are on https://launchpad.net/ubuntu; DXVK's on https://github.com/doitsujin/dxvk and vkd3d's on https://gitlab.winehq.org/wine/vkd3d.
+          The packages and versions inside are in $name.packages.txt, and each one's licence in usr/share/doc. The Ubuntu packages' sources are on https://launchpad.net/ubuntu; SDL3's on https://github.com/libsdl-org/SDL, SDL_shadercross's on https://github.com/libsdl-org/SDL_shadercross and FFmpeg's on https://github.com/FFmpeg/FFmpeg.
 
           Pin it with \`scripts/pin-sysroot.py $name.tar.xz\`. SHA-256: \`$sha256\`
           NOTES

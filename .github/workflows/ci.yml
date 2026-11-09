@@ -19,10 +19,18 @@ jobs:
   sysroot:
     runs-on: ubuntu-24.04-arm
     container: ubuntu:24.04
-    timeout-minutes: 45
+    # DXC, an LLVM fork, takes most of this; the cache skips it until the
+    # script changes.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: out/sysroot
+          key: arm64-sysroot-${{ hashFiles('scripts/build-sysroot.sh') }}
       - name: Build the ARM64 sysroot
+        if: steps.cache.outputs.cache-hit != 'true'
         run: scripts/build-sysroot.sh out/sysroot
       - uses: actions/upload-artifact@v7
         with:
