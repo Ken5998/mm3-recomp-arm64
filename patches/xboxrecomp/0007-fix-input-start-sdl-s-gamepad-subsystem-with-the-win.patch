@@ -1,0 +1,46 @@
+From 3662de2976a80201cb3ba50a712bf31edaed35bd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Kenan=20Kasumovi=C4=87?=
+ <46025606+Ken5998@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 21:57:15 +0000
+Subject: [PATCH] fix(input): start sdl's gamepad subsystem with the window
+
+Nothing initialised it on the SDL3 path, so SDL listed no gamepads and every
+pad read returned ERROR_DEVICE_NOT_CONNECTED. Also log each pad opened.
+---
+ src/input/xinput_device.c | 6 +++++-
+ src/video/fb_window_sdl.c | 4 ++++
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
+index 4bffbb4..cff8e7d 100644
+--- a/src/input/xinput_device.c
++++ b/src/input/xinput_device.c
+@@ -96,8 +96,12 @@ static SDL_Gamepad *sdl_pad(DWORD port)
+     {
+         int count = 0;
+         SDL_JoystickID *ids = SDL_GetGamepads(&count);
+-        if (ids && (int)port < count)
++        if (ids && (int)port < count) {
+             g_sdl_pads[port] = SDL_OpenGamepad(ids[port]);
++            if (g_sdl_pads[port])
++                fprintf(stderr, "[INPUT] port %lu: %s\n", (unsigned long)port,
++                        SDL_GetGamepadName(g_sdl_pads[port]));
++        }
+         SDL_free(ids);
+     }
+     return g_sdl_pads[port];
+diff --git a/src/video/fb_window_sdl.c b/src/video/fb_window_sdl.c
+index 3a78248..62b3ca9 100644
+--- a/src/video/fb_window_sdl.c
++++ b/src/video/fb_window_sdl.c
+@@ -177,6 +177,10 @@ SDL_Window *fbw_sdl_open(SDL_WindowFlags extra_flags)
+         fprintf(stderr, "  [FBWIN] SDL video: %s\n", SDL_GetError());
+         return NULL;
+     }
++    /* The pads are read through SDL's gamepad API (xinput_device.c), which
++     * lists nothing until its subsystem is up; this thread pumps its events. */
++    if (!SDL_WasInit(SDL_INIT_GAMEPAD) && !SDL_InitSubSystem(SDL_INIT_GAMEPAD))
++        fprintf(stderr, "  [INPUT] SDL gamepads: %s\n", SDL_GetError());
+     memset(&usable, 0, sizeof usable);
+     SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable);
+     fbw_initial_size(usable.w, usable.h, &cw, &ch);
