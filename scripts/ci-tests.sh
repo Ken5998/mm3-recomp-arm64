@@ -37,7 +37,7 @@ tests=(
     apu_phys apu_sdl apu_wav wma_decoder
     input_keyboard input_keyboard_map input_map keymap keymap_spec net kernel_crypto
     nv2a_combiner nv2a_hash nv2a_pacing nv2a_sampler_cache nv2a_shader_cache nv2a_vsh
-    fb_present flip_hold frame_limit video_pump memory_regressions adpcm_decode
+    fb_present flip_hold frame_limit video_pump memory_regressions adpcm_decode dsp
 )
 failed=()
 summary=()

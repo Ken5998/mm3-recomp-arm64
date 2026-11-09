@@ -1,0 +1,49 @@
+From d900cab6d3caacea80160578ef65ae7b4b5e9ee9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Kenan=20Kasumovi=C4=87?=
+ <46025606+Ken5998@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 20:53:46 +0000
+Subject: [PATCH] fix(apu): run dsp_recomp_gen by its path in cross builds
+
+With a toolchain file CMake treats the build as a cross build and leaves a
+target name in a custom command as a bare word, so the shell looked for
+dsp_recomp_gen on PATH.
+---
+ src/apu/CMakeLists.txt   | 3 ++-
+ tests/dsp/CMakeLists.txt | 4 ++--
+ 2 files changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/apu/CMakeLists.txt b/src/apu/CMakeLists.txt
+index d4b1f49..9d4dcde 100644
+--- a/src/apu/CMakeLists.txt
++++ b/src/apu/CMakeLists.txt
+@@ -50,11 +50,12 @@ if(XBOXRECOMP_DSP_PROGRAM_DIR)
+     target_include_directories(dsp_recomp_gen PRIVATE ${dsp_interp} ${CMAKE_CURRENT_SOURCE_DIR}/dsp)
+     target_compile_definitions(dsp_recomp_gen PRIVATE _CRT_SECURE_NO_WARNINGS NDEBUG)
+     add_custom_target(dsp_recomp_programs
+-        COMMAND dsp_recomp_gen ${dsp_interp}/dsp_cpu.c ${dsp_interp}/dsp_emu.c.inc
++        COMMAND $<TARGET_FILE:dsp_recomp_gen> ${dsp_interp}/dsp_cpu.c ${dsp_interp}/dsp_emu.c.inc
+                 ${dsp_recomp_inc} ${XBOXRECOMP_DSP_PROGRAM_DIR}
+         BYPRODUCTS ${dsp_recomp_inc}
+         COMMENT "Recompiling DSP programs from ${XBOXRECOMP_DSP_PROGRAM_DIR}"
+         VERBATIM)
++    add_dependencies(dsp_recomp_programs dsp_recomp_gen)
+     add_dependencies(xbox_apu dsp_recomp_programs)
+     target_compile_definitions(xbox_apu PRIVATE DSP_RECOMP_INC="${dsp_recomp_inc}")
+     set_source_files_properties(dsp/interp/dsp_cpu.c PROPERTIES OBJECT_DEPENDS ${dsp_recomp_inc})
+diff --git a/tests/dsp/CMakeLists.txt b/tests/dsp/CMakeLists.txt
+index 0de5942..95c2608 100644
+--- a/tests/dsp/CMakeLists.txt
++++ b/tests/dsp/CMakeLists.txt
+@@ -141,10 +141,10 @@ add_custom_command(OUTPUT ${recomp_capture} ${recomp_dir}/ep.p.bin
+   COMMAND "${CMAKE_COMMAND}" -E make_directory ${recomp_dir}
+   COMMAND "${CMAKE_COMMAND}" -E env "RECOMP_DSP_FRAME_DUMP=${recomp_dir}/clipped-frame"
+           "RECOMP_DSP_CAPTURE_CLIPPED=1" $<TARGET_FILE:dsp_clipped_capture_test>
+-  COMMAND dsp_capture_program ${recomp_capture} ${recomp_dir}
++  COMMAND $<TARGET_FILE:dsp_capture_program> ${recomp_capture} ${recomp_dir}
+   DEPENDS dsp_clipped_capture_test dsp_capture_program VERBATIM)
+ add_custom_command(OUTPUT ${recomp_inc}
+-  COMMAND dsp_recomp_gen ${dsp_interp}/dsp_cpu.c ${dsp_interp}/dsp_emu.c.inc ${recomp_inc} ${recomp_dir}
++  COMMAND $<TARGET_FILE:dsp_recomp_gen> ${dsp_interp}/dsp_cpu.c ${dsp_interp}/dsp_emu.c.inc ${recomp_inc} ${recomp_dir}
+   DEPENDS dsp_recomp_gen ${recomp_dir}/ep.p.bin ${dsp_interp}/dsp_cpu.c ${dsp_interp}/dsp_emu.c.inc VERBATIM)
+ add_executable(dsp_recomp_frame_replay dsp_frame_replay.c ${dsp_interp}/dsp_cpu.c
+   ../../src/apu/dsp/dsp_dma.c ../../src/apu/dsp/dsp.c ${recomp_inc})
