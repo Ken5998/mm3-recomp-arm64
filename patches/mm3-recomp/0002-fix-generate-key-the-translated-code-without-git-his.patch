@@ -1,0 +1,41 @@
+From 9987068aaf37ca1108ac3978e978e1ee49e2269f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Kenan=20Kasumovi=C4=87?=
+ <46025606+Ken5998@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 13:14:15 +0000
+Subject: [PATCH 2/3] fix(generate): key the translated code without git
+ history
+
+The arm64 launcher builds from a source archive with no .git, where git
+rev-parse failed before the code was even translated: without history the
+key hashes the toolkit's files.
+---
+ scripts/generate_mm3.py | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/scripts/generate_mm3.py b/scripts/generate_mm3.py
+index 8353722..a4dd457 100644
+--- a/scripts/generate_mm3.py
++++ b/scripts/generate_mm3.py
+@@ -33,8 +33,20 @@ def generator_dir():
+ 
+ 
+ def generation_key():
+-    toolkit_tree = subprocess.check_output(
+-        ['git', '-C', str(generator_dir()), 'rev-parse', 'HEAD:tools', 'HEAD:templates/runtime'])
++    try:
++        toolkit_tree = subprocess.check_output(
++            ['git', '-C', str(generator_dir()), 'rev-parse', 'HEAD:tools', 'HEAD:templates/runtime'],
++            stderr=subprocess.DEVNULL)
++    except (OSError, subprocess.CalledProcessError):
++        # A source tree without git history (the arm64 launcher's): the
++        # toolkit's files themselves.
++        toolkit = hashlib.sha256()
++        for folder in ('tools', 'templates/runtime'):
++            for path in sorted((generator_dir() / folder).rglob('*')):
++                if path.is_file() and '__pycache__' not in path.parts and 'output' not in path.parts:
++                    toolkit.update(str(path.relative_to(generator_dir())).encode())
++                    toolkit.update(path.read_bytes())
++        toolkit_tree = toolkit.hexdigest().encode()
+     digest = hashlib.sha256(toolkit_tree)
+     for path in ('scripts/generate_mm3.py', 'scripts/Generate-MM3RuntimeEntries.py',
+                  'scripts/mm3_runtime_unwind.py', 'tools/prepare_mm3_gui_boundaries.py',

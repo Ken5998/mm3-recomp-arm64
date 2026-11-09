@@ -1,0 +1,100 @@
+From 3026959b458f8d2465ee6c85149cd5dd40ae15d2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Kenan=20Kasumovi=C4=87?=
+ <46025606+Ken5998@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 13:22:38 +0000
+Subject: [PATCH 4/5] fix(posix): exit without tearing libraries down, and read
+ at an offset in one call
+
+ExitProcess called exit(), which runs atexit handlers and C++ static
+destructors while the guest, audio and render threads still use SDL and
+the GPU driver, so a title quitting crashed on the way out. Windows ends
+the other threads first and skips the process's atexit handlers; flush
+stdio and _exit() instead.
+
+NtReadFile and NtWriteFile at an offset were a seek and a transfer, so a
+second thread using the same handle between them moved the first one's
+data. pread and pwrite are one call, as ReadFile with an OVERLAPPED is,
+and the file pointer still ends after the data.
+---
+ src/kernel/kernel_file.c    | 29 +++++++++++++++++++++--------
+ src/platform/win32_compat.c | 13 +++++++++++--
+ 2 files changed, 32 insertions(+), 10 deletions(-)
+
+diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
+index d81cda6..d9ef2b0 100644
+--- a/src/kernel/kernel_file.c
++++ b/src/kernel/kernel_file.c
+@@ -1659,10 +1659,18 @@ NTSTATUS __stdcall xbox_NtReadFile(
+     }
+ 
+     overwrite_settle(fd);
+-    if (ByteOffset && ByteOffset->QuadPart >= 0)
+-        lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
+-
+-    ssize_t n = read(fd, Buffer, Length);
++    /* At an offset, read there in one call, as ReadFile with an OVERLAPPED
++     * does: a seek and a read are two, and a second thread reading the same
++     * handle between them moves the first one's data. The file pointer still
++     * ends after the data, as it does on Windows. */
++    ssize_t n;
++    if (ByteOffset && ByteOffset->QuadPart >= 0) {
++        n = pread(fd, Buffer, Length, (off_t)ByteOffset->QuadPart);
++        if (n >= 0)
++            lseek(fd, (off_t)ByteOffset->QuadPart + n, SEEK_SET);
++    } else {
++        n = read(fd, Buffer, Length);
++    }
+     if (n < 0) {
+         XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
+         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+@@ -1696,10 +1704,15 @@ NTSTATUS __stdcall xbox_NtWriteFile(
+     }
+ 
+     overwrite_settle(fd);
+-    if (ByteOffset && ByteOffset->QuadPart >= 0)
+-        lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
+-
+-    ssize_t n = write(fd, Buffer, Length);
++    /* In one call at an offset, for the reason NtReadFile gives. */
++    ssize_t n;
++    if (ByteOffset && ByteOffset->QuadPart >= 0) {
++        n = pwrite(fd, Buffer, Length, (off_t)ByteOffset->QuadPart);
++        if (n >= 0)
++            lseek(fd, (off_t)ByteOffset->QuadPart + n, SEEK_SET);
++    } else {
++        n = write(fd, Buffer, Length);
++    }
+     if (n < 0) {
+         XBOX_TRACE(XBOX_LOG_FILE, "NtWriteFile(handle=%p) errno=%d", FileHandle, errno);
+         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+diff --git a/src/platform/win32_compat.c b/src/platform/win32_compat.c
+index 176e92c..26452e9 100644
+--- a/src/platform/win32_compat.c
++++ b/src/platform/win32_compat.c
+@@ -2319,7 +2319,15 @@ VOID OutputDebugStringA(LPCSTR str)
+     if (str) fputs(str, stderr);
+ }
+ 
+-VOID ExitProcess(UINT exitCode) { exit((int)exitCode); }
++/* Windows ends the other threads before anything is torn down, and the
++ * process's atexit handlers do not run. exit() would run C++ destructors and
++ * library teardown (SDL, the GPU driver) while the guest, audio and render
++ * threads still use them, and crash on the way out. */
++VOID ExitProcess(UINT exitCode)
++{
++    fflush(NULL);
++    _exit((int)exitCode);
++}
+ 
+ BOOL IsDebuggerPresent(void)
+ {
+@@ -2594,7 +2602,8 @@ LRESULT DispatchMessageA(const MSG *m) { (void)m; return 0; }
+ BOOL TerminateProcess(HANDLE process, UINT exitCode)
+ {
+     (void)process;
+-    exit((int)exitCode);
++    ExitProcess(exitCode);
++    return FALSE;
+ }
+ 
+ VOID OutputDebugStringW(LPCWSTR str)

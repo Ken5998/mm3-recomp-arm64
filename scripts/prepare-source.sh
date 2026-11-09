@@ -4,8 +4,8 @@
 #
 #   scripts/prepare-source.sh DEST
 #
-# DEST must not exist. Needs git and python3. The xboxrecomp checkout also
-# holds the generator commit generate_mm3.py extracts its translator from.
+# DEST must not exist. Needs git and python3. The translator is xboxrecomp's
+# own tools/, which generate_mm3.py runs from the checkout.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,7 +26,6 @@ repository="$(read_pin repository)"
 commit="$(read_pin commit)"
 xbox_repository="$(read_pin xboxrecomp.repository)"
 xbox_commit="$(read_pin xboxrecomp.commit)"
-generator_commit="$(read_pin xboxrecomp.generator_commit)"
 
 retry() {
     local attempt
@@ -55,7 +54,7 @@ xbox="$dest/tools/xboxrecomp"
 rm -rf "$xbox"
 git init -q "$xbox"
 git -C "$xbox" remote add origin "$xbox_repository"
-retry git -C "$xbox" fetch -q --depth 1 origin "$xbox_commit" "$generator_commit"
+retry git -C "$xbox" fetch -q --depth 1 origin "$xbox_commit"
 git -C "$xbox" -c advice.detachedHead=false checkout -q "$xbox_commit"
 
 # Some xboxrecomp sources have CRLF line ends, which their patches carry.

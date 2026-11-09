@@ -1,0 +1,144 @@
+From e8bf775ea094d73fcaae2d1edac14ea646a43443 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Kenan=20Kasumovi=C4=87?=
+ <46025606+Ken5998@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 13:13:39 +0000
+Subject: [PATCH 2/5] fix(linux): build the sdl3 renderer and kernel on linux
+
+The D3D8 layer included <windows.h> and <d3dcompiler.h> outright and
+used UINT16/INT8 without a header that defines them off Windows, the SDL
+event pump called fprintf without stdio, and the write-back flush used
+_mm_sfence on every host. Linux builds them now, arm64 included.
+
+Also finds an installed SDL_shadercross (a prebuilt sysroot's) before
+building its vendored DXC.
+---
+ cmake/xbox_sdl3.cmake       | 5 +++++
+ src/d3d/d3d8_combiners.h    | 2 +-
+ src/d3d/d3d8_shaders.c      | 1 +
+ src/d3d/d3d8_vsh.c          | 4 +++-
+ src/d3d/d3d8_vsh.h          | 2 +-
+ src/gfx/sdl_events.c        | 1 +
+ src/kernel/nv2a_wbc_flush.c | 4 ++++
+ src/platform/xbox_winnt.h   | 6 ++++++
+ 8 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/cmake/xbox_sdl3.cmake b/cmake/xbox_sdl3.cmake
+index b23e218..8d3aeee 100644
+--- a/cmake/xbox_sdl3.cmake
++++ b/cmake/xbox_sdl3.cmake
+@@ -20,6 +20,11 @@ endif()
+ # and SDL_GPU only takes SPIR-V / DXIL / MSL, so the HLSL is compiled and
+ # cross-compiled at run time (DXC + SPIRV-Cross, built from the vendored
+ # submodules; the first build is long).
++# An installed SDL_shadercross (a prebuilt sysroot's, with its DXC) first:
++# building DXC, an LLVM fork, is most of a first build.
++if(NOT TARGET SDL3_shadercross::SDL3_shadercross-static)
++    find_package(SDL3_shadercross CONFIG QUIET)
++endif()
+ if(NOT TARGET SDL3_shadercross::SDL3_shadercross-static)
+     set(SDLSHADERCROSS_VENDORED ON CACHE BOOL "" FORCE)
+     set(ENABLE_SPIRV_CODEGEN ON CACHE BOOL "" FORCE)
+diff --git a/src/d3d/d3d8_combiners.h b/src/d3d/d3d8_combiners.h
+index 7655f91..c64932f 100644
+--- a/src/d3d/d3d8_combiners.h
++++ b/src/d3d/d3d8_combiners.h
+@@ -42,7 +42,7 @@
+ 
+ #include "gfx/gpu_shader.h"
+ #include <stdint.h>
+-#include <windows.h>
++#include "platform/xbox_winnt.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+diff --git a/src/d3d/d3d8_shaders.c b/src/d3d/d3d8_shaders.c
+index 9de5dac..875c669 100644
+--- a/src/d3d/d3d8_shaders.c
++++ b/src/d3d/d3d8_shaders.c
+@@ -22,6 +22,7 @@
+ 
+ #include "d3d8_internal.h"
+ #include "d3d8_fvf.h"
++#include <stdlib.h>
+ #include <string.h>
+ #include <stdio.h>
+ #include <math.h>
+diff --git a/src/d3d/d3d8_vsh.c b/src/d3d/d3d8_vsh.c
+index ab2bd77..f03ad80 100644
+--- a/src/d3d/d3d8_vsh.c
++++ b/src/d3d/d3d8_vsh.c
+@@ -19,13 +19,15 @@
+ 
+ #include "d3d8_internal.h"
+ #include "d3d8_vsh.h"
+-#include <d3dcompiler.h>
+ #include <string.h>
+ #include <stdio.h>
+ #include <stdarg.h>
+ #include <math.h>
+ 
++#if defined(_WIN32)
++#include <d3dcompiler.h>
+ #pragma comment(lib, "d3dcompiler.lib")
++#endif
+ 
+ /* ================================================================
+  * NV2A Instruction Bit Field Extraction
+diff --git a/src/d3d/d3d8_vsh.h b/src/d3d/d3d8_vsh.h
+index 8c9390d..821085d 100644
+--- a/src/d3d/d3d8_vsh.h
++++ b/src/d3d/d3d8_vsh.h
+@@ -48,7 +48,7 @@
+ 
+ #include "gfx/gpu_shader.h"
+ #include <stdint.h>
+-#include <windows.h>
++#include "platform/xbox_winnt.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+diff --git a/src/gfx/sdl_events.c b/src/gfx/sdl_events.c
+index 34f827f..05fa13e 100644
+--- a/src/gfx/sdl_events.c
++++ b/src/gfx/sdl_events.c
+@@ -4,6 +4,7 @@
+  */
+ #include <SDL3/SDL.h>
+ #include "../input/keyboard.h"
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+diff --git a/src/kernel/nv2a_wbc_flush.c b/src/kernel/nv2a_wbc_flush.c
+index 246ad7b..41edff2 100644
+--- a/src/kernel/nv2a_wbc_flush.c
++++ b/src/kernel/nv2a_wbc_flush.c
+@@ -9,7 +9,11 @@
+ #include "platform/xbox_winnt.h"
+ #include "xbox_memory_layout.h"
+ #include <stdio.h>
++#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+ #include <xmmintrin.h>
++#else
++#define _mm_sfence() __atomic_thread_fence(__ATOMIC_RELEASE)
++#endif
+ 
+ /* Device object: the NV2A register block pointer lives at device+0x17C8. */
+ #define NV2A_DEVICE_REGS_OFFSET 0x17C8u
+diff --git a/src/platform/xbox_winnt.h b/src/platform/xbox_winnt.h
+index 34788dc..1a7b090 100644
+--- a/src/platform/xbox_winnt.h
++++ b/src/platform/xbox_winnt.h
+@@ -136,6 +136,12 @@ typedef char               CHAR,  *PCHAR;
+ typedef char               CCHAR;
+ typedef int                INT,   *PINT;
+ typedef unsigned int       UINT,  *PUINT;
++typedef uint8_t            UINT8, *PUINT8;
++typedef uint16_t           UINT16, *PUINT16;
++typedef uint32_t           UINT32, *PUINT32;
++typedef int8_t             INT8, *PINT8;
++typedef int16_t            INT16, *PINT16;
++typedef int32_t            INT32, *PINT32;
+ typedef int                BOOL,  *PBOOL;
+ typedef int64_t            LONGLONG,  LONG64,  *PLONGLONG;
+ typedef uint64_t           ULONGLONG, ULONG64, *PULONGLONG, DWORDLONG;

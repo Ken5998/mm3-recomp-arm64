@@ -1,0 +1,95 @@
+From 7c1c43bbd11c4efa46acd783bb0b8f5eac19c106 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Kenan=20Kasumovi=C4=87?=
+ <46025606+Ken5998@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 13:21:51 +0000
+Subject: [PATCH 3/5] fix(kernel): find game files whatever the case of their
+ path on linux
+
+Titles spell paths the way they like; NTFS ignores case, Linux file
+systems do not. Re-case each component of a translated path to the
+directory entry that exists.
+---
+ src/kernel/kernel_path.c | 56 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
+index 6c74c41..4cc49d1 100644
+--- a/src/kernel/kernel_path.c
++++ b/src/kernel/kernel_path.c
+@@ -670,6 +670,8 @@ translate:
+ #include <sys/types.h>
+ #include <errno.h>
+ #include <fcntl.h>
++#include <dirent.h>
++#include <strings.h>
+ 
+ static char s_game_dir[MAX_PATH];
+ static char s_save_dir[MAX_PATH];
+@@ -684,6 +686,59 @@ static void strip_trailing_slash(char* s)
+         s[len - 1] = '\0';
+ }
+ 
++/* Xbox paths are case-insensitive and titles do not spell a file the way
++ * the disc does ("D:\DATA\Foo.ARF" for data/foo.arf); NTFS hides that, a
++ * Linux file system does not. Re-case each component after the first `keep`
++ * bytes to the entry that exists, in place (ASCII case folding keeps the
++ * length). A component with no match ends the walk: the rest is a file or
++ * directory about to be created, and keeps the title's spelling. */
++static void resolve_case(char* path, size_t keep)
++{
++    struct stat st;
++    char* comp;
++
++    if (stat(path, &st) == 0)
++        return;
++    for (comp = path + keep; *comp == '/'; comp++)
++        ;
++    while (*comp) {
++        char* end = strchr(comp, '/');
++        char  saved = end ? *end : '\0';
++        DIR* dir;
++        struct dirent* de;
++        int found = 0;
++
++        if (end)
++            *end = '\0';
++        if (stat(path, &st) != 0) {
++            /* The parent is comp[-1] == '/': list it for a match. */
++            comp[-1] = '\0';
++            dir = opendir(path[0] ? path : "/");
++            comp[-1] = '/';
++            if (dir) {
++                while ((de = readdir(dir)) != NULL) {
++                    if (strcasecmp(de->d_name, comp) == 0) {
++                        memcpy(comp, de->d_name, strlen(comp));
++                        found = 1;
++                        break;
++                    }
++                }
++                closedir(dir);
++            }
++            if (!found) {
++                if (end)
++                    *end = saved;
++                return;
++            }
++        }
++        if (!end)
++            return;
++        *end = saved;
++        for (comp = end; *comp == '/'; comp++)
++            ;
++    }
++}
++
+ /* Recursively create a directory and all missing parents. */
+ static void mkdir_p(const char* path)
+ {
+@@ -890,6 +945,7 @@ translate:
+             while (n > 1 && host_path_buf[n - 1] == '/')
+                 host_path_buf[--n] = '\0';
+         }
++        resolve_case(host_path_buf, strlen(base_dir));
+ 
+         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
+         /* As the Win32 backend does: the bridge reads back the host path

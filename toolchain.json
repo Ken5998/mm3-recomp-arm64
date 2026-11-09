@@ -55,11 +55,11 @@
     "strip": 1
   },
   "capstone": {
-    "label": "Capstone 5.0.9",
-    "version": "5.0.9",
-    "url": "https://files.pythonhosted.org/packages/45/d9/dbeadb9fcd461e608ce79b1cb647fed6baa812fa6e1c68b0ba5ef81291af/capstone-5.0.9-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
-    "sha256": "41772ad0c71aa5d3e97d541e802593c2e71fb94ac7e20d4202f97ce2a3eb8ed5",
-    "size": 1461016,
+    "label": "Capstone 5.0.7",
+    "version": "5.0.7",
+    "url": "https://files.pythonhosted.org/packages/7d/32/084419edcd9a3efaadf5c22166de625090fae833aad0672ddd9fa436d1e2/capstone-5.0.7-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+    "sha256": "c58546c814567c95e4b9a63bdb8624c960cb8508855c7c767d5f108d7bc09ce2",
+    "size": 1458867,
     "members": [
       "capstone/",
       "capstone.libs/"
@@ -88,11 +88,13 @@
     ]
   },
   "runtime_libraries": [
-    "libdxvk_d3d11.so.0",
-    "libdxvk_dxgi.so.0",
-    "libvkd3d-utils.so.1",
-    "libvkd3d.so.1",
-    "libvkd3d-shader.so.1",
-    "libepoxy.so.0"
+    "libSDL3.so.0",
+    "libdxcompiler.so",
+    "libdxil.so",
+    "libavformat.so.61",
+    "libavcodec.so.61",
+    "libavutil.so.59",
+    "libswscale.so.8",
+    "libswresample.so.5"
   ]
 }

@@ -1,0 +1,465 @@
+From 2f8ab3a20b7165a275b3ea8f2793e034b9258fff Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Kenan=20Kasumovi=C4=87?=
+ <46025606+Ken5998@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 13:02:16 +0000
+Subject: [PATCH 1/5] feat(posix): trap device registers on linux arm64
+
+The vectored exception handlers win32_compat emulates decode x86-64, so on
+arm64 Linux nothing served a trapped device page and NV2A was never set up.
+The host now installs a SIGSEGV/SIGBUS handler there that routes a fault as
+mmio_handler does, NIC, OHCI, PVIDEO and APU, each served by the A64 decoder
+on the handler's ucontext; faults it does not own go to the previous
+handler. The AC'97 bus-master page has no trap flag to step its write with,
+so the store is decoded and done with the reset bits masked.
+
+A trapped load into an FP/SIMD register also lands in the frame's SVE
+record: once a thread has used SVE, as glibc does on the Snapdragon 8 Gen
+2, sigreturn restores Vn from Zn.
+---
+ src/host/host.c                 | 115 ++++++++++++++++++++++++++++++++
+ src/kernel/xbox_memory_layout.c |  66 ++++++++++++++++++
+ src/kernel/xbox_memory_layout.h |   4 ++
+ src/net/nvnet.c                 |  11 +++
+ src/nv2a/nv2a_mmio_hook.c       |  26 +++++++-
+ src/platform/mmio_decode_a64.h  |  57 +++++++++++++++-
+ 6 files changed, 273 insertions(+), 6 deletions(-)
+
+diff --git a/src/host/host.c b/src/host/host.c
+index 8aa992f..afda4eb 100644
+--- a/src/host/host.c
++++ b/src/host/host.c
+@@ -84,6 +84,110 @@ static LONG CALLBACK mmio_handler(PEXCEPTION_POINTERS info)
+     return EXCEPTION_CONTINUE_SEARCH;
+ }
+ 
++#if defined(__aarch64__) && !defined(_WIN32)
++/* POSIX arm64: no vectored exception handlers (win32_compat's only decode
++ * x86-64), so the device pages are served from a SIGSEGV/SIGBUS handler of
++ * our own with the A64 decoder (src/platform/mmio_decode_a64.h): the same
++ * routing as mmio_handler above, each device's hook taking the ucontext in
++ * place of a CONTEXT. Faults it does not own go to the previous handler. */
++#include <signal.h>
++#include "platform/mmio_decode_a64.h"
++
++extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
++                                       uint32_t fault_xbox_va, int is_write);
++
++static struct sigaction s_prev_segv, s_prev_bus;
++static int s_a64_installed;
++
++static int a64_mmio(ucontext_t *uc, uintptr_t fault_address)
++{
++    uint32_t guest_address, physical;
++    int alias, is_write = 0;
++
++    if (xbox_Ac97PosixFault(uc, fault_address))
++        return 1;
++    if (fault_address < (uintptr_t)g_xbox_mem_offset ||
++        fault_address - (uintptr_t)g_xbox_mem_offset > UINT32_MAX)
++        return 0;
++    guest_address = (uint32_t)(fault_address - (uintptr_t)g_xbox_mem_offset);
++    /* The decoder reads the direction from the opcode; the resolve and the
++     * PVIDEO read below need it first, from the frame's ESR record (WnR). */
++    {
++        unsigned char *p = (unsigned char *)uc->uc_mcontext.__reserved;
++        unsigned char *end = p + sizeof(uc->uc_mcontext.__reserved);
++        while (p + 16 <= end) {
++            uint32_t magic, size;
++            memcpy(&magic, p, 4);
++            memcpy(&size, p + 4, 4);
++            if (magic == 0 || size < 8) break;
++            if (magic == 0x45535201u) {                    /* ESR_MAGIC */
++                uint64_t esr;
++                memcpy(&esr, p + 8, 8);
++                is_write = (int)((esr >> 6) & 1);
++                break;
++            }
++            p += size;
++        }
++    }
++    alias = xbox_IoMappingResolve(guest_address, is_write, &physical);
++    if (alias < 0) return 0;
++    if (alias) guest_address = physical;
++    if (xbox_NicOwnsAddress(guest_address))
++        return xbox_NicHandleMmio(uc, guest_address);
++    if (xbox_OhciOwnsAddress(guest_address))
++        return xbox_OhciHandleMmio(uc, guest_address);
++    if (guest_address == PVIDEO_PAGE + 0x700u && !is_write &&
++        !getenv("RECOMP_FB_WINDOW")) {
++        NV2AState *gpu = nv2a_get_state();
++        if (gpu) {
++            uint64_t buffer = nv2a_mmio_read(gpu, 0x8700, 4);
++            nv2a_mmio_write(gpu, 0x8700, buffer & ~0x11u, 4);
++        }
++    }
++    if (guest_address >= PVIDEO_PAGE && guest_address < PVIDEO_PAGE + 0x1000u)
++        return nv2a_hook_handle_mmio((PCONTEXT)(void *)uc, fault_address,
++                                     guest_address, is_write);
++    if (g_apu_state &&
++        guest_address >= APU_TRAP_BASE && guest_address < APU_TRAP_END)
++        return apu_hook_handle_mmio_posix(uc, fault_address, guest_address, is_write);
++    return 0;
++}
++
++static void a64_fault(int sig, siginfo_t *si, void *raw)
++{
++    struct sigaction *prev = sig == SIGBUS ? &s_prev_bus : &s_prev_segv;
++
++    if (a64_mmio((ucontext_t *)raw, (uintptr_t)si->si_addr))
++        return;
++    if (prev->sa_flags & SA_SIGINFO) {
++        if (prev->sa_sigaction) { prev->sa_sigaction(sig, si, raw); return; }
++    } else if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
++        prev->sa_handler(sig);
++        return;
++    }
++    /* Nobody else wants it: die of it as if no handler were installed. */
++    signal(sig, SIG_DFL);
++    raise(sig);
++}
++
++static int a64_install(void)
++{
++    struct sigaction sa;
++
++    if (s_a64_installed)
++        return 1;
++    memset(&sa, 0, sizeof sa);
++    sa.sa_sigaction = a64_fault;
++    sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
++    sigemptyset(&sa.sa_mask);
++    if (sigaction(SIGSEGV, &sa, &s_prev_segv) != 0 ||
++        sigaction(SIGBUS, &sa, &s_prev_bus) != 0)
++        return 0;
++    s_a64_installed = 1;
++    return 1;
++}
++#endif
++
+ int xbox_HostHardwareInit(void)
+ {
+     if (getenv("RECOMP_AC97_READY")) {
+@@ -93,7 +197,12 @@ int xbox_HostHardwareInit(void)
+             return 0;
+         }
+     }
++#if defined(__aarch64__) && !defined(_WIN32)
++    s_mmio_veh = a64_install() ? (PVOID)&s_a64_installed : NULL;
++    (void)mmio_handler;
++#else
+     s_mmio_veh = AddVectoredExceptionHandler(1, mmio_handler);
++#endif
+     if (!s_mmio_veh) {
+         fprintf(stderr, "[HOST] could not install MMIO exception handler\n");
+         xbox_HostHardwareShutdown();
+@@ -111,7 +220,13 @@ int xbox_HostHardwareInit(void)
+ void xbox_HostHardwareShutdown(void)
+ {
+     if (s_mmio_veh) {
++#if defined(__aarch64__) && !defined(_WIN32)
++        sigaction(SIGSEGV, &s_prev_segv, NULL);
++        sigaction(SIGBUS, &s_prev_bus, NULL);
++        s_a64_installed = 0;
++#else
+         RemoveVectoredExceptionHandler(s_mmio_veh);
++#endif
+         s_mmio_veh = NULL;
+     }
+     if (g_apu_state) {
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index b4a1fe0..400d85f 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -705,6 +705,59 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
+ /* Arm the trap. Called once the MCPX aperture exists, and only alongside the
+  * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
+  * channel has nothing to gain from it, and the page fault costs something. */
++#if defined(__aarch64__) && !defined(_WIN32)
++/* POSIX arm64 has no trap flag to single-step the write with, so the store is
++ * decoded (src/platform/mmio_decode_a64.h) and done here: the page is opened
++ * for it, the value written, the reset bits masked and the page closed again.
++ * Called by the host's SIGSEGV dispatcher (src/host/host.c) with the handler's
++ * ucontext; 1 when the fault was this page's and was serviced. */
++#include "../platform/mmio_decode_a64.h"
++
++static uint64_t ac97_a64_read(void *page, uint32_t off, int size)
++{
++    uint64_t v = 0;
++    memcpy(&v, (char *)page + off, (size_t)size);
++    return v;
++}
++
++static void ac97_a64_write(void *page, uint32_t off, uint64_t v, int size)
++{
++    DWORD old;
++    VirtualProtect(page, AC97_TRAP_BYTES, PAGE_READWRITE, &old);
++    memcpy((char *)page + off, &v, (size_t)size);
++    ac97_clear_reset_bits(page);
++    VirtualProtect(page, AC97_TRAP_BYTES, PAGE_READONLY, &old);
++}
++
++int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
++{
++    uint32_t physical;
++    uintptr_t canonical, page;
++    int alias;
++
++    if (!g_ac97_page)
++        return 0;
++    alias = fault >= (uintptr_t)g_memory_offset &&
++            fault - (uintptr_t)g_memory_offset <= UINT32_MAX
++        ? xbox_IoMappingResolve((uint32_t)(fault - (uintptr_t)g_memory_offset), 1, &physical) : 0;
++    if (alias < 0)
++        return 0;
++    canonical = alias == 1 ? (uintptr_t)physical + g_memory_offset : fault;
++    if (canonical < (uintptr_t)g_ac97_page ||
++        canonical >= (uintptr_t)g_ac97_page + AC97_TRAP_BYTES)
++        return 0;
++    page = fault & ~(uintptr_t)(AC97_TRAP_BYTES - 1);
++    return mmio_emulate_a64((ucontext_t *)ucv, (uint32_t)(fault - page), (void *)page,
++                            ac97_a64_read, ac97_a64_write);
++}
++#else
++int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
++{
++    (void)ucv; (void)fault;
++    return 0;
++}
++#endif
++
+ static void ac97_arm_write_trap(void)
+ {
+     DWORD old;
+@@ -712,6 +765,19 @@ static void ac97_arm_write_trap(void)
+     if (!g_mcpx_memory || g_ac97_page)
+         return;
+     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
++#if defined(__aarch64__) && !defined(_WIN32)
++    /* The host's SIGSEGV dispatcher serves it: no VEH here. */
++    if (!VirtualProtect(g_ac97_page, AC97_TRAP_BYTES, PAGE_READONLY, &old)) {
++        g_ac97_page = NULL;
++        fprintf(stderr, "  AC97: could not arm the bus-master write trap;"
++                        " a channel reset will spin\n");
++        return;
++    }
++    fprintf(stderr, "  AC97: bus-master writes trapped at 0x%08X"
++                    " (channel reset completes on write)\n",
++            XBOX_MCPX_BASE + AC97_NABM_OFFSET);
++    return;
++#endif
+     /* First, so it runs before the game target's own crash reporter, which
+      * would otherwise print the write as an access violation. */
+     g_ac97_veh = AddVectoredExceptionHandler(1, ac97_write_veh);
+diff --git a/src/kernel/xbox_memory_layout.h b/src/kernel/xbox_memory_layout.h
+index 88bc48d..cb13b67 100644
+--- a/src/kernel/xbox_memory_layout.h
++++ b/src/kernel/xbox_memory_layout.h
+@@ -504,6 +504,10 @@ void  *xbox_thread_debug_handle(void); /* the game thread, or NULL under inline
+ #define XBOX_THREAD_MODE_SPAWN  1
+ void xbox_SetThreadMode(int mode);
+ 
++/* POSIX arm64: service a write fault on the trapped AC'97 bus-master page
++ * from a SIGSEGV handler (ucv is its ucontext). 1 when it was that page's. */
++int xbox_Ac97PosixFault(void *ucv, uintptr_t fault);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/net/nvnet.c b/src/net/nvnet.c
+index a30f017..139754e 100644
+--- a/src/net/nvnet.c
++++ b/src/net/nvnet.c
+@@ -22,6 +22,7 @@
+  */
+ #include "net.h"
+ #include "../platform/mmio_decode.h"
++#include "../platform/mmio_decode_a64.h"
+ #include "../kernel/xbox_memory_layout.h"
+ #include "../kernel/kernel.h"
+ #include <stdio.h>
+@@ -500,6 +501,16 @@ int xbox_NicHandleMmio(void *ctx, uint32_t va)
+         fflush(stderr);
+     }
+     return ok;
++#elif defined(__aarch64__)
++    /* ctx is the SIGSEGV handler's ucontext (src/host/host.c). */
++    ucontext_t *uc = (ucontext_t *)ctx;
++    int ok = mmio_emulate_a64(uc, va - NIC_BASE, NULL, nic_read, nic_write);
++    if (!ok && s.decode_fail++ < 20) {
++        NIC_LOG("  [NIC] undecoded access at +0x%03X: insn %08X\n",
++                va - NIC_BASE, *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc));
++        fflush(stderr);
++    }
++    return ok;
+ #else
+     (void)ctx; (void)va;
+     return 0;
+diff --git a/src/nv2a/nv2a_mmio_hook.c b/src/nv2a/nv2a_mmio_hook.c
+index f8cba31..e3cf343 100644
+--- a/src/nv2a/nv2a_mmio_hook.c
++++ b/src/nv2a/nv2a_mmio_hook.c
+@@ -8,6 +8,7 @@
+ #include "nv2a_mmio_hook.h"
+ #include "nv2a_state.h"
+ #include "platform/mmio_decode.h"
++#include "platform/mmio_decode_a64.h"
+ #include <stdio.h>
+ 
+ /* NV2A MMIO base in Xbox VA space */
+@@ -21,7 +22,7 @@ static volatile LONG g_mmio_read_count = 0;
+ static volatile LONG g_mmio_write_count = 0;
+ static volatile LONG g_mmio_decode_fail = 0;
+ 
+-#if defined(_WIN32) || defined(__x86_64__)
++#if defined(_WIN32) || defined(__x86_64__) || defined(__aarch64__)
+ 
+ static SRWLOCK g_pvideo_lock = SRWLOCK_INIT;
+ 
+@@ -64,6 +65,24 @@ static void hook_write(void *device, uint32_t offset, uint64_t value, int size)
+     InterlockedIncrement(&g_mmio_write_count);
+ }
+ 
++#if defined(__aarch64__) && !defined(_WIN32)
++/* POSIX arm64: ctx is the SIGSEGV handler's ucontext (src/host/host.c), and
++ * the A64 decoder serves the access. */
++static bool decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
++{
++    NV2AState *state = nv2a_get_state();
++    ucontext_t *uc = (ucontext_t *)(void *)ctx;
++    if (!state || !uc) return false;
++    if (mmio_emulate_a64(uc, mmio_offset, state, hook_read, hook_write)) return true;
++    if (InterlockedIncrement(&g_mmio_decode_fail) <= 20) {
++        fprintf(stderr, "[NV2A] MMIO decode fail at PC=%p insn=%08X offset=%08X write=%d\n",
++                (void *)(uintptr_t)A64_CTX_PC(uc),
++                *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc), mmio_offset, is_write);
++        fflush(stderr);
++    }
++    return false;
++}
++#else
+ static bool decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
+ {
+     NV2AState *state = nv2a_get_state();
+@@ -76,6 +95,7 @@ static bool decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
+     }
+     return false;
+ }
++#endif
+ 
+ /* ============================================================
+  * Public API
+@@ -118,7 +138,7 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+     return handled;
+ }
+ 
+-#else /* no x86-64 instruction decoder for this host */
++#else /* no instruction decoder for this host */
+ 
+ bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4])
+ { (void)regs; return false; }
+@@ -131,4 +151,4 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+                            uint32_t fault_xbox_va, int is_write)
+ { (void)ctx; (void)fault_addr; (void)fault_xbox_va; (void)is_write; return false; }
+ 
+-#endif /* _WIN32 || __x86_64__ */
++#endif /* _WIN32 || __x86_64__ || __aarch64__ */
+diff --git a/src/platform/mmio_decode_a64.h b/src/platform/mmio_decode_a64.h
+index 3fdc824..1062667 100644
+--- a/src/platform/mmio_decode_a64.h
++++ b/src/platform/mmio_decode_a64.h
+@@ -25,6 +25,7 @@
+ #define MMIO_DECODE_A64_H
+ 
+ #include <stdint.h>
++#include <string.h>
+ 
+ #if defined(__aarch64__) && !defined(_WIN32)
+ 
+@@ -43,6 +44,7 @@
+ #define A64_CTX_SP(uc)   ((uc)->uc_mcontext->__ss.__sp)
+ #define A64_CTX_HAS_V 1
+ #define A64_CTX_V(uc, n) ((uc)->uc_mcontext->__ns.__v[(n)])
++#define A64_CTX_V_SET(uc, n, v) (A64_CTX_V(uc, n) = (v))
+ #elif defined(__linux__)
+ #include <ucontext.h>
+ #include <asm/sigcontext.h>      /* struct _aarch64_ctx, fpsimd_context */
+@@ -73,9 +75,58 @@ static inline __uint128_t *mmio_a64_linux_vregs(ucontext_t *uc)
+     }
+     return 0;
+ }
++/* Zn in the frame's SVE record, *vl bytes long, or 0 when the record carries
++ * no registers. It carries them once the thread has used SVE (glibc's string
++ * functions do on cores that have it, as the Snapdragon 8 Gen 2's do, and
++ * QEMU always fills it), and sigreturn then restores Vn from Zn's low bytes
++ * rather than from the FPSIMD record, so a load must land there too. Records
++ * moved to an extra_context (long vector lengths) are followed. */
++static inline unsigned char *mmio_a64_linux_zreg(ucontext_t *uc, int n, unsigned *vl)
++{
++    unsigned char *p = (unsigned char *)uc->uc_mcontext.__reserved;
++    unsigned char *end = p + sizeof(uc->uc_mcontext.__reserved);
++    while (p + 8 <= end) {
++        uint32_t magic, size;
++        memcpy(&magic, p, 4);
++        memcpy(&size, p + 4, 4);
++        if (magic == 0 || size < 8)
++            break;
++        if (magic == 0x45585401u && size >= 20) {          /* EXTRA_MAGIC */
++            uint64_t datap;
++            uint32_t extra;
++            memcpy(&datap, p + 8, 8);
++            memcpy(&extra, p + 16, 4);
++            p = (unsigned char *)(uintptr_t)datap;
++            end = p + extra;
++            continue;
++        }
++        if (magic == 0x53564501u) {                         /* SVE_MAGIC */
++            uint16_t len;
++            /* head (8), vl (2), flags (2), reserved (4), Z0..Z31 of vl bytes */
++            memcpy(&len, p + 8, 2);
++            if (len < 16 || size < 16 + 32u * len)
++                return 0;
++            *vl = len;
++            return p + 16 + (size_t)n * len;
++        }
++        p += size;
++    }
++    return 0;
++}
++static inline void mmio_a64_linux_vset(ucontext_t *uc, int n, __uint128_t v)
++{
++    unsigned vl;
++    unsigned char *z = mmio_a64_linux_zreg(uc, n, &vl);
++    mmio_a64_linux_vregs(uc)[n] = v;
++    if (z) {                         /* writing Vn clears the rest of Zn */
++        memset(z, 0, vl);
++        memcpy(z, &v, 16);
++    }
++}
+ #define A64_CTX_HAS_V 1
+ #define A64_CTX_V_OK(uc) (mmio_a64_linux_vregs(uc) != 0)
+ #define A64_CTX_V(uc, n) (mmio_a64_linux_vregs(uc)[(n)])
++#define A64_CTX_V_SET(uc, n, v) mmio_a64_linux_vset(uc, n, v)
+ #endif
+ #ifndef A64_CTX_V_OK
+ #define A64_CTX_V_OK(uc) 1
+@@ -140,9 +191,9 @@ static inline int mmio_emulate_a64(ucontext_t *uc, uint32_t off, void *dev,
+             if (is_load) {
+                 if (bytes == 16) {
+                     __uint128_t lo = rd(dev, off, 8), hi = rd(dev, off + 8, 8);
+-                    A64_CTX_V(uc, rt) = lo | (hi << 64);
++                    A64_CTX_V_SET(uc, rt, lo | (hi << 64));
+                 } else {
+-                    A64_CTX_V(uc, rt) = rd(dev, off, bytes);
++                    A64_CTX_V_SET(uc, rt, rd(dev, off, bytes));
+                 }
+             } else {
+                 __uint128_t q = A64_CTX_V(uc, rt);
+@@ -221,7 +272,7 @@ static inline int mmio_emulate_a64(ucontext_t *uc, uint32_t off, void *dev,
+                 b = (uint64_t)(int64_t)(int32_t)b;
+             }
+ #if A64_CTX_HAS_V
+-            if (V) { A64_CTX_V(uc, rt) = a; A64_CTX_V(uc, rt2) = b; } else
++            if (V) { A64_CTX_V_SET(uc, rt, a); A64_CTX_V_SET(uc, rt2, b); } else
+ #endif
+             {
+                 if (rt != 31) *mmio_a64_xreg(uc, rt) = a;

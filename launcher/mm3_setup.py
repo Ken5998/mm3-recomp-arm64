@@ -303,16 +303,18 @@ def fetch_tools() -> dict[str, Path]:
 def write_wrappers(tools: dict[str, Path]) -> Path:
     """The linker and pkg-config the build runs, and the CMake toolchain file.
 
-    The LLVM release's ld.lld and the sysroot's pkgconf link libraries an
-    image-based system may not have (libxml2.so.2, libpkgconf.so.3), so they
-    run on the sysroot's own glibc through its dynamic loader."""
+    The LLVM release's ld.lld, the sysroot's pkgconf and its dxc (which
+    compiles the renderer's shaders) link libraries an image-based system may
+    not have (libxml2.so.2, libpkgconf.so.3, libdxcompiler.so), so they run
+    on the sysroot's own glibc through its dynamic loader."""
     sysroot = tools["sysroot"]
     libs = sysroot / "usr/lib/aarch64-linux-gnu"
     loader = sysroot / "usr/lib/ld-linux-aarch64.so.1"
     bin_dir = TOOLS / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     for name, program in (("ld.lld", tools["llvm"] / "bin/lld"),
-                          ("pkg-config", sysroot / "usr/bin/pkgconf")):
+                          ("pkg-config", sysroot / "usr/bin/pkgconf"),
+                          ("dxc", sysroot / "usr/bin/dxc")):
         wrapper = bin_dir / name
         wrapper.write_text(
             "#!/bin/sh\n"
@@ -331,7 +333,7 @@ set(CMAKE_RANLIB "{llvm}/llvm-ranlib" CACHE FILEPATH "")
 set(CMAKE_C_COMPILER_TARGET aarch64-linux-gnu)
 set(CMAKE_CXX_COMPILER_TARGET aarch64-linux-gnu)
 # An RPATH rather than a RUNPATH: it also serves the libraries the game
-# loads from lib/ (vkd3d-utils loads vkd3d, d3d11 loads dxgi).
+# loads from lib/ (libavformat loads libavcodec, SDL_shadercross DXC's).
 set(_mm3_link "-fuse-ld=lld --ld-path={bin_dir}/ld.lld -static-libstdc++ -static-libgcc -Wl,--disable-new-dtags")
 set(CMAKE_EXE_LINKER_FLAGS_INIT "${{_mm3_link}}")
 set(CMAKE_SHARED_LINKER_FLAGS_INIT "${{_mm3_link}}")
@@ -360,7 +362,12 @@ def pinned_python(tools: dict[str, Path]) -> tuple[Path, dict]:
 # --- Build ---------------------------------------------------------------------
 
 STEPS = ["Checking your disc and copying the game files", "Downloading the build tools",
-         "Translating the game code", "Compiling the game", "Finishing"]
+         "Translating the game code", "Compiling the game", "Capturing the audio programs",
+         "Finishing"]
+
+# The audio DSP programs the game builds while it runs: a short hidden run
+# saves them and the next compile turns them into native code.
+DSP_FILES = ("gp.p.bin", "ep.p.bin")
 
 
 def step(index: int) -> None:
@@ -450,6 +457,12 @@ def jobs() -> int:
     return max(1, min(os.cpu_count() or 1, by_memory))
 
 
+def third_party_flags(source: Path) -> list[str]:
+    """The sources CMake would download, from the launcher's source archive."""
+    return [f"-DFETCHCONTENT_SOURCE_DIR_{name.upper()}={source / 'third_party' / name}"
+            for name in ("freetype", "rmlui", "imgui", "sdl3_image")]
+
+
 def compile_game(tools: dict[str, Path], toolchain: Path) -> Path:
     build = SOURCE / "build"
     cmake = tools["cmake"] / "bin/cmake"
@@ -458,10 +471,9 @@ def compile_game(tools: dict[str, Path], toolchain: Path) -> Path:
     run([cmake, "-S", SOURCE, "-B", build, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}",
          f"-DCMAKE_TOOLCHAIN_FILE={toolchain}", "-DCMAKE_BUILD_TYPE=Release",
          "-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG", "-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG",
-         "-DCMAKE_BUILD_RPATH=$ORIGIN/../lib",
-         f"-DFETCHCONTENT_SOURCE_DIR_RMLUI={SOURCE / 'third_party/rmlui'}",
-         f"-DFETCHCONTENT_SOURCE_DIR_FREETYPE={SOURCE / 'third_party/freetype'}",
-         "-DFETCHCONTENT_FULLY_DISCONNECTED=ON"], cwd=SOURCE)
+         "-DCMAKE_BUILD_RPATH=$ORIGIN/../lib", "-DXBOXRECOMP_RENDERER=SDL3_GPU",
+         f"-DXBOXRECOMP_DXC={TOOLS / 'bin/dxc'}",
+         *third_party_flags(SOURCE), "-DFETCHCONTENT_FULLY_DISCONNECTED=ON"], cwd=SOURCE)
 
     def on_line(line: str) -> None:
         if line.startswith("[") and "/" in line.split("]")[0]:
@@ -477,7 +489,7 @@ def compile_game(tools: dict[str, Path], toolchain: Path) -> Path:
 
 def install_libraries(tools: dict[str, Path]) -> None:
     """The sysroot's libraries the game loads that a handheld may not have
-    (DXVK, vkd3d, epoxy) into lib/, which the game's rpath names."""
+    (SDL3, FFmpeg, DXC) into lib/, which the game's rpath names."""
     libs = tools["sysroot"] / "usr/lib/aarch64-linux-gnu"
     lib = DATA / "lib"
     shutil.rmtree(lib, ignore_errors=True)
@@ -505,14 +517,53 @@ def install(binary: Path, tools: dict[str, Path]) -> None:
         f'[ -f "{LOGS}/game.log" ] && mv -f "{LOGS}/game.log" "{LOGS}/game.previous.log"\n'
         "export MM3_LAUNCHER_SKIP=1\n"
         f'export MM3_SAVE_DIR="{DATA}/saves"\n'
-        # Compiled shaders survive between runs (vkd3d takes up to seconds each).
-        f'mkdir -p "{DATA}/cache/shaders"\n'
-        f'export RECOMP_SHADER_CACHE="{DATA}/cache/shaders"\n'
+        # The SDL3 GPU renderer on Vulkan (Turnip); a value already set wins.
+        'export RECOMP_SDL_GPU_DRIVER="${RECOMP_SDL_GPU_DRIVER:-vulkan}"\n'
         # Turnip's shader preambles cost Adreno more than they save, as in
         # Pinyon Shift and Saints Reborn; a value already set wins.
         'export IR3_SHADER_DEBUG="${IR3_SHADER_DEBUG:-nopreamble}"\n'
         f'exec "{DATA}/bin/mm3_recomp" "$@" >"{LOGS}/game.log" 2>&1\n')
     START_SCRIPT.chmod(0o755)
+
+
+def dsp_captured() -> bool:
+    return all((GAME_FILES / "dsp" / name).is_file() for name in DSP_FILES)
+
+
+def capture_dsp() -> bool:
+    """Runs the built game muted until it saves its DSP programs (two minutes
+    at most). The game's DirectSound builds them from templates in its code,
+    so only the game can make them."""
+    if dsp_captured():
+        return True
+    saves = DATA / "cache/dsp-capture"
+    shutil.rmtree(saves, ignore_errors=True)
+    saves.mkdir(parents=True)
+    env = dict(os.environ)
+    env.update({
+        "RECOMP_PB_EXEC": "1", "RECOMP_USB": "1", "RECOMP_AUDIO_MUTE": "1",
+        "RECOMP_DSP_PROGRAM_DIR": str(GAME_FILES / "dsp"), "RECOMP_SDL_GPU_DRIVER": "vulkan",
+        "MM3_PERFORMANCE_PROFILE": "LowPower", "MM3_SAVE_DIR": str(saves),
+        "IR3_SHADER_DEBUG": env.get("IR3_SHADER_DEBUG", "nopreamble"),
+    })
+    (GAME_FILES / "dsp").mkdir(parents=True, exist_ok=True)
+    log(f"$ {DATA / 'bin/mm3_recomp'} (DSP capture)")
+    with open(LOGS / "dsp-capture.log", "w") as out:
+        game = subprocess.Popen([str(DATA / "bin/mm3_recomp")], cwd=DATA, env=env,
+                                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
+        start = time.monotonic()
+        try:
+            while game.poll() is None and time.monotonic() - start < 120 and not dsp_captured():
+                emit("progress", f"{min(1.0, (time.monotonic() - start) / 120):.3f}",
+                     "The game runs for a moment to save its audio programs")
+                time.sleep(2)
+        finally:
+            if game.poll() is None:
+                game.kill()
+            game.wait()
+            shutil.rmtree(saves, ignore_errors=True)
+    log(f"DSP programs {'captured' if dsp_captured() else 'not saved'}")
+    return dsp_captured()
 
 
 def build(iso: Path | None) -> int:
@@ -543,6 +594,17 @@ def build(iso: Path | None) -> int:
     binary = compile_game(tools, toolchain)
 
     step(4)
+    install(binary, tools)
+    if not dsp_captured():
+        if capture_dsp():
+            emit("progress", "-1", "Compiling the audio programs in")
+            binary = compile_game(tools, toolchain)
+        else:
+            # Audio still works through the DSP interpreter; the game saves
+            # the programs as it plays and the next build compiles them in.
+            log("the DSP programs were not saved; audio stays interpreted")
+
+    step(5)
     emit("progress", "-1", "Installing")
     install(binary, tools)
     try:

@@ -78,8 +78,8 @@ cmake -S "$work/shadercross" -B "$work/shadercross-build" -G Ninja -DCMAKE_BUILD
 cmake --build "$work/shadercross-build" -j "$jobs"
 cmake --build "$work/shadercross-build" -j "$jobs" --target dxc
 DESTDIR="$stage" cmake --install "$work/shadercross-build"
-dxc_bin="$(find "$work/shadercross-build" -type f -name dxc -perm -u+x | head -n 1)"
-install -Dm755 "$dxc_bin" "$stage/usr/bin/dxc"
+install -Dm755 "$(readlink -f "$work/shadercross-build/external/DirectXShaderCompiler/bin/dxc")" \
+    "$stage/usr/bin/dxc"
 
 # FFmpeg, shared, LGPL, only its built-in components: no external codec
 # libraries to carry, and nothing Fedora's own FFmpeg could clash with.

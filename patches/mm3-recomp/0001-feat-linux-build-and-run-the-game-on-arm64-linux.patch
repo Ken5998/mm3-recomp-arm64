@@ -1,0 +1,149 @@
+From d84952557c0c1a15a487145cea3a0d2c4fd3c73e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Kenan=20Kasumovi=C4=87?=
+ <46025606+Ken5998@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 13:13:39 +0000
+Subject: [PATCH 1/3] feat(linux): build and run the game on arm64 linux
+
+The recompiled code and the runtime have portable paths for everything
+x86-specific, so CMake accepts Linux on arm64 and builds there with
+x86's signed char and without fused multiply-adds, which move the physics
+off the x86 results. An installed SDL3 and SDL_shadercross are found at
+the top so this directory sees their targets. The Windows-only thread
+profiler in the teleport panel and the speedometer's guest-state
+includes no longer stop a Linux build.
+---
+ CMakeLists.txt        | 26 +++++++++++++++++++++-----
+ src/mm3_speedometer.c |  2 +-
+ src/mods/teleport.c   |  9 +++++++++
+ src/recomp_manual.c   |  4 ++++
+ 4 files changed, 35 insertions(+), 6 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 74deb2e..1d8da98 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,11 +1,14 @@
+ cmake_minimum_required(VERSION 3.20)
+ project(mm3_recomp C CXX)
+ 
+-# The recompiled game code uses x86 SIMD intrinsics for the guest's MMX/SSE,
+-# and the runtime traps hardware registers by decoding x86-64 instructions,
+-# so the host must be x86-64 (Windows, Linux or an Intel Mac).
+-if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+-    message(FATAL_ERROR "MM3 needs an x86-64 host; this is ${CMAKE_SYSTEM_PROCESSOR}")
++# The recompiled game code uses x86 SIMD intrinsics for the guest's MMX/SSE
++# where the host has them and portable C elsewhere, and the runtime traps
++# hardware registers by decoding x86-64 or AArch64 instructions, so the host
++# is x86-64 (Windows, Linux or an Intel Mac) or Linux on arm64.
++if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
++    set(MM3_ARM64_LINUX ON)
++elseif(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
++    message(FATAL_ERROR "MM3 needs an x86-64 host or Linux on arm64; this is ${CMAKE_SYSTEM_PROCESSOR}")
+ endif()
+ 
+ # Recompiled x86 code relies on what MSVC does anyway: signed arithmetic wraps
+@@ -15,6 +18,12 @@ endif()
+ if(NOT MSVC)
+     add_compile_options(-fwrapv -fno-strict-aliasing)
+ endif()
++# On arm64, char is unsigned and compilers fuse multiply-adds by default; the
++# code was written against x86's signed char and separate roundings, and the
++# physics drift off the x86 results with fused multiply-adds.
++if(MM3_ARM64_LINUX)
++    add_compile_options(-fsigned-char -ffp-contract=off)
++endif()
+ 
+ set(CMAKE_C_STANDARD 11)
+ set(CMAKE_C_STANDARD_REQUIRED ON)
+@@ -43,6 +52,13 @@ endif()
+ set(XBOXRECOMP_DSP_PROGRAM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/game_files/dsp")
+ # MM3 owns its depth-view compatibility shader; both host renderers use it.
+ set(XBOXRECOMP_NV2A_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/mods/shaders/nv2a")
++# An installed SDL3 and SDL_shadercross (a prebuilt sysroot's, as the arm64
++# Linux build uses) are found here, so that their imported targets are seen
++# by this directory as well as by the runtime's.
++if(NOT WIN32)
++    find_package(SDL3 CONFIG QUIET)
++    find_package(SDL3_shadercross CONFIG QUIET)
++endif()
+ add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
+ # MM3 VP-only playback was measured about 10 dB above GP output (-10.7 vs
+ # -20.7 dBFS in a race). Keep its existing calibration outside the runtime.
+diff --git a/src/mm3_speedometer.c b/src/mm3_speedometer.c
+index 52bdb49..b0d642c 100644
+--- a/src/mm3_speedometer.c
++++ b/src/mm3_speedometer.c
+@@ -1,9 +1,9 @@
+ #define _CRT_SECURE_NO_WARNINGS
+ #ifdef _WIN32
+ #include <windows.h>
++#endif
+ #include "guest_state.h"
+ #include "xbox_memory_layout.h"
+-#endif
+ #include <stdio.h>
+ #include <math.h>
+ #include <string.h>
+diff --git a/src/mods/teleport.c b/src/mods/teleport.c
+index 44cf43c..98204f8 100644
+--- a/src/mods/teleport.c
++++ b/src/mods/teleport.c
+@@ -189,6 +189,7 @@ static void sample_car(uint32_t player)
+     ReleaseSRWLockExclusive(&lock);
+ }
+ 
++#if defined(_WIN32)
+ /* The "profile <seconds> <file>" pipe command: a sampling profiler for the game thread that
+  * needs no elevation. Every millisecond it suspends the thread, reads its RIP and writes one line
+  * per sample ("exe <rva>" inside the executable, "<module> <offset>" elsewhere, so waits show up
+@@ -259,11 +260,15 @@ static DWORD WINAPI prof_run(void *arg)
+     return 0;
+ }
+ 
++#endif
++
+ void sub_002203E5(void)
+ {
++#if defined(_WIN32)
+     if (!s_prof_thread)
+         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &s_prof_thread,
+                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, 0);
++#endif
+     uint32_t primary = primary_player();
+     if (primary && g_ecx == primary) {
+         uint32_t car, vehicle;
+@@ -402,6 +407,7 @@ static void teleport_answer(const char *command, char *reply, size_t size)
+         isfinite(xyz[0]) && isfinite(xyz[2])) {
+         request_teleport(xyz, fields == 3 ? heading : NAN, reply, size);
+     } else if (strncmp(command, "profile ", 8) == 0) {
++#if defined(_WIN32)
+         int secs = 0, off = 0;
+         if (sscanf(command + 8, "%d %n", &secs, &off) >= 1 && secs > 0 && s_prof_thread) {
+             s_prof_job.seconds = secs;
+@@ -409,6 +415,9 @@ static void teleport_answer(const char *command, char *reply, size_t size)
+             CloseHandle(CreateThread(NULL, 0, prof_run, NULL, 0, NULL));
+             snprintf(reply, size, "{\"result\":\"started\"}");
+         } else snprintf(reply, size, "{\"result\":\"no game thread yet\"}");
++#else
++        snprintf(reply, size, "{\"result\":\"the profiler is Windows only\"}");
++#endif
+     } else if (strcmp(command, "cars") == 0) {
+         uint32_t primary = primary_player();
+         size_t n = (size_t)snprintf(reply, size, "{\"cars\":[");
+diff --git a/src/recomp_manual.c b/src/recomp_manual.c
+index bc38922..e7f443a 100644
+--- a/src/recomp_manual.c
++++ b/src/recomp_manual.c
+@@ -2,8 +2,12 @@
+ #include <stddef.h>
+ #include <stdlib.h>
+ #include <stdio.h>
++#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+ #include <xmmintrin.h>
+ #include <emmintrin.h>
++#else
++#define _mm_mfence() __atomic_thread_fence(__ATOMIC_SEQ_CST)
++#endif
+ #include <string.h>
+ #include "platform/xbox_winnt.h"
+ 

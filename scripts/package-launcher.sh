@@ -20,17 +20,17 @@ work="$(mktemp -d)"
 stage="$work/MidtownMadness3"
 mkdir -p "$stage/setup"
 
-# The sources CMake would fetch (RmlUi, FreeType), in third_party/: the
-# device builds offline.
+# The sources CMake would fetch (RmlUi, FreeType, Dear ImGui, SDL3_image), in
+# third_party/ under CMake's lower-case names: the device builds offline.
 python3 - "$src" <<'PY'
 import hashlib, re, subprocess, sys, time, urllib.request
 from pathlib import Path
 src = Path(sys.argv[1])
 declared = re.findall(r"FetchContent_Declare\((\w+)\s+URL (\S+)\s+URL_HASH SHA256=(\w+)",
                       (src / "CMakeLists.txt").read_text())
-assert {name for name, _, _ in declared} == {"freetype", "rmlui"}, declared
+assert {name for name, _, _ in declared} == {"freetype", "rmlui", "imgui", "SDL3_image"}, declared
 for name, url, digest in declared:
-    dest = src / "third_party" / name
+    dest = src / "third_party" / name.lower()
     if dest.is_dir():
         continue
     for attempt in range(4):
@@ -48,18 +48,6 @@ for name, url, digest in declared:
     subprocess.run(["tar", "-xzf", "-", "--strip-components", "1", "-C", dest], input=data, check=True)
     print(f"{name}: {url}")
 PY
-
-# The translator generate_mm3.py extracts from the pinned xboxrecomp commit
-# (with its fld tbyte fix), so the device needs no git history.
-(cd "$src" && python3 - <<'PY'
-import importlib.util
-spec = importlib.util.spec_from_file_location("generate_mm3", "scripts/generate_mm3.py")
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-print("translator:", module.TOOLKIT)
-PY
-)
-ls "$src"/tools/.generator/*/tools/recomp/__main__.py > /dev/null
 
 top="$(basename "$src")"
 tar -C "$(dirname "$src")" --exclude-vcs --exclude='__pycache__' \
@@ -95,12 +83,18 @@ ninja="$(ls -d "$data"/toolchain/ninja-*/ninja)"
 build="$work/build"
 "$cmake" -S "$src" -B "$build" -G Ninja -DCMAKE_MAKE_PROGRAM="$ninja" \
     -DCMAKE_TOOLCHAIN_FILE="$toolchain" -DCMAKE_BUILD_TYPE=Release -DMM3_LAUNCHER_ONLY=ON \
-    -DCMAKE_EXE_LINKER_FLAGS_RELEASE=-s \
+    -DCMAKE_EXE_LINKER_FLAGS_RELEASE=-s -DXBOXRECOMP_RENDERER=SDL3_GPU \
+    -DXBOXRECOMP_DXC="$data/toolchain/bin/dxc" -DCMAKE_BUILD_RPATH='$ORIGIN/lib' \
     -DFETCHCONTENT_SOURCE_DIR_RMLUI="$src/third_party/rmlui" \
     -DFETCHCONTENT_SOURCE_DIR_FREETYPE="$src/third_party/freetype" \
+    -DFETCHCONTENT_SOURCE_DIR_IMGUI="$src/third_party/imgui" \
+    -DFETCHCONTENT_SOURCE_DIR_SDL3_IMAGE="$src/third_party/sdl3_image" \
     -DFETCHCONTENT_FULLY_DISCONNECTED=ON
 "$ninja" -C "$build" mm3-launcher
 cp "$build/mm3-launcher" "$stage/"
+# SDL3 beside it, which its rpath names: a handheld's own may be older.
+mkdir -p "$stage/lib"
+cp -L "$(ls -d "$data"/toolchain/sysroot-*/usr/lib/aarch64-linux-gnu/libSDL3.so.0)" "$stage/lib/"
 
 tar -C "$work" --sort=name --owner=0 --group=0 --numeric-owner -czf \
     "$out/MidtownMadness3-Launcher-linux-arm64.tar.gz" MidtownMadness3
