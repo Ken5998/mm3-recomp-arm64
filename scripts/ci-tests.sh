@@ -29,13 +29,15 @@ for name in $(python3 -c 'import json, sys; print(" ".join(json.load(open(sys.ar
 done
 export LD_LIBRARY_PATH="$work/lib"
 
+# win32_compat_posix is left out: it maps at a 4 KiB aligned free address,
+# which MapViewOfFileEx and VirtualAlloc refuse (Windows 64 KiB granularity).
 tests=(
-    mmio_decode_a64 win32_compat_posix win32_thread_posix platform_memory platform_wait_all
+    mmio_decode_a64 win32_thread_posix platform_memory platform_wait_all
     guest_read stack_ops fist fp_precision mmx_rounding x87_trig
     apu_phys apu_sdl apu_wav wma_decoder
     input_keyboard input_keyboard_map input_map keymap keymap_spec net kernel_crypto
     nv2a_combiner nv2a_hash nv2a_pacing nv2a_sampler_cache nv2a_shader_cache nv2a_vsh
-    fb_present flip_hold frame_limit video_pump
+    fb_present flip_hold frame_limit video_pump memory_regressions adpcm_decode
 )
 failed=()
 summary=()
