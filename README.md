@@ -65,7 +65,11 @@ on Vulkan instead of Direct3D 11 through DXVK, and compiles the game's audio
 DSP programs ahead of time instead of interpreting them. The 0.1.x releases
 ran races at 40-60 fps on a Retroid Pocket 6; 0.2.0 is new on the handheld,
 so frame rate, audio and the hang some players saw when a second race loads
-still need checking there. mm3-recomp itself is a work in progress, so expect
+still need checking there. 0.2.2 makes the controller work. 0.2.3 gives each
+vertex program its own shader again, as 0.1.5 did on the old renderer (the
+first seconds stutter while they compile; later runs load them from
+`~/.local/share/MidtownMadness3/cache/shaders`), and copies the saves of
+0.1.x to where the new runtime looks for them. mm3-recomp itself is a work in progress, so expect
 rough edges, and back up your saves (`~/.local/share/MidtownMadness3/saves`).
 
 ## If something goes wrong

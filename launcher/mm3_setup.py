@@ -520,6 +520,8 @@ def install(binary: Path, tools: dict[str, Path]) -> None:
         f'export MM3_SAVE_DIR="{DATA}/saves"\n'
         # The SDL3 GPU renderer on Vulkan (Turnip); a value already set wins.
         'export RECOMP_SDL_GPU_DRIVER="${RECOMP_SDL_GPU_DRIVER:-vulkan}"\n'
+        # Each vertex program's own shader, compiled once and kept here.
+        f'export RECOMP_SHADER_CACHE="${{RECOMP_SHADER_CACHE:-{DATA}/cache/shaders}}"\n'
         # Turnip's shader preambles cost Adreno more than they save, as in
         # Pinyon Shift and Saints Reborn; a value already set wins.
         'export IR3_SHADER_DEBUG="${IR3_SHADER_DEBUG:-nopreamble}"\n'
