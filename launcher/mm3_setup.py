@@ -508,6 +508,7 @@ def install(binary: Path, tools: dict[str, Path]) -> None:
     shutil.copy2(binary, temporary)
     temporary.replace(DATA / "bin/mm3_recomp")
     (DATA / "saves").mkdir(exist_ok=True)
+    migrate_saves()
     START_SCRIPT.write_text(
         "#!/bin/sh\n"
         "# Starts Midtown Madness 3 with the launcher's saved settings.\n"
@@ -524,6 +525,18 @@ def install(binary: Path, tools: dict[str, Path]) -> None:
         'export IR3_SHADER_DEBUG="${IR3_SHADER_DEBUG:-nopreamble}"\n'
         f'exec "{DATA}/bin/mm3_recomp" "$@" >"{LOGS}/game.log" 2>&1\n')
     START_SCRIPT.chmod(0o755)
+
+
+def migrate_saves() -> None:
+    """Up to 0.1.12 the runtime kept the console's E:\\UDATA and E:\\TDATA in
+    saves/UserData and saves/TitleData; the new one uses saves/UDATA and
+    saves/TDATA. Copies the old folders across once, leaving them in place so
+    an older build still finds them."""
+    for old, new in (("UserData", "UDATA"), ("TitleData", "TDATA")):
+        source, target = DATA / "saves" / old, DATA / "saves" / new
+        if source.is_dir() and not target.exists():
+            shutil.copytree(source, target, symlinks=True)
+            log(f"Copied saves/{old} to saves/{new}")
 
 
 def dsp_captured() -> bool:
