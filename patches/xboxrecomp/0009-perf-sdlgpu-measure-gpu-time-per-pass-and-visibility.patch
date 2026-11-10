@@ -1,0 +1,327 @@
+From ef34aa0449aa3bc52ec2368f66e368ee461f9fe1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Kenan=20Kasumovi=C4=87?=
+ <46025606+Ken5998@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:04:25 +0000
+Subject: [PATCH] perf(sdlgpu): measure gpu time per pass and visibility test
+ reads
+
+RECOMP_D3D_PASS_TIMING waits for the GPU after each render pass and
+prints the slowest passes once a second, with size, clears and draws.
+The profile line now counts submits and visibility test reads with
+the time spent waiting on them, and RECOMP_D3D_ZPASS=off skips the
+counting so its cost can be compared. The sum texture and download
+buffer of a read are kept instead of made for every read.
+---
+ src/video/nv2a_sdlgpu.c | 203 ++++++++++++++++++++++++++++++++++------
+ 1 file changed, 176 insertions(+), 27 deletions(-)
+
+diff --git a/src/video/nv2a_sdlgpu.c b/src/video/nv2a_sdlgpu.c
+index 316aa20..4a9ef43 100644
+--- a/src/video/nv2a_sdlgpu.c
++++ b/src/video/nv2a_sdlgpu.c
+@@ -111,7 +111,8 @@ enum { PROF_VERTEX, PROF_TEXTURE, PROF_DRAW, PROF_SYNC, PROF_WRITEBACK,
+ static const char *const s_prof_name[PROF_COUNT] = {
+     "vertex", "texture", "draw", "cpu-sync", "writeback", "present", "pace", "exec(all)" };
+ static int64_t s_prof[PROF_COUNT];
+-static uint64_t s_prof_verts, s_prof_draws, s_prof_passes;
++static uint64_t s_prof_verts, s_prof_draws, s_prof_passes, s_prof_submits, s_prof_zreads;
++static int64_t s_prof_zwait;
+ static int s_prof_on = -1;
+ 
+ void nv2a_d3d_prof_add(int slot, int64_t ticks, uint32_t verts)
+@@ -142,12 +143,16 @@ static void prof_report(void)
+     for (i = 0; i < PROF_COUNT; i++)
+         fprintf(stderr, " %s %.2f", s_prof_name[i],
+                 s_prof[i] * 1000.0 / (double)freq / (double)frames);
+-    fprintf(stderr, " ms/frame | %llu verts %llu draws %llu passes/frame\n",
++    fprintf(stderr, " ms/frame | %llu verts %llu draws %llu passes %llu submits/frame"
++            " | visibility reads %.1f/frame waiting %.2f ms/frame\n",
+             (unsigned long long)(s_prof_verts / frames), (unsigned long long)(s_prof_draws / frames),
+-            (unsigned long long)(s_prof_passes / frames));
++            (unsigned long long)(s_prof_passes / frames), (unsigned long long)(s_prof_submits / frames),
++            (double)s_prof_zreads / (double)frames,
++            s_prof_zwait * 1000.0 / (double)freq / (double)frames);
+     fflush(stderr);
+     memset(s_prof, 0, sizeof s_prof);
+-    s_prof_verts = s_prof_draws = s_prof_passes = 0;
++    s_prof_verts = s_prof_draws = s_prof_passes = s_prof_submits = s_prof_zreads = 0;
++    s_prof_zwait = 0;
+     frames = 0;
+     worst = 0;
+     last = now;
+@@ -731,6 +736,11 @@ static void rec_samplers(const SDL_GPUTextureSamplerBinding *b, uint32_t n)
+ static void submit(SDL_GPUFence **fence);
+ static void graveyard_empty(void);
+ static void copy_end(void);
++static int pass_timing(void);
++static void pass_timed(SDL_GPUTexture *color, SDL_GPUTexture *depth, int clear, uint32_t draws);
++static double pt_sync(void);
++static void pt_frame(void);
++static double s_pt_other;
+ 
+ /* End the open batch: upload its vertex/index data, then replay its draws in
+  * one render pass. */
+@@ -769,6 +779,13 @@ static void flush_batch(void)
+         }
+         SDL_EndGPUCopyPass(cp);
+     }
++    if (pass_timing()) {
++        /* What was recorded before this pass (uploads, copies) is timed on
++         * its own, outside the passes. */
++        pt_frame();
++        s_pt_other += pt_sync();
++        if (!(c = cmd())) goto reset;
++    }
+     memset(&ct, 0, sizeof ct);
+     memset(&dt, 0, sizeof dt);
+     ct.texture = s_b.color;
+@@ -831,6 +848,12 @@ static void flush_batch(void)
+         }
+     }
+     SDL_EndGPURenderPass(rp);
++    if (pass_timing()) {
++        uint32_t draws = 0;
++        for (i = 0; i < s_b.nops; i++)
++            draws += s_b.ops[i].kind == OP_DRAWI || s_b.ops[i].kind == OP_DRAW;
++        pass_timed(s_b.color, s_b.depth, s_b.color_clear | (s_b.depth_clear << 1), draws);
++    }
+ reset:
+     graveyard_empty();
+     s_b.nops = 0;
+@@ -867,8 +890,18 @@ static void submit(SDL_GPUFence **fence)
+     flush_batch();
+     if (fence) *fence = NULL;
+     if (!s_cmd) return;
++    s_prof_submits++;
+     if (s_vmap) { SDL_UnmapGPUTransferBuffer(s_dev, s_vtb); s_vmap = NULL; }
+     if (s_imap) { SDL_UnmapGPUTransferBuffer(s_dev, s_itb); s_imap = NULL; }
++    /* Timed (a fenced submit is a readback: its caller waits, so it is
++     * submitted as usual). */
++    if (pass_timing() && !fence) {
++        pt_frame();
++        s_pt_other += pt_sync();
++        s_vpos = s_ipos = s_upos = 0;
++        s_b.v0 = s_b.v1 = s_b.i0 = s_b.i1 = 0;
++        return;
++    }
+     RECOMP_PROFILE_BEGIN("SDL GPU submission");
+     if (fence) {
+         *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(s_cmd);
+@@ -1467,6 +1500,97 @@ typedef struct {
+ #define MAX_DEPTHS 16
+ static Surface s_surf[MAX_SURFACES];
+ static Depth s_depth[MAX_DEPTHS];
++
++/* RECOMP_D3D_PASS_TIMING: the GPU time of each render pass, measured by
++ * submitting and waiting after it (so everything runs much slower while it is
++ * on). Once a second it prints the frame's GPU total, the work outside render
++ * passes (uploads, readbacks, present) and the slowest passes by their place
++ * in the frame, with target size, clears and draw count. A diagnostic only. */
++#define PT_SLOTS 64
++static int s_pt_on = -1;
++static double s_pt_ms[PT_SLOTS];
++static uint32_t s_pt_w[PT_SLOTS], s_pt_h[PT_SLOTS], s_pt_draws[PT_SLOTS], s_pt_clear[PT_SLOTS];
++static uint32_t s_pt_index, s_pt_frame = 0xFFFFFFFFu, s_pt_frames;
++static int64_t s_pt_last;
++
++static int pass_timing(void)
++{
++    if (s_pt_on < 0) s_pt_on = getenv("RECOMP_D3D_PASS_TIMING") != NULL;
++    return s_pt_on;
++}
++
++/* Submits what is recorded and waits for it; returns the wait in ms. The
++ * rings keep their positions: the GPU is idle once this returns. */
++static double pt_sync(void)
++{
++    SDL_GPUFence *f;
++    int64_t t0;
++    if (!s_cmd) return 0.0;
++    if (s_vmap) { SDL_UnmapGPUTransferBuffer(s_dev, s_vtb); s_vmap = NULL; }
++    if (s_imap) { SDL_UnmapGPUTransferBuffer(s_dev, s_itb); s_imap = NULL; }
++    t0 = qpc();
++    f = SDL_SubmitGPUCommandBufferAndAcquireFence(s_cmd);
++    s_cmd = NULL;
++    s_cmd_serial++;
++    if (f) {
++        SDL_WaitForGPUFences(s_dev, true, &f, 1);
++        SDL_ReleaseGPUFence(s_dev, f);
++    } else {
++        SDL_WaitForGPUIdle(s_dev);
++    }
++    return (double)(qpc() - t0) * 1000.0 / (double)qpf();
++}
++
++static void pt_report(void)
++{
++    int64_t now = qpc();
++    uint32_t i, j, order[PT_SLOTS], n = 0;
++    double total = s_pt_other;
++    if (!s_pt_last) { s_pt_last = now; return; }
++    if (now - s_pt_last < qpf() || !s_pt_frames) return;
++    for (i = 0; i < PT_SLOTS; i++) { total += s_pt_ms[i]; if (s_pt_ms[i] > 0) order[n++] = i; }
++    for (i = 1; i < n; i++)
++        for (j = i; j > 0 && s_pt_ms[order[j]] > s_pt_ms[order[j - 1]]; j--) {
++            uint32_t t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
++        }
++    fprintf(stderr, "[SDLGPU_PASS] gpu %.2f ms/frame: outside passes %.2f; slowest:", total / s_pt_frames,
++            s_pt_other / s_pt_frames);
++    for (i = 0; i < n && i < 8; i++)
++        fprintf(stderr, " #%u %ux%u%s%s %ud %.2f;", order[i], s_pt_w[order[i]], s_pt_h[order[i]],
++                (s_pt_clear[order[i]] & 1) ? " cc" : "", (s_pt_clear[order[i]] & 2) ? " zc" : "",
++                s_pt_draws[order[i]], s_pt_ms[order[i]] / s_pt_frames);
++    fprintf(stderr, "\n");
++    fflush(stderr);
++    memset(s_pt_ms, 0, sizeof s_pt_ms);
++    s_pt_other = 0;
++    s_pt_frames = 0;
++    s_pt_last = now;
++}
++
++static void pt_frame(void)
++{
++    if (s_pt_frame != s_frame) {
++        if (s_pt_frame != 0xFFFFFFFFu) { s_pt_frames++; pt_report(); }
++        s_pt_frame = s_frame;
++        s_pt_index = 0;
++    }
++}
++
++static void pass_timed(SDL_GPUTexture *color, SDL_GPUTexture *depth, int clear, uint32_t draws)
++{
++    uint32_t i, k, w = 0, h = 0;
++    double ms;
++    pt_frame();
++    for (i = 0; i < MAX_SURFACES; i++)
++        if (color && s_surf[i].tex == color) { w = s_surf[i].iw; h = s_surf[i].ih; break; }
++    for (i = 0; !w && i < MAX_DEPTHS; i++)
++        if (depth && s_depth[i].tex == depth) { w = s_depth[i].iw; h = s_depth[i].ih; }
++    ms = pt_sync();
++    k = s_pt_index < PT_SLOTS ? s_pt_index : PT_SLOTS - 1;
++    s_pt_index++;
++    s_pt_ms[k] += ms;
++    s_pt_w[k] = w; s_pt_h[k] = h; s_pt_draws[k] = draws; s_pt_clear[k] = (uint32_t)clear;
++}
+ static Surface *s_cur_rt;
+ static Depth *s_cur_ds;
+ static uint32_t s_aa_x = 1, s_aa_y = 1;
+@@ -2612,9 +2736,23 @@ void nv2a_d3d_zpass_clear(void)
+     s_zpass = 0;
+ }
+ 
++/* RECOMP_D3D_ZPASS=off: no count passes and no readbacks; every test
++ * reports its whole target visible (a test of what the reads cost). */
++static int zpass_off(void)
++{
++    static int off = -1;
++    if (off < 0) {
++        const char *e = getenv("RECOMP_D3D_ZPASS");
++        off = e && (!strcmp(e, "off") || !strcmp(e, "0"));
++        if (off) fprintf(stderr, "[SDLGPU] visibility tests not counted (RECOMP_D3D_ZPASS=off)\n");
++    }
++    return off;
++}
++
+ uint32_t nv2a_d3d_zpass_read(void)
+ {
+     double px;
++    if (zpass_off()) return 640u * 480u;
+     zpass_collect();
+     /* In guest pixels: the host target has scale^2 as many. */
+     px = (double)s_zpass / ((double)s_cur_sx * s_cur_sy);
+@@ -2782,7 +2920,7 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
+     s_ipos += (ib_bytes + 255) & ~255u;
+     s_b.v1 = s_vpos;
+     s_b.i1 = s_ipos;
+-    if (s_zpass_on && s) {
++    if (s_zpass_on && s && !zpass_off()) {
+         /* Count the draw's passing pixels: the same draw again, before the
+          * real one would be wrong (it has been recorded already), so the
+          * count pass tests against depth as it stands after this draw only
+@@ -2844,35 +2982,48 @@ void nv2a_sdlgpu_zcount(const NvD3DState *st, Surface *s, uint32_t first_index,
+     target(s->tex, &s->clear, s_cur_ds ? s_cur_ds->tex : NULL, s_cur_ds ? &s_cur_ds->clear : NULL);
+ }
+ 
++/* The sum texture and its 4-byte download buffer, kept between reads: a
++ * title can read dozens of visibility tests a frame. */
++static SDL_GPUTexture *s_zsum;
++static uint32_t s_zsum_w, s_zsum_h, s_zsum_levels;
++static SDL_GPUTransferBuffer *s_ztb;
++
+ static void zpass_collect(void)
+ {
+-    SDL_GPUTransferBuffer *tb;
+     SDL_GPUFence *fence = NULL;
+     SDL_GPUTextureRegion r;
+     SDL_GPUTextureTransferInfo info;
+-    uint32_t levels = 1, m, lw, lh;
+-    SDL_GPUTexture *sum;
++    uint32_t m;
++    int64_t t0;
+     if (!s_zcount_used) return;
+     s_zcount_used = 0;
++    t0 = qpc();
++    s_prof_zreads++;
+     /* Sum: mipmaps of the count target average it; the last level times the
+      * pixel count is the total. */
+-    m = s_zcount_w > s_zcount_h ? s_zcount_w : s_zcount_h;
+-    while (m > 1) { m >>= 1; levels++; }
+-    sum = make_texture(s_zcount_w, s_zcount_h, levels, 0, SDL_GPU_TEXTUREFORMAT_R32_FLOAT, USAGE_TARGET);
+-    if (!sum) return;
+-    copy_texture(sum, 0, s_zcount, 0, s_zcount_w, s_zcount_h);
+-    copy_end();
+-    if (!cmd()) { SDL_ReleaseGPUTexture(s_dev, sum); return; }
+-    SDL_GenerateMipmapsForGPUTexture(s_cmd, sum);
+-    {
++    if (!s_zsum || s_zsum_w != s_zcount_w || s_zsum_h != s_zcount_h) {
++        release_texture(&s_zsum);
++        s_zsum_levels = 1;
++        m = s_zcount_w > s_zcount_h ? s_zcount_w : s_zcount_h;
++        while (m > 1) { m >>= 1; s_zsum_levels++; }
++        s_zsum = make_texture(s_zcount_w, s_zcount_h, s_zsum_levels, 0, SDL_GPU_TEXTUREFORMAT_R32_FLOAT,
++                              USAGE_TARGET);
++        if (!s_zsum) return;
++        s_zsum_w = s_zcount_w; s_zsum_h = s_zcount_h;
++    }
++    if (!s_ztb) {
+         SDL_GPUTransferBufferCreateInfo ci = { SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, 4, 0 };
+-        tb = SDL_CreateGPUTransferBuffer(s_dev, &ci);
++        if (!(s_ztb = SDL_CreateGPUTransferBuffer(s_dev, &ci))) return;
+     }
+-    if (!tb || !copy_begin()) { SDL_ReleaseGPUTexture(s_dev, sum); return; }
++    copy_texture(s_zsum, 0, s_zcount, 0, s_zcount_w, s_zcount_h);
++    copy_end();
++    if (!cmd()) return;
++    SDL_GenerateMipmapsForGPUTexture(s_cmd, s_zsum);
++    if (!copy_begin()) return;
+     memset(&r, 0, sizeof r);
+     memset(&info, 0, sizeof info);
+-    r.texture = sum; r.mip_level = levels - 1; r.w = r.h = r.d = 1;
+-    info.transfer_buffer = tb;
++    r.texture = s_zsum; r.mip_level = s_zsum_levels - 1; r.w = r.h = r.d = 1;
++    info.transfer_buffer = s_ztb;
+     SDL_DownloadFromGPUTexture(s_copy, &r, &info);
+     copy_end();
+     submit(&fence);
+@@ -2881,14 +3032,12 @@ static void zpass_collect(void)
+         const float *v;
+         SDL_WaitForGPUFences(s_dev, true, &fence, 1);
+         SDL_ReleaseGPUFence(s_dev, fence);
+-        v = (const float *)SDL_MapGPUTransferBuffer(s_dev, tb, false);
+-        if (v) { avg = *v; SDL_UnmapGPUTransferBuffer(s_dev, tb); }
+-        lw = s_zcount_w; lh = s_zcount_h;
+-        s_zpass += (uint64_t)(avg * (double)lw * (double)lh + 0.5);
++        v = (const float *)SDL_MapGPUTransferBuffer(s_dev, s_ztb, false);
++        if (v) { avg = *v; SDL_UnmapGPUTransferBuffer(s_dev, s_ztb); }
++        s_zpass += (uint64_t)(avg * (double)s_zcount_w * (double)s_zcount_h + 0.5);
+     }
+-    SDL_ReleaseGPUTransferBuffer(s_dev, tb);
+-    SDL_ReleaseGPUTexture(s_dev, sum);
+     s_zcount_clear = 1;          /* counts start again from zero */
++    s_prof_zwait += qpc() - t0;
+ }
+ 
+ /* ------------------------------------------------------------------ clear */
+-- 
+2.43.0
+

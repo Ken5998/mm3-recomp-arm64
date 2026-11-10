@@ -69,7 +69,9 @@ still need checking there. 0.2.2 makes the controller work. 0.2.3 gives each
 vertex program its own shader again, as 0.1.5 did on the old renderer (the
 first seconds stutter while they compile; later runs load them from
 `~/.local/share/MidtownMadness3/cache/shaders`), and copies the saves of
-0.1.x to where the new runtime looks for them. mm3-recomp itself is a work in progress, so expect
+0.1.x to where the new runtime looks for them. 0.2.4 measures where the GPU
+time goes, to find why menus run under 10 fps on the handheld. mm3-recomp
+itself is a work in progress, so expect
 rough edges, and back up your saves (`~/.local/share/MidtownMadness3/saves`).
 
 ## If something goes wrong

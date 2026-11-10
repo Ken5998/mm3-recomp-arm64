@@ -78,6 +78,20 @@ options before `%command%`):
   with it, it is a race between them. A thread that spins on another one
   without a kernel call deadlocks under it.
 
+## When it runs slowly
+
+Set in the same way:
+
+- `RECOMP_D3D_PROFILE=1` prints a `[SDLGPU_PROF]` line a second: the frame
+  rate, what each stage of the renderer costs per frame, and how many
+  visibility tests the game read back (each one waits for the GPU).
+- `RECOMP_D3D_PASS_TIMING=1` waits for the GPU after every render pass and
+  prints the slowest ones in a `[SDLGPU_PASS]` line: target size, clears,
+  draws and GPU time. It slows the game down; the split is what counts.
+- `RECOMP_D3D_ZPASS=off` stops counting visibility tests: every test reports
+  its target visible. The game culls with these, so it draws more, but
+  nothing waits for the GPU in the middle of a frame.
+
 ## How a release is made
 
 1. `ci.yml` is green on the branch, which is then merged to `main`.
